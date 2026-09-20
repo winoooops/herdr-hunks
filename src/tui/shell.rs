@@ -99,7 +99,7 @@ fn initial_state(config: &Config, width: u16) -> ViewState {
     use crate::engine::nav::ViewMode;
     let mode = match config.mode {
         ModeSetting::Auto if width >= 120 => ViewMode::Split,
-        ModeSetting::Split if width >= view::MIN_SPLIT_WIDTH => ViewMode::Split,
+        ModeSetting::Split => ViewMode::Split,
         _ => ViewMode::Unified,
     };
     let files = match config.files {
@@ -108,6 +108,7 @@ fn initial_state(config: &Config, width: u16) -> ViewState {
         _ => FilesPanel::Hidden,
     };
     let mut state = ViewState::new(mode, files, config.mouse);
+    state.resize(width, 0);
     if config.mode == ModeSetting::Split && width < view::MIN_SPLIT_WIDTH {
         state.notice = Some("split view needs 100 columns".into());
     }
@@ -148,10 +149,7 @@ fn run_terminal(
             terminal.draw(|frame| {
                 let area = frame.area();
                 width = area.width;
-                if width < view::MIN_SPLIT_WIDTH {
-                    state.mode = crate::engine::nav::ViewMode::Unified;
-                }
-                state.resize(view::body_height(&state, &snapshot, area.height));
+                state.resize(width, view::body_height(&state, &snapshot, area.height));
                 state.reconcile(&snapshot);
                 rendered = view::render(&snapshot, &state, width, area.height);
                 let lines: Vec<_> = rendered
@@ -203,6 +201,10 @@ fn run_terminal(
 pub fn run(path: PathBuf) -> i32 {
     if !io::stdout().is_terminal() {
         eprintln!("herdr-hunks: stdout is not a terminal");
+        return 2;
+    }
+    if !io::stdin().is_terminal() {
+        eprintln!("herdr-hunks: stdin is not a terminal");
         return 2;
     }
     let lookup = |key: &str| std::env::var_os(key);
@@ -297,12 +299,15 @@ mod tests {
             files: FilesSetting::Hidden,
             mouse: false,
         };
-        let state = initial_state(&config, 99);
+        let mut state = initial_state(&config, 99);
         assert_eq!(
             (state.mode, state.files_panel, state.mouse_requested),
             (ViewMode::Unified, FilesPanel::Hidden, false)
         );
-        assert!(state.notice.unwrap().contains("100 columns"));
+        assert!(state.notice.as_deref().unwrap().contains("100 columns"));
+        assert_eq!(state.requested_mode, ViewMode::Split);
+        state.resize(120, 10);
+        assert_eq!(state.mode, ViewMode::Split);
         assert_eq!(initial_state(&config, 100).mode, ViewMode::Split);
         let config = Config {
             mode: ModeSetting::Unified,

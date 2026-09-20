@@ -681,7 +681,7 @@ mod tests {
     fn rendered(width: u16, height: u16, panel: FilesPanel) -> (Rendered, ViewState) {
         let snap = files(snapshot("a.rs", "r1", &[(10, " --+ ")]));
         let mut st = ViewState::new(ViewMode::Unified, panel, true);
-        st.resize(body_height(&st, &snap, height));
+        st.resize(width, body_height(&st, &snap, height));
         st.reconcile(&snap);
         (render(&snap, &st, width, height), st)
     }
@@ -755,7 +755,7 @@ mod tests {
         st.help_open = true;
         st.help_offset = 18;
         for (columns, height) in [(40, 10), (61, 12), (120, 40)] {
-            st.resize(body_height(&st, &snap, height));
+            st.resize(columns, body_height(&st, &snap, height));
             st.reconcile(&snap);
             let r = render(&snap, &st, columns, height);
             assert_eq!(r.lines.len(), usize::from(height));
@@ -874,7 +874,7 @@ mod tests {
         let mut snap = files(snapshot(&name, "r1", &[(1, "+")]));
         snap.files[1].path = name;
         let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
-        st.resize(body_height(&st, &snap, 10));
+        st.resize(40, body_height(&st, &snap, 10));
         st.reconcile(&snap);
         let r = render(&snap, &st, 40, 10);
         assert_eq!(r.lines.len(), 10);
@@ -936,7 +936,7 @@ mod tests {
         snap.status_error = Some("status\x1b\u{2066}".into());
         snap.watcher_error = Some("watcher\x07".into());
         let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Shown, true);
-        st.resize(body_height(&st, &snap, 12));
+        st.resize(100, body_height(&st, &snap, 12));
         st.reconcile(&snap);
         let r = render(&snap, &st, 100, 12);
         let text = r.plain().join(" ");

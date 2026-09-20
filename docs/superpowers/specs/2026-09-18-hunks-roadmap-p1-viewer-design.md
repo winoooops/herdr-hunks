@@ -602,8 +602,11 @@ The TUI follows `herdr-agent-watcher`'s sidebar: a pure view and a thin shell.
 - **Footer.** Key hints for the focused area. Hints drop from the right when
   narrow.
 
-Split mode needs at least 100 columns. `t` below that width shows a one-line
-notice and stays unified. `view = "auto"` chooses split at 120 columns or more.
+Split mode needs at least 100 columns. Requesting split below that width shows a
+one-line notice and stays unified. `view = "auto"` chooses split at 120 columns or more.
+The requested mode survives resizes: the effective mode is unified below 100
+columns and the requested mode otherwise. `t` toggles the requested mode and
+refuses a new split request below 100 columns.
 Below 40x10 the TUI draws a single "terminal too small" line.
 
 ### 4.3 Keys
@@ -703,7 +706,7 @@ index, so it can be found again after the rows change.
 | Event | Cursor | Offsets |
 | --- | --- | --- |
 | a different `FileKey` becomes selected | `target_index_for_hunk(0)`, or none when the diff has no targets | both reset to 0 |
-| same `FileKey`, new `LoadedDiff` (refresh) | the target with the same `(side, line_number)`; else the nearest `line_number` on that side; else the old index clamped | vertical offset re-anchored so the cursor keeps its viewport row where possible, then clamped; horizontal unchanged |
+| same `FileKey`, new `LoadedDiff` (refresh) | the target with the same `(side, line_number)`; else the nearest `line_number` on that side; else the old index clamped | vertical offset re-anchored so the cursor keeps its viewport row where possible, then clamped; horizontal retained, then clamped to the current rows |
 | view mode toggled | same `(side, line_number)` in the other sequence | rows rebuilt, then `ensure_visible` |
 | terminal resized | unchanged | both clamped, then `ensure_visible` |
 | diff has zero targets | none | both 0; `j k [ ] h l g G` are inert and the hunk stepper reads `0/0` |
@@ -723,6 +726,7 @@ view slices rows itself, so ratatui's `u16` scroll limit never applies.
 | Condition | Behaviour |
 | --- | --- |
 | stdout is not a terminal | exit 2 with a one-line message; nothing is drawn |
+| stdin is not a terminal | exit 2 with `herdr-hunks: stdin is not a terminal`; nothing is drawn |
 | `PATH` argument missing or not a directory | the TUI starts and shows the error state, so an overlay pane does not flash and vanish; `q` quits |
 | not a git repository | "not a git repository" state; the frozen watcher's pre-repo mode upgrades it when `.git/` appears |
 | `git` missing from `PATH` | status error carrying the spawn message; `r` retries |

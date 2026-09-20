@@ -96,13 +96,14 @@ fn act(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction, width: u16
         FileNext => return Outcome::Engine(Command::SelectNext),
         FilePrev => return Outcome::Engine(Command::SelectPrev),
         ToggleView => {
-            if state.mode == ViewMode::Unified && width < view::MIN_SPLIT_WIDTH {
+            if state.requested_mode == ViewMode::Unified && width < view::MIN_SPLIT_WIDTH {
                 state.notice = Some("split view needs 100 columns".into());
             } else {
-                state.mode = match state.mode {
+                state.requested_mode = match state.requested_mode {
                     ViewMode::Unified => ViewMode::Split,
                     ViewMode::Split => ViewMode::Unified,
                 };
+                state.resize(width, state.body_height);
             }
         }
         ToggleFiles => {
@@ -193,10 +194,11 @@ fn move_cursor(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction) ->
             return Outcome::Redraw;
         }
         ScrollLeft | ScrollRight => {
+            let limit = state.max_hscroll();
             return scroll(
                 &mut state.hscroll,
                 if action == ScrollRight { 8 } else { -8 },
-                usize::MAX,
+                limit,
                 0,
             );
         }
@@ -315,7 +317,7 @@ mod tests {
     fn setup(hunks: &[(u32, &str)]) -> (crate::engine::Snapshot, ViewState) {
         let snap = snapshot("a.rs", "r1", hunks);
         let mut st = ViewState::new(ViewMode::Split, FilesPanel::Hidden, true);
-        st.resize(body_height(&st, &snap, 24));
+        st.resize(120, body_height(&st, &snap, 24));
         st.reconcile(&snap);
         (snap, st)
     }
@@ -342,7 +344,7 @@ mod tests {
     #[test]
     fn down_and_up_scroll_help_like_j_and_k() {
         let (snap, mut st) = setup(&[(1, "+")]);
-        st.resize(body_height(&st, &snap, 12));
+        st.resize(120, body_height(&st, &snap, 12));
         handle_key(&mut st, &snap, key("?"), 120);
         for (code, expected_offset) in [(KeyCode::Down, 1), (KeyCode::Up, 0)] {
             assert_eq!(
@@ -372,7 +374,12 @@ mod tests {
         let prefixes: [&[&str]; 4] = [&[], &["l"], &["]", "L"], &["ctrl+d"]];
         for binding in KEYS {
             let live = prefixes.iter().any(|prefix| {
-                let (snap, mut st) = setup(&[(10, " --+ "), (40, long.as_str())]);
+                let (mut snap, mut st) = setup(&[(10, " --+ "), (40, long.as_str())]);
+                if let DiffState::Ready(diff) = &mut snap.diff {
+                    std::sync::Arc::make_mut(diff).file_diff.hunks[0].lines[0].content =
+                        "x".repeat(200);
+                }
+                st.reconcile(&snap);
                 for p in prefix.iter() {
                     handle_key(&mut st, &snap, key(p), 120);
                 }
@@ -445,11 +452,62 @@ mod tests {
     #[test]
     fn split_is_refused_below_100_columns() {
         let (snap, mut st) = setup(&[(10, " + ")]);
-        st.mode = ViewMode::Unified;
+        st.requested_mode = ViewMode::Unified;
+        st.resize(120, st.body_height);
         st.reconcile(&snap);
         handle_key(&mut st, &snap, key("t"), 90);
         assert_eq!(st.mode, ViewMode::Unified);
         assert!(st.notice.as_deref().unwrap_or("").contains("100 columns"));
+        assert_eq!(st.requested_mode, ViewMode::Unified);
+    }
+
+    #[test]
+    fn scroll_right_stops_at_the_row_bound_and_becomes_inert() {
+        let snap = crate::tui::state::tests::text_snapshot("r1", &"猫".repeat(70));
+        for (mode, panel, limit) in [
+            (ViewMode::Unified, FilesPanel::Hidden, 34),
+            (ViewMode::Split, FilesPanel::Hidden, 89),
+            (ViewMode::Split, FilesPanel::Shown, 98),
+        ] {
+            let mut st = ViewState::new(mode, panel, true);
+            st.resize(120, 22);
+            st.reconcile(&snap);
+            while st.hscroll < limit {
+                let previous = st.hscroll;
+                assert_eq!(handle_key(&mut st, &snap, key("L"), 120), Outcome::Redraw);
+                assert_eq!(st.hscroll, (previous + 8).min(limit));
+            }
+            assert_eq!(handle_key(&mut st, &snap, key("L"), 120), Outcome::Inert);
+            assert_eq!(st.hscroll, limit);
+            assert_eq!(handle_key(&mut st, &snap, key("H"), 120), Outcome::Redraw);
+            assert_eq!(st.hscroll, limit - 8);
+        }
+    }
+
+    #[test]
+    fn toggling_while_narrow_changes_the_request_without_losing_the_cursor() {
+        let (snap, mut st) = setup(&[(10, " --+ ")]);
+        let cursor = st.cursor_id;
+        st.resize(90, st.body_height);
+        st.reconcile(&snap);
+        assert_eq!(st.mode, ViewMode::Unified);
+        assert_eq!(handle_key(&mut st, &snap, key("t"), 90), Outcome::Redraw);
+        assert_eq!(st.requested_mode, ViewMode::Unified);
+        assert_eq!(handle_key(&mut st, &snap, key("t"), 90), Outcome::Redraw);
+        assert_eq!(st.requested_mode, ViewMode::Unified);
+        assert!(st.notice.as_deref().unwrap().contains("100 columns"));
+        st.resize(120, st.body_height);
+        st.reconcile(&snap);
+        assert_eq!(st.mode, ViewMode::Unified);
+        assert_eq!(st.cursor_id, cursor);
+        handle_key(&mut st, &snap, key("t"), 120);
+        st.reconcile(&snap);
+        st.resize(90, st.body_height);
+        st.reconcile(&snap);
+        st.resize(120, st.body_height);
+        st.reconcile(&snap);
+        assert_eq!(st.mode, ViewMode::Split);
+        assert_eq!(st.cursor_id, cursor);
     }
 
     #[test]
@@ -468,7 +526,7 @@ mod tests {
     #[test]
     fn every_binding_is_reachable_on_the_key_sheet_in_a_short_terminal() {
         let (snap, mut st) = setup(&[(10, " + ")]);
-        st.resize(body_height(&st, &snap, 12));
+        st.resize(120, body_height(&st, &snap, 12));
         handle_key(&mut st, &snap, key("?"), 120);
         let mut seen = String::new();
         for _ in 0..40 {
@@ -536,7 +594,7 @@ mod tests {
         ));
         assert_eq!(st.offset, 3);
         // the run loop's redraw preparation must not pull the viewport back to the cursor
-        st.resize(body_height(&st, &snap, 24));
+        st.resize(120, body_height(&st, &snap, 24));
         st.reconcile(&snap);
         assert_eq!(st.offset, 3, "wheel scrolling was undone by the next frame");
         let shifted = MouseEvent {
@@ -554,8 +612,12 @@ mod tests {
 
     #[test]
     fn movement_uses_display_order_and_half_pages_snap_to_the_centre() {
-        let (snap, mut st) = setup(&[(10, " --+ ")]);
-        st.mode = ViewMode::Unified;
+        let (mut snap, mut st) = setup(&[(10, " --+ ")]);
+        if let DiffState::Ready(diff) = &mut snap.diff {
+            std::sync::Arc::make_mut(diff).file_diff.hunks[0].lines[0].content = "x".repeat(200);
+        }
+        st.requested_mode = ViewMode::Unified;
+        st.resize(120, st.body_height);
         st.reconcile(&snap);
         assert_eq!(st.cursor, Some(1));
         assert_eq!(handle_key(&mut st, &snap, key("j"), 120), Outcome::Redraw);
@@ -623,7 +685,7 @@ mod tests {
     #[test]
     fn help_is_modal_and_scrolls_with_keys_and_wheel_to_both_ends() {
         let (snap, mut st) = setup(&[(1, &"+".repeat(80))]);
-        st.resize(body_height(&st, &snap, 12));
+        st.resize(120, body_height(&st, &snap, 12));
         let background = render(&snap, &st, 40, 12);
         let wheel = MouseEvent {
             kind: MouseEventKind::ScrollDown,

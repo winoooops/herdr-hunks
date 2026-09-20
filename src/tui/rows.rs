@@ -44,6 +44,7 @@ pub enum Row {
 
 pub struct Rows {
     pub rows: Vec<Row>,
+    pub max_text_width: usize,
     /// Row index that displays each target.
     pub row_of_target: Vec<usize>,
 }
@@ -208,8 +209,27 @@ pub fn build(diff: &LoadedDiff, mode: ViewMode) -> Rows {
             lines: diff.truncated_lines,
         });
     }
+    let max_text_width = rows
+        .iter()
+        .map(|row| {
+            use crate::tui::format::width;
+            match row {
+                Row::FileHeader { path } => width(path),
+                Row::HunkHeader { text, .. } | Row::Unified { text, .. } => width(text),
+                Row::Split { left, right } => [left, right]
+                    .into_iter()
+                    .flatten()
+                    .map(|cell| width(&cell.text))
+                    .max()
+                    .unwrap_or(0),
+                _ => 0,
+            }
+        })
+        .max()
+        .unwrap_or(0);
     Rows {
         rows,
+        max_text_width,
         row_of_target,
     }
 }

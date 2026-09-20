@@ -12,6 +12,7 @@ pub enum FilesPanel {
 }
 
 pub struct ViewState {
+    pub requested_mode: ViewMode,
     pub mode: ViewMode,
     pub cursor: Option<usize>,
     pub cursor_id: Option<(Side, u32)>,
@@ -24,6 +25,7 @@ pub struct ViewState {
     pub rows: Option<Rows>,
     pub body_height: u16,
     pub help_offset: usize,
+    width: u16,
     /// The diff the rows were built from. Holding the Arc makes `Arc::ptr_eq` a safe,
     /// allocation-free "did anything change" test; the engine swaps the Arc only on change.
     built_from: Option<(std::sync::Arc<LoadedDiff>, ViewMode)>,
@@ -32,6 +34,7 @@ pub struct ViewState {
 impl ViewState {
     pub fn new(mode: ViewMode, files_panel: FilesPanel, mouse: bool) -> Self {
         Self {
+            requested_mode: mode,
             mode,
             cursor: None,
             cursor_id: None,
@@ -44,12 +47,20 @@ impl ViewState {
             rows: None,
             body_height: 0,
             help_offset: 0,
+            width: 0,
             built_from: None,
         }
     }
 
-    /// Acts only when the height changed; the run loop calls it before every frame.
-    pub fn resize(&mut self, body_height: u16) {
+    /// Resolves the effective mode and clamps offsets before each frame.
+    pub fn resize(&mut self, width: u16, body_height: u16) {
+        self.width = width;
+        self.mode = if width < crate::tui::view::MIN_SPLIT_WIDTH {
+            ViewMode::Unified
+        } else {
+            self.requested_mode
+        };
+        self.hscroll = self.hscroll.min(self.max_hscroll());
         if self.body_height == body_height {
             return;
         }
@@ -58,6 +69,26 @@ impl ViewState {
             self.offset = clamp_scroll(self.offset, rows.rows.len(), body_height);
             self.keep_cursor_visible();
         }
+    }
+
+    pub fn max_hscroll(&self) -> usize {
+        let columns = self
+            .width
+            .saturating_sub(if self.files_panel == FilesPanel::Hidden {
+                0
+            } else {
+                crate::tui::view::FILES_WIDTH + 1
+            });
+        // Keep room for the line-number gutters, sign, and space before the text.
+        let text_columns = match self.mode {
+            ViewMode::Unified => columns.saturating_sub(14),
+            ViewMode::Split => (columns.saturating_sub(1) / 2).saturating_sub(8),
+        }
+        .max(1);
+        self.rows.as_ref().map_or(0, |rows| {
+            rows.max_text_width
+                .saturating_sub(usize::from(text_columns))
+        })
     }
 
     pub fn set_cursor(&mut self, diff: &LoadedDiff, target: usize) {
@@ -144,6 +175,7 @@ impl ViewState {
             self.offset = reanchor(self.offset, old, new, self.body_height, rows.rows.len());
         }
         self.rows = Some(rows);
+        self.hscroll = self.hscroll.min(self.max_hscroll());
         self.keep_cursor_visible();
         self.built_from = Some((diff.clone(), self.mode));
     }
@@ -214,8 +246,50 @@ pub(crate) mod tests {
 
     fn state() -> ViewState {
         let mut s = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
-        s.resize(10);
+        s.resize(120, 10);
         s
+    }
+
+    pub(crate) fn text_snapshot(raw: &str, text: &str) -> Snapshot {
+        let mut snap = snapshot("a.rs", raw, &[(1, "+")]);
+        let DiffState::Ready(diff) = &mut snap.diff else {
+            unreachable!()
+        };
+        Arc::make_mut(diff).file_diff.hunks[0].lines[0].content = text.into();
+        snap
+    }
+
+    #[test]
+    fn width_and_row_changes_clamp_horizontal_scroll() {
+        let mut st = state();
+        st.reconcile(&text_snapshot("r1", &"猫".repeat(70)));
+        assert_eq!(st.rows.as_ref().unwrap().max_text_width, 140);
+        st.hscroll = 34;
+        st.resize(140, 10);
+        assert_eq!(st.hscroll, 14);
+        st.reconcile(&text_snapshot("r2", &"猫".repeat(60)));
+        assert_eq!(st.hscroll, 0);
+    }
+
+    #[test]
+    fn a_narrow_resize_preserves_the_requested_split_and_cursor_line() {
+        let mut st = ViewState::new(ViewMode::Split, FilesPanel::Hidden, true);
+        let snap = snapshot("a.rs", "r1", &[(10, " --+ ")]);
+        st.resize(120, 10);
+        st.reconcile(&snap);
+        let DiffState::Ready(diff) = &snap.diff else {
+            unreachable!()
+        };
+        st.set_cursor(diff, 3);
+        let cursor_id = st.cursor_id;
+        for (width, mode) in [(90, ViewMode::Unified), (120, ViewMode::Split)] {
+            st.resize(width, 10);
+            st.reconcile(&snap);
+            assert_eq!(st.requested_mode, ViewMode::Split);
+            assert_eq!(st.mode, mode);
+            assert_eq!(st.built_from.as_ref().unwrap().1, mode);
+            assert_eq!(st.cursor_id, cursor_id);
+        }
     }
 
     #[test]
@@ -250,7 +324,8 @@ pub(crate) mod tests {
         if let DiffState::Ready(d) = &snap.diff {
             st.set_cursor(d, 3);
         } // deletions line 12
-        st.mode = ViewMode::Split;
+        st.requested_mode = ViewMode::Split;
+        st.resize(120, st.body_height);
         st.reconcile(&snap);
         assert_eq!(st.cursor_id, Some((Side::Deletions, 12)));
         assert!(st.rows.is_some());
@@ -282,7 +357,8 @@ pub(crate) mod tests {
     fn refresh_reanchors_the_cursor_and_resize_keeps_it_visible() {
         let mut st = state();
         let kinds = "+".repeat(30);
-        let snap = snapshot("a.rs", "r1", &[(10, &kinds)]);
+        let path = "a".repeat(200);
+        let snap = snapshot(&path, "r1", &[(10, &kinds)]);
         st.reconcile(&snap);
         let DiffState::Ready(diff) = &snap.diff else {
             panic!()
@@ -290,11 +366,11 @@ pub(crate) mod tests {
         st.set_cursor(diff, 10);
         st.offset = 6;
         st.hscroll = 16;
-        st.reconcile(&snapshot("a.rs", "r2", &[(1, "++"), (10, &kinds)]));
+        st.reconcile(&snapshot(&path, "r2", &[(1, "++"), (10, &kinds)]));
         let row = st.rows.as_ref().unwrap().row_of_target[st.cursor.unwrap()];
         assert_eq!(row - st.offset, 7);
         assert_eq!(st.hscroll, 16);
-        st.resize(5);
+        st.resize(120, 5);
         assert_eq!(row - st.offset, 4);
     }
 
