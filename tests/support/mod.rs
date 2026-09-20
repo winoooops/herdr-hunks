@@ -1,0 +1,143 @@
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+pub struct FakeHerdr {
+    pub socket_path: PathBuf,
+    recorded: Arc<Mutex<Vec<serde_json::Value>>>,
+    panes: Arc<Mutex<serde_json::Value>>,
+    fail_focus: Arc<AtomicBool>,
+    listener_thread: Option<std::thread::JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl FakeHerdr {
+    pub fn start(dir: &Path) -> Self {
+        let socket_path = dir.join("fake-herdr.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind fake herdr socket");
+        listener.set_nonblocking(true).unwrap();
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let panes = Arc::new(Mutex::new(serde_json::json!({ "panes": [] })));
+        let fail_focus = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (requests, pane_response, focus_failure, stop) = (
+            recorded.clone(),
+            panes.clone(),
+            fail_focus.clone(),
+            shutdown.clone(),
+        );
+        let listener_thread = std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        // On BSD and macOS an accepted socket inherits the
+                        // listener's `O_NONBLOCK`, so a client that has
+                        // connected but not yet written makes `read_line`
+                        // answer `WouldBlock` -- which the arm below reads as
+                        // a dead client and drops the request. The timeout is
+                        // what keeps a genuinely stuck one from holding the
+                        // loop instead.
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                        let mut line = String::new();
+                        if BufReader::new(stream.try_clone().unwrap())
+                            .read_line(&mut line)
+                            .is_err()
+                            || line.is_empty()
+                        {
+                            continue;
+                        }
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        requests.lock().unwrap().push(request.clone());
+                        let id = request["id"].clone();
+                        let response = if !request["params"].is_object() {
+                            serde_json::json!({
+                                "id": id,
+                                "error": {
+                                    "code": "invalid_params",
+                                    "message": "params object required",
+                                },
+                            })
+                        } else {
+                            let result = match request["method"].as_str().unwrap_or_default() {
+                                "pane.get" => pane_response.lock().unwrap()["panes"]
+                                    .as_array().unwrap().iter()
+                                    .find(|pane| pane["pane_id"] == request["params"]["pane_id"])
+                                    .map(|pane| serde_json::json!({ "type": "pane", "pane": pane }))
+                                    .ok_or_else(|| serde_json::json!({ "code": "pane_not_found", "message": "no such pane" })),
+                                "plugin.pane.open" => Ok(serde_json::json!({
+                                    "type": "plugin_pane_opened",
+                                    "plugin_pane": { "pane": { "pane_id": "w1:p9" } },
+                                })),
+                                "plugin.pane.focus" if focus_failure.load(Ordering::Relaxed) =>
+                                    Err(serde_json::json!({ "code": "pane_not_found", "message": "focus failed" })),
+                                "plugin.pane.focus" => Ok(serde_json::json!({ "type": "ok" })),
+                                _ => Err(serde_json::json!({ "code": "unknown_method", "message": "unknown method" })),
+                            };
+                            match result {
+                                Ok(result) => serde_json::json!({ "id": id, "result": result }),
+                                Err(error) => serde_json::json!({ "id": id, "error": error }),
+                            }
+                        };
+                        let mut writer = stream;
+                        let _ =
+                            writer.write_all(serde_json::to_string(&response).unwrap().as_bytes());
+                        let _ = writer.write_all(b"\n");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            socket_path,
+            recorded,
+            panes,
+            fail_focus,
+            listener_thread: Some(listener_thread),
+            shutdown,
+        }
+    }
+
+    pub fn set_panes(&self, panes: serde_json::Value) {
+        *self.panes.lock().unwrap() = serde_json::json!({ "panes": panes });
+    }
+
+    pub fn fail_focus(&self, fail: bool) {
+        self.fail_focus.store(fail, Ordering::Relaxed);
+    }
+
+    pub fn calls_named(&self, method: &str) -> Vec<serde_json::Value> {
+        self.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == method)
+            .cloned()
+            .collect()
+    }
+
+    pub fn stop(mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        let _ = std::fs::remove_file(&self.socket_path);
+        if let Some(thread) = self.listener_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+pub fn wait_for(mut check: impl FnMut() -> bool, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if check() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for condition");
+}

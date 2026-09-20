@@ -13,7 +13,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "herdr-hunks"
 path = "src/main.rs"
-required-features = ["tui"]
 
 [features]
 default = ["tui"]

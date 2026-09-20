@@ -183,3 +183,12 @@ API in a separate process with one test, before starting its Tokio runtime.
 | `src/tui/guard.rs` | `src/sidebar/tui.rs:20-75,85-119,2173-2178` | Terminal guard, polling, and mouse-transition code with required imports and guard tests; `TerminalGuard`, `enter`, `set_mouse`, `poll_terminal`, and `mouse_transition` made public. |
 | `src/tui/layout.rs` | `src/sidebar/layout.rs` | Adapted scroll arithmetic: content offsets and row counts use `usize`, while viewport sizes remain `u16`, so diffs can scroll past row 65,535; reanchoring preserves the cursor's viewport row. |
 | `src/tui/shell.rs` | `src/sidebar/tui.rs:2180-2231,2265 onward` | Adapted terminal setup, mouse reconciliation, rendering and input loop for engine snapshots and handler outcomes; named ANSI colours only, with config notices, panic restoration and bounded runtime shutdown. |
+| `src/herdr/client.rs` | `src/herdr/client.rs` | Unchanged socket client, response decoding, three-second read timeout, and tests. |
+| `tests/support/mod.rs` | `tests/support/mod.rs` | Keeps the socket accept loop, object-params enforcement, request recording, `set_panes`, `calls_named`, `stop`, and `wait_for`; replaces responses with `pane.get`, `plugin.pane.open`, and `plugin.pane.focus`, adds `fail_focus`, and removes the fake CLI, process-info support, agent fixtures, state snapshot, and rusqlite/sha2 imports. |
+| `tests/fixtures/ping-response.json` | `tests/fixtures/ping-response.json` | Unchanged captured ping response used by the client tests. |
+
+`tests/fixtures/herdr-0.8.0-schema.json` is the complete output of
+`$HERDR_BIN_PATH api schema --json`, captured from the installed Herdr 0.8.0
+binary at `/home/will/.local/bin/herdr` (protocol 19, schema version 1).
+Tier A tests resolve each method's parameter definition in this fixture and
+check allowed and required keys for every recorded request.

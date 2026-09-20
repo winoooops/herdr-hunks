@@ -1,10 +1,13 @@
 #[cfg(not(unix))]
 compile_error!("herdr-hunks targets Unix (macOS and Linux) only");
 
+pub mod actions;
 pub mod engine;
 pub mod filesystem;
 #[allow(dead_code)]
 pub mod git;
+pub mod herdr;
+pub mod paths;
 pub mod runtime;
 #[cfg(feature = "tui")]
 pub mod tui;
