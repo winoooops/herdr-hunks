@@ -619,6 +619,8 @@ Below 40x10 the TUI draws a single "terminal too small" line.
 | `?` | key sheet | none (added) |
 | `q` | quit | none (added) |
 
+Ctrl+C quits from any state because a raw-mode terminal does not raise SIGINT, and the arrow keys, PageUp/PageDown and Home/End alias j/k/h/l, Ctrl+D/Ctrl+U and g/G.
+
 Bindings come from `vimeflow:src/features/keymap/catalog.ts:44-186`. Phase 1
 leaves these keys unbound because later phases use them with vimeflow's
 meanings: `s d D` (P2), `i I u U x v y Y @ c /` (P3-P5). herdr's prefix key

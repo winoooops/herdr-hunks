@@ -7,6 +7,7 @@ use crate::tui::rows::Row;
 use crate::tui::sanitize::sanitize;
 use crate::tui::state::{FilesPanel, ViewState};
 use crate::tui::style::{Line, Role, Semantic, Span, Style};
+use crate::tui::{dialog, keys, layout};
 
 pub const FILES_WIDTH: u16 = 18;
 pub const MIN_SPLIT_WIDTH: u16 = 100;
@@ -483,14 +484,54 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
     if let Some(notice) = notice {
         lines.push(vec![Span::label(pad(&sanitize(&notice), columns.into()))]);
     }
-    lines.push(vec![Span::label(pad(
-        "j/k line  [ ] hunk  n/p file  t view  e files  r refresh  ? help  q quit",
-        columns.into(),
-    ))]);
+    let mut hints = vec![
+        "j/k line",
+        "[ ] hunk",
+        "n/p file",
+        "t view",
+        "e files",
+        "r refresh",
+        "? help",
+        "q quit",
+    ];
+    while width(&hints.join("  ")) > usize::from(columns) {
+        // Keep help and quit until the other hints have gone.
+        hints.remove(hints.len().saturating_sub(3));
+    }
+    lines.push(vec![Span::label(pad(&hints.join("  "), columns.into()))]);
     for hit in &mut hits {
         hit.x1 = hit.x1.min(columns);
     }
     hits.retain(|hit| hit.x0 < hit.x1);
+    if state.help_open {
+        let panel_width = columns.min(60);
+        let panel_height = height.saturating_sub(2);
+        let x = usize::from((columns - panel_width) / 2);
+        let mut panel = keys::help_panel();
+        panel.offset = layout::clamp_scroll(
+            state.help_offset,
+            dialog::line_count(&panel, panel_width),
+            panel_height.saturating_sub(4),
+        );
+        for (y, overlay) in dialog::render(&panel, panel_width, panel_height)
+            .into_iter()
+            .enumerate()
+        {
+            let background = &lines[y + 1];
+            let mut line = fit_line(background.clone(), x);
+            line.extend(overlay);
+            let mut skip = x + usize::from(panel_width);
+            for span in background {
+                let cells = width(&span.text);
+                if skip < cells {
+                    line.push(Span::new(scroll_text(&span.text, skip), span.style));
+                }
+                skip = skip.saturating_sub(cells);
+            }
+            lines[y + 1] = fit_line(line, columns.into());
+        }
+        hits.clear();
+    }
     Rendered { lines, hits }
 }
 
@@ -565,6 +606,59 @@ mod tests {
         let bar = &r.plain()[0];
         assert!(bar.contains("‹ a.rs 2/2 ›") && bar.contains("{} 1/1"));
         assert!(!bar.contains("⟳") && !bar.contains("files"));
+    }
+
+    #[test]
+    fn footer_drops_whole_hints_and_preserves_help_and_quit() {
+        let (narrow, _) = rendered(40, 12, FilesPanel::Hidden);
+        let text = narrow.plain();
+        let footer = text.last().unwrap();
+        assert!(!footer.contains('…'), "{footer}");
+        assert_eq!(footer, "j/k line  [ ] hunk  ? help  q quit");
+        let (wide, _) = rendered(120, 12, FilesPanel::Hidden);
+        let text = wide.plain();
+        let footer = text.last().unwrap();
+        for hint in [
+            "j/k line",
+            "[ ] hunk",
+            "n/p file",
+            "t view",
+            "e files",
+            "r refresh",
+            "? help",
+            "q quit",
+        ] {
+            assert!(footer.contains(hint), "{footer} lacks {hint}");
+        }
+    }
+
+    #[test]
+    fn help_is_centred_and_fits_after_resizing_with_a_notice() {
+        let mut snap = files(snapshot("猫.rs", "r1", &[(1, "+")]));
+        snap.watcher_error = Some("unavailable".into());
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Shown, true);
+        st.help_open = true;
+        st.help_offset = 18;
+        for (columns, height) in [(40, 10), (61, 12), (120, 40)] {
+            st.resize(body_height(&st, &snap, height));
+            st.reconcile(&snap);
+            let r = render(&snap, &st, columns, height);
+            assert_eq!(r.lines.len(), usize::from(height));
+            for line in &r.lines {
+                let text: String = line.iter().map(|span| span.text.as_str()).collect();
+                assert_eq!(width(&text), usize::from(columns));
+            }
+            let plain = r.plain();
+            let title = &plain[1];
+            let (left, _) = title.split_once("┌ Keys ").unwrap();
+            assert_eq!(width(left), usize::from(columns.saturating_sub(60) / 2));
+            assert!(r.hits.is_empty());
+            if height == 40 {
+                for binding in keys::KEYS {
+                    assert!(plain.iter().any(|line| line.contains(binding.label)));
+                }
+            }
+        }
     }
 
     #[test]
