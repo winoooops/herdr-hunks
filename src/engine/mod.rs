@@ -1,7 +1,9 @@
 //! UI-agnostic engine. No ratatui or crossterm types appear here.
 pub mod gitver;
 pub mod nav;
+pub mod session;
 pub mod types;
+pub use session::{spawn, EngineHandle, SessionConfig};
 pub use types::*;
 
 /// D3. The frozen tree spawns git itself, so policy is process-wide.
