@@ -5,6 +5,7 @@ pub mod actions;
 pub mod engine;
 pub mod filesystem;
 #[allow(dead_code)]
+#[allow(clippy::all)]
 pub mod git;
 pub mod herdr;
 pub mod paths;

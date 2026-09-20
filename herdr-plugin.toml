@@ -1,0 +1,32 @@
+id = "winoooops.hunks"
+name = "hunks"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Read-only git hunk viewer: changed files, hunks, and a clickable navigation toolbar."
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["sh", "scripts/fetch-or-build.sh"]
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "viewer"
+title = "Hunks"
+description = "Git hunk viewer for the focused pane's worktree"
+placement = "overlay"
+command = ["/bin/sh", "-lc", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-hunks\" tui"]
+
+[[actions]]
+id = "open"
+title = "Open the hunk viewer over the focused pane"
+command = ["target/release/herdr-hunks", "open"]
+
+[[actions]]
+id = "open-split"
+title = "Open the hunk viewer in a split beside the focused pane"
+command = ["target/release/herdr-hunks", "open-split"]
+
+[[actions]]
+id = "update"
+title = "Install the latest release"
+command = ["target/release/herdr-hunks", "update"]

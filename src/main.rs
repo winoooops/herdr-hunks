@@ -26,6 +26,7 @@ fn main() {
         }
         Some("open") => herdr_hunks::actions::run_open(Placement::Overlay),
         Some("open-split") => herdr_hunks::actions::run_open(Placement::Split),
+        Some("update") => herdr_hunks::actions::update::run(),
         Some("--version") | Some("-V") => {
             println!("herdr-hunks {}", env!("CARGO_PKG_VERSION"));
             0

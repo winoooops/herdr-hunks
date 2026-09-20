@@ -1,0 +1,114 @@
+name: Release
+
+# Publishes the four binaries `scripts/fetch-or-build.sh` knows how to fetch.
+# Their names must stay in step with the `case` in that script: it looks for
+# `herdr-hunks-<version>-<target>` in the release tagged `v<version>`.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # A tag that disagrees with Cargo.toml publishes assets under a version the
+  # install script will never ask for. Fail here rather than ship a release
+  # that silently makes everyone compile.
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          set -euo pipefail
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$cargo_version" != "$tag_version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both Darwin slices come off one Apple Silicon runner. `macos-13`
+          # was used here first and queued forever: GitHub has retired it, and
+          # a label that no longer exists never gets a machine, it just waits.
+          # Cross-compiling also halves the macOS runner minutes, which bill at
+          # ten times the Linux rate. Apple's clang targets x86_64 natively, so
+          # the C dependencies in the tree build too.
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # musl is what makes the Linux builds work on any distribution rather than
+      # only on one as new as this runner's glibc.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Name the asset the way the install script looks for it
+        run: |
+          set -euo pipefail
+          asset="herdr-hunks-${{ needs.guard.outputs.version }}-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/herdr-hunks" "$asset"
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  publish:
+    needs: [guard, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      # Two spaces between hash and name: `fetch-or-build.sh` greps for
+      # "  <asset>" at end of line, which is also what sha256sum -c expects.
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd assets
+          chmod +x herdr-hunks-*
+          sha256sum herdr-hunks-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes_args=()
+          if notes=$(git log -1 --format=%b "$GITHUB_REF_NAME" 2>/dev/null) \
+            && [ -n "${notes//[[:space:]]/}" ]; then
+            notes_file=$(mktemp) \
+              && printf '%s\n' "$notes" > "$notes_file" \
+              && notes_args=(--notes-file "$notes_file") \
+              || true
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            "${notes_args[@]}" \
+            assets/*

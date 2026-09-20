@@ -877,9 +877,11 @@ The repository mirrors `herdr-agent-watcher`: `README.md` with `zh-CN` and `ja`
 translations in the same section order; `PORT-SURFACE.md`; `AGENTS.md` and
 `CLAUDE.md`; specs and plans under `docs/superpowers/`; conventional commits with a
 lowercase subject; licence Apache-2.0, as `herdr-agent-watcher`. CI runs `cargo test`,
-`cargo fmt --check`, `cargo clippy` (without `-D warnings` while the frozen tree
-carries inherited warnings), `cargo check --no-default-features`, and
-`scripts/port-check.sh`. The repository carries the GitHub topic `herdr-plugin`,
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (inherited clippy
+warnings are allowed at the frozen git module declaration),
+`cargo check --no-default-features`, `scripts/port-check.sh`, and its self-test.
+Port checks emit a skip notice when the pinned reference checkout is unavailable.
+The repository carries the GitHub topic `herdr-plugin`,
 which is how herdr's marketplace index finds plugins.
 
 ### 6.3 Seams Phase 1 leaves for later phases

@@ -1,5 +1,6 @@
 mod open;
 pub mod reuse;
+pub mod update;
 
 use serde_json::{json, Value};
 
