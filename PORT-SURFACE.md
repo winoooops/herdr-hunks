@@ -13,6 +13,7 @@ then changed only by the registered patches below:
 `scripts/port-check.sh <vimeflow-checkout>` verifies the pinned sources plus
 `port/patches/*.patch` in order against `src/git/`. Two patches are registered:
 `0001-no-ext-diff.patch` (D4) and `0002-drain-sync-output.patch` (D5).
+`sh scripts/port-check-selftest.sh <vimeflow-checkout>` verifies the baseline and rejection of symlinks, extra files, hand edits, and unregistered patches in a temporary copy.
 
 ## Port surface
 

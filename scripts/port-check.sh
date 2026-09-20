@@ -12,7 +12,16 @@ for f in mod.rs watcher.rs test_helpers.rs; do
 done
 for p in port/patches/*.patch; do
   [ -e "$p" ] || continue
+  if ! grep -Fq -e "${p##*/}" PORT-SURFACE.md; then
+    echo "port-check: patch ${p##*/} is not registered in PORT-SURFACE.md" >&2
+    exit 1
+  fi
   patch -s -d "$work" -p1 < "$p"
 done
+non_regular="$(find src/git ! -type f ! -type d -print)"
+if [ -n "$non_regular" ]; then
+  printf 'port-check: src/git allows only regular files and directories; invalid entries:\n%s\n' "$non_regular" >&2
+  exit 1
+fi
 diff -ru "$work/src/git" src/git
 echo "port-check: src/git matches $PIN + $(ls port/patches/*.patch 2>/dev/null | wc -l | tr -d ' ') patch(es)"
