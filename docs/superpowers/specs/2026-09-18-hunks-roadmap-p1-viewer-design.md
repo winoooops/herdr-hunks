@@ -653,6 +653,9 @@ Every string from git is untrusted. Before it reaches a cell the TUI replaces
 each C0 control character other than tab with its Unicode control picture
 (`U+2400 + code`), and DEL and C1 characters with `U+FFFD`. A diff that contains
 escape sequences therefore cannot drive the terminal.
+The TUI also replaces bidirectional formatting controls U+202A–U+202E and
+U+2066–U+2069 with `U+FFFD` (width 1) to prevent misleading source display,
+while preserving U+200E, U+200F and U+061C for legitimate right-to-left prose.
 
 ### 4.6 Empty and error states
 
