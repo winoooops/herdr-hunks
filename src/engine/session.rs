@@ -519,7 +519,9 @@ async fn run(
                                 }
                                 Err(e) => next.diff = DiffState::Failed(e),
                             }
-                            next.refreshing = false;
+                            if !state.status_in_flight && !state.diff_dirty {
+                                next.refreshing = false;
+                            }
                             publish(&mut state, next, &snapshots);
                         }
                         if std::mem::take(&mut state.diff_dirty) {
@@ -881,6 +883,53 @@ mod tests {
         wait_for(&h, "a diff despite constant polling", |s| {
             ready(s).is_some()
         });
+    }
+
+    #[test]
+    fn a_refresh_stays_busy_until_a_diff_started_after_it_completes() {
+        let dir = fixture();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = spawn(
+            rt.handle(),
+            SessionConfig {
+                path: dir.path().to_path_buf(),
+                poll_interval: Duration::from_secs(3600),
+                watcher: Arc::new(FlakyWatcher {
+                    allow: Arc::new(AtomicBool::new(true)),
+                }),
+                git_check: ok_git(),
+                diff_delay: Some(Duration::from_millis(400)),
+            },
+        );
+        wait_for(&h, "first ready diff", |s| ready(s).is_some());
+        h.commands.send(Command::SelectNext).unwrap();
+        wait_for(&h, "next selection loading", |s| {
+            matches!(s.diff, DiffState::Loading)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let refreshed = Instant::now();
+        h.commands.send(Command::Refresh).unwrap();
+        loop {
+            let remaining = Duration::from_secs(3)
+                .checked_sub(refreshed.elapsed())
+                .expect("refresh did not complete within 3 seconds");
+            let s = h
+                .snapshots
+                .recv_timeout(remaining)
+                .expect("refresh completion");
+            if !s.refreshing {
+                assert!(
+                    refreshed.elapsed() >= Duration::from_millis(500),
+                    "refresh cleared before its follow-up diff completed"
+                );
+                assert!(ready(&s).is_some());
+                break;
+            }
+        }
     }
 
     #[test]

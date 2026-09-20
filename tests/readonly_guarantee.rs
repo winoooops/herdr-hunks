@@ -158,7 +158,24 @@ fn the_engine_never_mutates_the_repository() {
     assert!(saw_other, "the branch switch never reached the engine");
     std::thread::sleep(Duration::from_millis(400)); // a few D2 ticks
     handle.commands.send(Command::Shutdown).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_change = Instant::now();
+    let mut log_len = std::fs::metadata(&log).unwrap().len();
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            Instant::now() < deadline,
+            "wrapper log did not settle after shutdown"
+        );
+        let len = std::fs::metadata(&log).unwrap().len();
+        if len != log_len {
+            log_len = len;
+            last_change = Instant::now();
+        }
+        if last_change.elapsed() >= Duration::from_millis(500) {
+            break;
+        }
+    }
 
     let recorded = std::fs::read_to_string(&log).unwrap();
     assert!(!recorded.is_empty(), "wrapper recorded nothing");

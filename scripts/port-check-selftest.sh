@@ -45,3 +45,13 @@ mv "$work/mod.rs" src/git/mod.rs
 
 mv port/patches/0002-drain-sync-output.patch port/patches/9999-unregistered.patch
 check 'unregistered patch file' fail
+mv port/patches/9999-unregistered.patch port/patches/0002-drain-sync-output.patch
+
+rm port/patches/0001-no-ext-diff.patch
+for f in mod.rs watcher.rs test_helpers.rs; do
+  git -C "$src" show "91e45b1c:crates/backend/src/git/$f" > "src/git/$f"
+done
+for p in port/patches/*.patch; do
+  patch -s -p1 < "$p"
+done
+check 'missing registered patch file' fail

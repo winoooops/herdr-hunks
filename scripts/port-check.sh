@@ -18,6 +18,18 @@ for p in port/patches/*.patch; do
   fi
   patch -s -d "$work" -p1 < "$p"
 done
+awk '{
+  while (match($0, /[0-9][0-9][0-9][0-9]-[^[:space:]`\/]*[.]patch/)) {
+    print substr($0, RSTART, RLENGTH)
+    $0 = substr($0, RSTART + RLENGTH)
+  }
+}' PORT-SURFACE.md > "$work/registered-patches"
+while IFS= read -r p; do
+  if [ ! -f "port/patches/$p" ]; then
+    echo "port-check: registered patch $p is missing from port/patches/" >&2
+    exit 1
+  fi
+done < "$work/registered-patches"
 non_regular="$(find src/git ! -type f ! -type d -print)"
 if [ -n "$non_regular" ]; then
   printf 'port-check: src/git allows only regular files and directories; invalid entries:\n%s\n' "$non_regular" >&2

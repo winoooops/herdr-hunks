@@ -2,10 +2,9 @@
 //! (`oldText` / `newText` / `rawDiff`). Drives the producer end-to-end
 //! through `crate::git::get_git_diff` against tempdir git repos.
 //!
-//! Tempdirs live under `$HOME` so `validate_cwd`'s `ensure_within_home`
-//! check passes (the helper used by `git_status` / `get_git_diff` rejects
-//! paths outside the user's home, and the production code path is what we
-//! want to exercise here).
+//! Tempdirs live under `$HOME`, as inherited from the vimeflow port.
+//! This crate's D1 scope policy accepts any canonical absolute path, so
+//! the placement under `$HOME` is not required by `ensure_within_home`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,8 +12,8 @@ use std::process::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 
-/// Create a fresh git repo inside `$HOME` (matching the production
-/// `validate_cwd` scope) and return its tempdir.
+/// Create a fresh git repo inside `$HOME` (the inherited fixture location)
+/// and return its tempdir.
 fn init_repo() -> TempDir {
     let home = dirs::home_dir().expect("no home directory");
     let dir = tempfile::Builder::new()

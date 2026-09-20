@@ -270,9 +270,9 @@ status-hash fallback never works and a git process is always hung.
 threads while waiting, and adds its test inside `watcher.rs`, because the function
 is private.
 
-**K1-K5: known defects in the frozen tree.** K1-K4 sit in the mutating paths and
-are unreachable in Phase 1. K5 is in a read path and is visible in Phase 1. All
-five are fixed in Phase 2, through the patch mechanism of 2.2 or by sibling
+**K1-K6: known defects.** K1-K5 are in the frozen tree. K1-K4 sit in the mutating
+paths and are unreachable in Phase 1. K5 is in a read path and is visible in
+Phase 1. All five are fixed in Phase 2, through the patch mechanism of 2.2 or by sibling
 reimplementation where a patch would be large.
 
 - **K1.** Stage, unstage and discard run with `current_dir(<pane cwd>)`
@@ -294,6 +294,11 @@ reimplementation where a patch would be large.
   file, the staged half is hidden and the deletion is labelled modified. vimeflow
   accepted this limit (its VIM-327 spec puts extending the parser out of scope).
   Phase 1 inherits it because the parser is frozen.
+- **K6.** Superseded engine diff requests are not cancelled: the frozen
+  `run_git_with_timeout` waits in `spawn_blocking`, so aborting the Tokio task
+  would not kill its git child. Holding n/p with slow diffs can therefore pile
+  up git processes. Phase 1 accepts this limitation. Phase 2 adds a concurrency
+  cap or a cancellable runner.
 
 ### 2.5 herdr integration
 
