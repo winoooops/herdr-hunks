@@ -38,7 +38,8 @@ The spec for phase N+1 starts after phase N ships.
   renamed / untracked; insertion and deletion counts. The list inherits the frozen
   parser's one known gap, K5 in 2.4.
 - **G3 Diff view.** Hunks come from git's own unified diff for the selected row.
-  Unified and split modes.
+  Unified and split modes. A configured external diff tool must not replace that
+  output (D4 in 2.4).
 - **G4 Navigation.** vimeflow's read-only key subset: line `j`/`k`, half page
   `Ctrl+d`/`Ctrl+u`, hunk `[`/`]`, file `n`/`p`, side `h`/`l` (split mode), view
   toggle `t`, files list `e` / pin `E`, refresh `r`. The TUI adds a few keys
@@ -126,14 +127,15 @@ herdr-hunks/
 ├── herdr-plugin.toml
 ├── Cargo.toml            # [lib] herdr_hunks; [[bin]] herdr-hunks, required-features = ["tui"]
 ├── PORT-SURFACE.md       # what the frozen tree imports, and every registered divergence
+├── port/patches/         # registered patches applied on top of the pinned sources (2.2)
 ├── scripts/
 │   ├── fetch-or-build.sh # [[build]] step: verified release asset, else cargo build
 │   └── port-check.sh     # diffs src/git/ against vimeflow at the pinned commit
 └── src/
     ├── lib.rs
     ├── main.rs           # subcommands: tui [PATH] (default), open, open-split, update
-    ├── git/              # FROZEN. Verbatim copy of vimeflow crates/backend/src/git/
-    │                     #   (mod.rs, watcher.rs, test_helpers.rs) at 91e45b1c
+    ├── git/              # FROZEN. vimeflow crates/backend/src/git/ (mod.rs, watcher.rs,
+    │                     #   test_helpers.rs) at 91e45b1c, plus port/patches/
     ├── filesystem/scope.rs   # shim for the frozen tree's imports (policy differs: D1)
     ├── runtime/              # shim: EventSink, serialize_event, FakeEventSink (byte-identical)
     ├── engine/               # UI-agnostic view-model (Section 3)
@@ -162,8 +164,12 @@ under `[target.'cfg(unix)'.dependencies]`, which is how the fork already declare
 The method is the one `herdr-agent-watcher` used (its `DESIGN.md` and
 `PORT-SURFACE.md`), with one addition.
 
-1. **Copy mechanically and freeze.** `src/git/` is a byte-identical copy of
-   `vimeflow:crates/backend/src/git/` at `91e45b1c`. Nobody edits it by hand.
+1. **Copy mechanically and freeze.** `src/git/` is
+   `vimeflow:crates/backend/src/git/` at `91e45b1c` with the patch files in
+   `port/patches/` applied in order, and nothing else. Nobody edits it by hand: a
+   change is either a new pin or a new patch file. Phase 1 has two patches, D4 and
+   D5 (2.4); each carries its reason in its header and is small enough to offer
+   back to vimeflow, where the same defect exists.
 2. **Satisfy its imports with shims.** The frozen tree imports exactly
    `crate::filesystem::scope::{ensure_within_home, expand_home, home_canonical, reject_parent_refs}`
    (`vimeflow:crates/backend/src/git/mod.rs:13-15`) and
@@ -175,15 +181,16 @@ The method is the one `herdr-agent-watcher` used (its `DESIGN.md` and
    (`emit_json(event, payload)`). The plugin implements that trait with a
    channel-backed sink that feeds the engine's session loop (3.3).
 5. **Addition: parity is checked by a script, not by convention.**
-   `scripts/port-check.sh <vimeflow-checkout>` diffs `src/git/` against the pinned
-   commit and fails on any unregistered difference. CI runs it when a vimeflow
-   checkout is available. `herdr-agent-watcher` has no such check and its frozen
+   `scripts/port-check.sh <vimeflow-checkout>` takes a pristine copy of the pinned
+   sources, applies `port/patches/*.patch` in order, and requires the result to
+   equal `src/git/` byte for byte. CI runs it when a vimeflow checkout is
+   available. `herdr-agent-watcher` has no such check and its frozen
    tree has drifted in five unregistered files.
 
 The mutating functions in the frozen tree (`stage_file_inner`,
 `unstage_file_inner`, `discard_file_inner`) are copied but not called in Phase 1.
-`lib.rs` declares the module as `#[allow(dead_code)] pub mod git;` so the frozen
-files stay byte-identical. G7 is enforced by the test in Section 5, not by
+`lib.rs` declares the module as `#[allow(dead_code)] pub mod git;` so no frozen
+file needs an attribute added. G7 is enforced by the test in Section 5, not by
 deleting code.
 
 ### 2.3 Process model
@@ -243,10 +250,30 @@ the watcher's synchronous calls. The frozen tree is not edited.
   was rejected: it would lock out every system that still ships an older git, for
   the sake of a partial-clone edge case.
 
+**D4 (Phase 1, patch): no external diff.** The two patch-producing diff calls
+(`vimeflow:crates/backend/src/git/mod.rs:1343,1500`) pass `--no-color` but not
+`--no-ext-diff`, so `diff.external`, `GIT_EXTERNAL_DIFF` or a per-path diff driver
+replaces the unified diff. With a tool such as difftastic configured globally,
+every file would parse to zero hunks. No environment variable turns external
+diffs off, so this cannot be a D3 item. `port/patches/0001-no-ext-diff.patch` adds
+`--no-ext-diff` to those two calls. The numstat and name-status calls never run
+an external diff and are untouched. Textconv filters are left on: their output is
+still a unified diff.
+
+**D5 (Phase 1, patch): drain child output.** The watcher's
+`run_sync_with_timeout` polls `try_wait` and reads the child's pipes only after it
+exits (`vimeflow:crates/backend/src/git/watcher.rs:195-214`). A `git status` whose
+output exceeds the pipe buffer (64 KiB on Linux; a few thousand untracked paths)
+blocks on write until the 10 s timeout kills it, so in such a repository the
+status-hash fallback never works and a git process is always hung.
+`port/patches/0002-drain-sync-output.patch` reads stdout and stderr on helper
+threads while waiting, and adds its test inside `watcher.rs`, because the function
+is private.
+
 **K1-K5: known defects in the frozen tree.** K1-K4 sit in the mutating paths and
 are unreachable in Phase 1. K5 is in a read path and is visible in Phase 1. All
-five are fixed in Phase 2, which is the first phase that has to decide how the
-frozen tree takes registered patches.
+five are fixed in Phase 2, through the patch mechanism of 2.2 or by sibling
+reimplementation where a patch would be large.
 
 - **K1.** Stage, unstage and discard run with `current_dir(<pane cwd>)`
   (`mod.rs:369,393,437-462`), while status and diff return toplevel-relative paths
@@ -319,12 +346,16 @@ herdr opens splits at 50/50 and has no ratio parameter.
 
 **Instances.** herdr neither dedupes nor lists plugin panes. `open-split` resolves
 the worktree toplevel of `repo_cwd` (`git rev-parse --show-toplevel`) and records
-`{viewer_pane_id, toplevel}` in `$HERDR_PLUGIN_STATE_DIR/split-panes.json`, keyed
-by opener pane id. On the next invoke it reuses the recorded viewer, through
-`plugin.pane.focus`, only when the recorded `toplevel` equals the one just
-resolved and the focus call succeeds. If the opener has moved to another worktree,
-or the focus call fails, it opens a new viewer and overwrites the record; the old
-viewer keeps running until the user quits it. `overlay` needs no record.
+`{viewer_pane_id, repo_cwd, toplevel}` in
+`$HERDR_PLUGIN_STATE_DIR/split-panes.json`. The state directory is shared by every
+herdr session and pane ids such as `w1:p1` are session-local, so the key is the
+pair (`$HERDR_SOCKET_PATH`, opener pane id). On the next invoke it reuses the
+recorded viewer only when all of these hold: the recorded `toplevel` equals the
+one just resolved; `pane.get` on the recorded viewer id succeeds; that pane's
+label is the viewer's manifest title and its `cwd` is the recorded `repo_cwd`; and
+`plugin.pane.focus` succeeds. Otherwise it opens a new viewer and overwrites the
+record; an old viewer keeps running until the user quits it. `overlay` needs no
+record.
 
 **Keybinding.** Phase 1 documents the `[[keys.command]]` snippet in the README with
 `prefix+d` as the suggested key (unbound in both upstream herdr and the fork). Porting
@@ -332,7 +363,7 @@ viewer keeps running until the user quits it. `overlay` needs no record.
 and nothing in Phase 1 depends on it.
 
 **Socket methods used in Phase 1:** `pane.get`, `plugin.pane.open`,
-`plugin.pane.focus`. The client is `herdr-agent-watcher`'s: one JSON request per
+`plugin.pane.focus` (`pane.get` serves both the opener lookup and the reuse check). The client is `herdr-agent-watcher`'s: one JSON request per
 connection, newline-delimited, 3 s read timeout.
 
 ## 3. Engine API and data flow
@@ -359,6 +390,7 @@ pub struct Snapshot {
     pub diff: DiffState,               // Idle | Loading | Ready(Arc<LoadedDiff>) | Failed(String)
     pub status_error: Option<String>,  // last status failure; `files` keeps the last good list
     pub watcher_error: Option<String>, // set while live refresh runs degraded, see 3.3
+    pub refreshing: bool,              // a user-requested refresh is in flight, see 3.3
 }
 
 pub struct LoadedDiff {
@@ -394,8 +426,9 @@ UI, watcher events, and the D2 tick.
   alone would need only 2.15.) An older git is a fatal start error: the engine
   publishes `RepoState::Unusable` and runs no repository command. A `PATH` argument
   that is missing or not a directory ends the same way.
-- **Start.** Resolve the path, start the frozen watcher with
-  `start_git_watcher_backend(cwd, sink, state)`, run the first refresh. The sink
+- **Start.** Resolve the path, then start the frozen watcher with
+  `start_git_watcher_backend(cwd, sink, state)` and run the first refresh
+  concurrently; the first refresh never waits for the watcher. The sink
   is the channel-backed `EventSink`; the events it receives are
   `git-status-changed` and `git-head-changed`, each with a `cwds` payload
   (`vimeflow:crates/backend/src/git/watcher.rs:367-377,1470-1484`).
@@ -415,6 +448,13 @@ UI, watcher events, and the D2 tick.
   files for a non-repo cwd (`vimeflow:crates/backend/src/git/mod.rs:1126-1132`).
   The engine maps that to `RepoState::NotARepo`. The frozen watcher's pre-repo mode
   fires when `.git/` appears, and the next refresh upgrades the state.
+- **Loading versus background refresh.** `DiffState::Loading` is used only when
+  there is no diff to show for the selected `FileKey`: the first load and a
+  selection change. A refresh of the same `FileKey` (watcher event, D2 tick or
+  `r`) keeps `Ready(old)` in place and swaps it only when the new result differs,
+  so an unchanged repository produces no transition, no redraw, and no loss of
+  the diff the TUI reconciles against (4.8). Only a refresh the user asked for with
+  `r` sets `refreshing` while it runs, as feedback.
 - **Coalescing.** At most one refresh is in flight. A trigger that arrives during
   a refresh sets a dirty flag, and exactly one follow-up refresh runs.
 - **Stale results.** Every refresh carries a generation number. A diff result is
@@ -428,7 +468,7 @@ UI, watcher events, and the D2 tick.
   `revision` differs from the last published snapshot: `repo` (a branch switch in
   a clean repository changes nothing else), `files`, `selected`, `diff` (including
   the `Loading`, `Failed` and recovery transitions, and a changed `raw_diff`),
-  `status_error` and `watcher_error`. `revision` increments only then, so a quiet
+  `status_error`, `watcher_error` and `refreshing`. `revision` increments only then, so a quiet
   repository causes no redraws.
 
 ### 3.4 Navigation model
@@ -680,7 +720,7 @@ view slices rows itself, so ratatui's `u16` scroll limit never applies.
 | git call exceeds the frozen 30 s timeout | `status_error` or `DiffState::Failed`; the last good file list stays |
 | worktree removed while the viewer is open | refresh errors are shown; no crash; `r` retries |
 | the watcher cannot start (for example the inotify watch limit is exhausted) | degraded mode (3.3): `watcher_error` notice, 5 s polling that includes branch and worktree name, `r` retries the watcher |
-| slow status on a large repository | input and drawing continue; the toolbar shows a loading mark; triggers coalesce (3.3) |
+| slow status on a large repository | input and drawing continue; the toolbar shows a loading mark while `diff` is `Loading` or `refreshing` is set; background refreshes stay silent; triggers coalesce (3.3) |
 | very large diff | the engine's size cap (3.2) keeps 200,000 lines; the body ends with a "N more lines not shown" row, and every navigation target lies inside what is shown |
 | terminal hangs up (pane closed) | the poll loop sees `POLLHUP` and exits cleanly (`herdr-agent-watcher`'s `poll_terminal`) |
 | panic | a panic hook restores the terminal through `TerminalGuard` before printing |
@@ -717,7 +757,13 @@ view slices rows itself, so ratatui's `u16` scroll limit never applies.
    and the snapshot's `raw_diff` must converge; a branch switch must reach
    `repo.branch` through the tick; a `Refresh` with the failure lifted must clear
    `watcher_error`. **Literal pathspecs:** with `a*.txt` and `ab.txt` both
-   modified, selecting `a*.txt` yields only its own hunks. The fixture set
+   modified, selecting `a*.txt` yields only its own hunks. **D4:** with
+   `diff.external=/bin/echo` in the fixture's config, a modified file and an
+   untracked file still parse to their real hunks. **Background refresh:** a D2
+   tick on an unchanged repository publishes nothing, and `diff` never leaves
+   `Ready` during a same-key refresh. **D5** is tested inside the patched
+   `watcher.rs`: a child that writes 1 MiB to stdout returns its full output well
+   inside the timeout. The fixture set
    includes `MM`, `AM`, a staged rename with a worktree edit, a staged deletion,
    and an untracked file inside a new untracked directory (criterion 1).
 5. **Navigation tests.** Table tests for `targets_for_diff`,
@@ -755,8 +801,10 @@ view slices rows itself, so ratatui's `u16` scroll limit never applies.
 9. **herdr integration, tier A.** A fake herdr socket that enforces object
    `params` and records requests (from `herdr-agent-watcher`'s `tests/support`):
    `open` sends the overlay shape with no `target_pane_id`; `open-split` sends the
-   split shape; reuse happens only when the recorded toplevel matches; a failed
-   focus opens a new viewer; the host is reached only through `$HERDR_BIN_PATH` or
+   split shape; reuse happens only when the recorded toplevel matches, the socket
+   path matches, and `pane.get` reports the viewer's title and recorded cwd; a
+   record made under another socket path, a relabelled pane or a failed focus each
+   open a new viewer; the host is reached only through `$HERDR_BIN_PATH` or
    the socket. Request parameters are pinned against a fixture of
    `herdr api schema --json` captured from herdr 0.8.0.
 10. **herdr integration, tier B (`#[ignore]`).** A real `herdr --session <name>
@@ -827,7 +875,7 @@ Phase 1 builds none of the following. It only avoids closing them off.
 | --- | --- |
 | P2 hunk patch slicing (port of `extractHunkPatch`, `vimeflow:src/features/diff/services/gitPatch.ts:65-86`) | `LoadedDiff.raw_diff` is kept, and hunks keep git's own boundaries |
 | P2 actions and confirmations | the toolbar slot between the steppers, the unbound keys `s d D`, the dialog layer, an extensible `engine::Command` |
-| P2 frozen-tree fixes K1-K5 | the divergence registry and `port-check.sh`; P2 decides between registered patches and sibling reimplementation |
+| P2 frozen-tree fixes K1-K5 | the patch mechanism of 2.2 (already exercised by D4 and D5), the divergence registry and `port-check.sh` |
 | P3 comment anchors | `(FileKey, side, line_number)` from `engine::nav`, the same coordinates vimeflow's prompt format uses |
 | P3 dispatch target | `HERDR_HUNKS_OPENER_PANE` is already passed to the viewer; `herdr/` already wraps the socket |
 | P3 persistence | `$HERDR_PLUGIN_STATE_DIR` is already the only place Phase 1 writes (`split-panes.json`, `config-problems.log`) |
