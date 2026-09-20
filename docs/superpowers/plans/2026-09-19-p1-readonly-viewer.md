@@ -3951,3 +3951,5 @@ Then carry out every row of `docs/acceptance-p1.md` by hand, in upstream herdr 0
 git add -A
 git commit -m "test: add real-herdr end-to-end test and the phase 1 acceptance checklist"
 ```
+
+<!-- codex-reviewed: 2026-09-20T03:47:52Z -->
