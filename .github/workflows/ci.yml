@@ -14,9 +14,10 @@ jobs:
           components: rustfmt, clippy
       - run: git --version
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test -- --test-threads=1
-      - run: cargo check --no-default-features
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked -- --test-threads=1
+      - run: cargo check --locked --no-default-features
+      - run: sh scripts/fetch-or-build-selftest.sh
 
   port-check:
     runs-on: ubuntu-latest

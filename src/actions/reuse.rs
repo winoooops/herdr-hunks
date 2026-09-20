@@ -33,6 +33,7 @@ pub fn save(state_dir: &Path, records: &BTreeMap<String, Record>) -> std::io::Re
 
 pub fn with_lock<T>(state_dir: &Path, f: impl FnOnce() -> T) -> std::io::Result<T> {
     use std::os::unix::io::AsRawFd;
+    use std::time::{Duration, Instant};
     std::fs::create_dir_all(state_dir)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -40,8 +41,22 @@ pub fn with_lock<T>(state_dir: &Path, f: impl FnOnce() -> T) -> std::io::Result<
         .write(true)
         .open(state_dir.join("split-panes.lock"))?;
     // flock is released when `file` drops, including on panic.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error());
+    let start = Instant::now();
+    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ) {
+            return Err(error);
+        }
+        if start.elapsed() >= Duration::from_secs(2) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "split reuse lock is busy",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
     Ok(f())
 }
@@ -103,6 +118,43 @@ mod tests {
     #[test]
     fn keys_are_scoped_by_socket_path() {
         assert_ne!(key("/a/herdr.sock", "w1:p1"), key("/b/herdr.sock", "w1:p1"));
+    }
+
+    #[test]
+    fn a_busy_lock_times_out_and_can_be_acquired_after_release() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_owned();
+        let (ready, acquired) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            with_lock(&path, || {
+                ready.send(()).unwrap();
+                released.recv().unwrap();
+            })
+            .unwrap();
+        });
+        acquired.recv().unwrap();
+        let path = dir.path().to_owned();
+        let (done, result) = mpsc::channel();
+        let start = Instant::now();
+        let contender = std::thread::spawn(move || {
+            done.send(with_lock(&path, || ())).unwrap();
+        });
+        let result = result.recv_timeout(Duration::from_secs(3));
+        let elapsed = start.elapsed();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        contender.join().unwrap();
+        let error = result
+            .expect("busy lock must return within three seconds")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("lock is busy"));
+        assert!(elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(3));
+        assert_eq!(with_lock(dir.path(), || 42).unwrap(), 42);
     }
 
     #[test]

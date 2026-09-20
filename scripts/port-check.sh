@@ -3,6 +3,11 @@
 set -eu
 PIN=91e45b1c
 src="${1:?usage: port-check.sh <vimeflow-checkout>}"
+invalid_names="$(find port/patches -name '*[[:space:]]*' -print)"
+if [ -n "$invalid_names" ]; then
+  printf 'port-check: patch names must not contain whitespace:\n%s\n' "$invalid_names" >&2
+  exit 1
+fi
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 git -C "$src" cat-file -e "$PIN^{commit}" || { echo "pin $PIN not found in $src" >&2; exit 2; }

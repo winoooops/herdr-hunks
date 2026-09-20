@@ -8,6 +8,17 @@ fn manifest_and_crate_versions_match() {
         manifest["version"].as_str(),
         Some(env!("CARGO_PKG_VERSION"))
     );
+    let lock: toml::Table = std::fs::read_to_string("Cargo.lock")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let package = lock["package"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"].as_str() == Some(env!("CARGO_PKG_NAME")))
+        .expect("crate package in Cargo.lock");
+    assert_eq!(package["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
     assert_eq!(manifest["id"].as_str(), Some("winoooops.hunks"));
     assert_eq!(
         manifest["panes"][0]["title"].as_str(),

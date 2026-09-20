@@ -64,7 +64,7 @@ jobs:
       # only on one as new as this runner's glibc.
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Name the asset the way the install script looks for it
         run: |
           set -euo pipefail

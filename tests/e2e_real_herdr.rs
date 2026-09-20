@@ -1,5 +1,6 @@
 use serde_json::Value;
 use std::ffi::OsStr;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
@@ -27,12 +28,23 @@ fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
     }
 }
 
+fn host_paths(root: &Path, suffix: &Path) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => panic!("read {}: {error}", root.display()),
+    };
+    entries
+        .map(|entry| entry.unwrap().path().join(suffix))
+        .filter(|path| path.exists())
+        .collect()
+}
+
 struct Isolated {
     host: PathBuf,
     home: PathBuf,
     config: PathBuf,
     state: PathBuf,
-    socket: PathBuf,
     session: String,
 }
 
@@ -156,16 +168,11 @@ fn open_split_creates_one_viewer_and_reuses_it() {
             .unwrap();
         let session = format!("hh-e2e-{}", std::process::id());
         let config = tmp.path().join("xdg-config");
-        let socket = config
-            .join("herdr/sessions")
-            .join(&session)
-            .join("herdr.sock");
         let iso = Isolated {
             host,
             home: tmp.path().join("home"),
             config,
             state: tmp.path().join("xdg-state"),
-            socket,
             session,
         };
         std::fs::create_dir_all(&iso.home).unwrap();
@@ -178,14 +185,29 @@ fn open_split_creates_one_viewer_and_reuses_it() {
                 .spawn()
                 .expect("spawn isolated host server"),
         );
+        let mut socket = None;
+        let suffix = Path::new("sessions").join(&iso.session).join("herdr.sock");
         wait_for("isolated session socket", || {
             assert!(
                 server.0.try_wait().unwrap().is_none(),
                 "isolated server exited: {}",
                 std::fs::read_to_string(&server_log).unwrap_or_default()
             );
-            iso.socket.exists()
+            let mut sockets: Vec<_> = host_paths(&iso.config, &suffix)
+                .into_iter()
+                .filter(|path| {
+                    path.metadata()
+                        .is_ok_and(|metadata| metadata.file_type().is_socket())
+                })
+                .collect();
+            assert!(
+                sockets.len() <= 1,
+                "multiple isolated session sockets: {sockets:?}"
+            );
+            socket = sockets.pop();
+            socket.is_some()
         });
+        let socket = socket.unwrap();
 
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -237,17 +259,22 @@ fn open_split_creates_one_viewer_and_reuses_it() {
         assert_eq!(viewers[0]["pane_id"], viewer_id);
         assert_eq!(viewers[0]["focused"], true);
 
-        let state_file = iso
-            .state
-            .join("herdr/plugins")
+        let suffix = Path::new("plugins")
             .join(plugin_id)
             .join("split-panes.json");
-        let records: Value =
-            serde_json::from_str(&std::fs::read_to_string(state_file).expect("split-panes.json"))
-                .unwrap();
+        let state_files = host_paths(&iso.state, &suffix);
+        assert_eq!(
+            state_files.len(),
+            1,
+            "expected one reuse record file: {state_files:?}"
+        );
+        let records: Value = serde_json::from_str(
+            &std::fs::read_to_string(&state_files[0]).expect("split-panes.json"),
+        )
+        .unwrap();
         let records = records.as_object().expect("reuse records");
         assert_eq!(records.len(), 1);
-        let key = herdr_hunks::actions::reuse::key(iso.socket.to_str().unwrap(), opener);
+        let key = herdr_hunks::actions::reuse::key(socket.to_str().unwrap(), opener);
         assert_eq!(records[&key]["viewer_pane_id"], viewer_id);
         iso.herdr(&["server", "stop"]);
         wait_for("isolated server shutdown", || {

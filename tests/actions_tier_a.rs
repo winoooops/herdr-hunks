@@ -40,6 +40,51 @@ fn with_viewer(dir: &Path, fake: &FakeHerdr, label: &str, cwd: &Path) {
     fake.set_panes(json!([opener(dir), { "pane_id": "w1:p9", "label": label, "cwd": cwd }]));
 }
 
+fn matches_required_shape(value: &Value, definition: &Value, schema: &Value) -> bool {
+    if let Some(reference) = definition["$ref"].as_str() {
+        return matches_required_shape(
+            value,
+            schema
+                .pointer(reference.strip_prefix('#').unwrap())
+                .unwrap(),
+            schema,
+        );
+    }
+    if let Some(constant) = definition.get("const") {
+        if value != constant {
+            return false;
+        }
+    }
+    if let Some(required) = definition["required"].as_array() {
+        if required
+            .iter()
+            .any(|key| value.get(key.as_str().unwrap()).is_none())
+        {
+            return false;
+        }
+    }
+    for alternatives in ["oneOf", "anyOf"] {
+        if let Some(variants) = definition[alternatives].as_array() {
+            if !variants
+                .iter()
+                .any(|variant| matches_required_shape(value, variant, schema))
+            {
+                return false;
+            }
+        }
+    }
+    if let Some(properties) = definition["properties"].as_object() {
+        for (key, child) in properties {
+            if let Some(field) = value.get(key) {
+                if !matches_required_shape(field, child, schema) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 fn finish(fake: FakeHerdr) {
     let schema: Value =
         serde_json::from_str(include_str!("fixtures/herdr-0.8.0-schema.json")).unwrap();
@@ -71,6 +116,17 @@ fn finish(fake: FakeHerdr) {
                 }
             }
         }
+    }
+    for response in fake.responses() {
+        let kind = if response.get("result").is_some() {
+            "success_response"
+        } else {
+            "error_response"
+        };
+        assert!(
+            matches_required_shape(&response, &schema["schemas"][kind], &schema),
+            "response violates {kind}: {response}"
+        );
     }
     fake.stop();
 }

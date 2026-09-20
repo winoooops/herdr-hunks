@@ -43,6 +43,14 @@ printf '\n// hand edit\n' >> src/git/mod.rs
 check 'hand edit' fail
 mv "$work/mod.rs" src/git/mod.rs
 
+mv port/patches/0002-drain-sync-output.patch 'port/patches/0002-drain sync-output.patch'
+sed 's/0002-drain-sync-output.patch/0002-drain sync-output.patch/g' PORT-SURFACE.md > "$work/registry"
+mv "$work/registry" PORT-SURFACE.md
+check 'registered patch name with whitespace' fail
+grep -q 'patch names must not contain whitespace' "$work/result.log"
+mv 'port/patches/0002-drain sync-output.patch' port/patches/0002-drain-sync-output.patch
+cp "$root/PORT-SURFACE.md" PORT-SURFACE.md
+
 mv port/patches/0002-drain-sync-output.patch port/patches/9999-unregistered.patch
 check 'unregistered patch file' fail
 mv port/patches/9999-unregistered.patch port/patches/0002-drain-sync-output.patch

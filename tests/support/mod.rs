@@ -5,9 +5,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+fn pane_info(pane: serde_json::Value) -> serde_json::Value {
+    let mut complete = serde_json::json!({
+        "terminal_id": format!("terminal-{}", pane["pane_id"].as_str().unwrap()),
+        "workspace_id": "w1", "tab_id": "w1:t1", "focused": false,
+        "agent_status": "unknown", "revision": 1,
+    });
+    complete
+        .as_object_mut()
+        .unwrap()
+        .extend(pane.as_object().unwrap().clone());
+    complete
+}
+
 pub struct FakeHerdr {
     pub socket_path: PathBuf,
     recorded: Arc<Mutex<Vec<serde_json::Value>>>,
+    responses: Arc<Mutex<Vec<serde_json::Value>>>,
     panes: Arc<Mutex<serde_json::Value>>,
     fail_focus: Arc<AtomicBool>,
     listener_thread: Option<std::thread::JoinHandle<()>>,
@@ -20,6 +34,8 @@ impl FakeHerdr {
         let listener = UnixListener::bind(&socket_path).expect("bind fake herdr socket");
         listener.set_nonblocking(true).unwrap();
         let recorded = Arc::new(Mutex::new(Vec::new()));
+        let responses = Arc::new(Mutex::new(Vec::new()));
+        let sent = responses.clone();
         let panes = Arc::new(Mutex::new(serde_json::json!({ "panes": [] })));
         let fail_focus = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -66,15 +82,29 @@ impl FakeHerdr {
                                 "pane.get" => pane_response.lock().unwrap()["panes"]
                                     .as_array().unwrap().iter()
                                     .find(|pane| pane["pane_id"] == request["params"]["pane_id"])
-                                    .map(|pane| serde_json::json!({ "type": "pane", "pane": pane }))
+                                    .map(|pane| serde_json::json!({ "type": "pane_info", "pane": pane }))
                                     .ok_or_else(|| serde_json::json!({ "code": "pane_not_found", "message": "no such pane" })),
                                 "plugin.pane.open" => Ok(serde_json::json!({
                                     "type": "plugin_pane_opened",
-                                    "plugin_pane": { "pane": { "pane_id": "w1:p9" } },
+                                    "plugin_pane": {
+                                        "plugin_id": request["params"]["plugin_id"],
+                                        "entrypoint": request["params"]["entrypoint"],
+                                        "pane": pane_info(serde_json::json!({
+                                            "pane_id": "w1:p9", "label": "Hunks", "cwd": request["params"]["cwd"],
+                                            "focused": request["params"]["focus"].as_bool().unwrap_or(false),
+                                        })),
+                                    },
                                 })),
                                 "plugin.pane.focus" if focus_failure.load(Ordering::Relaxed) =>
                                     Err(serde_json::json!({ "code": "pane_not_found", "message": "focus failed" })),
-                                "plugin.pane.focus" => Ok(serde_json::json!({ "type": "ok" })),
+                                "plugin.pane.focus" => pane_response.lock().unwrap()["panes"]
+                                    .as_array().unwrap().iter()
+                                    .find(|pane| pane["pane_id"] == request["params"]["pane_id"])
+                                    .map(|pane| serde_json::json!({
+                                        "type": "plugin_pane_focused",
+                                        "plugin_pane": { "plugin_id": "test.hunks", "entrypoint": "viewer", "pane": pane },
+                                    }))
+                                    .ok_or_else(|| serde_json::json!({ "code": "pane_not_found", "message": "no such pane" })),
                                 _ => Err(serde_json::json!({ "code": "unknown_method", "message": "unknown method" })),
                             };
                             match result {
@@ -82,6 +112,7 @@ impl FakeHerdr {
                                 Err(error) => serde_json::json!({ "id": id, "error": error }),
                             }
                         };
+                        sent.lock().unwrap().push(response.clone());
                         let mut writer = stream;
                         let _ =
                             writer.write_all(serde_json::to_string(&response).unwrap().as_bytes());
@@ -97,6 +128,7 @@ impl FakeHerdr {
         Self {
             socket_path,
             recorded,
+            responses,
             panes,
             fail_focus,
             listener_thread: Some(listener_thread),
@@ -105,6 +137,13 @@ impl FakeHerdr {
     }
 
     pub fn set_panes(&self, panes: serde_json::Value) {
+        let panes: Vec<_> = panes
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(pane_info)
+            .collect();
         *self.panes.lock().unwrap() = serde_json::json!({ "panes": panes });
     }
 
@@ -120,6 +159,10 @@ impl FakeHerdr {
             .filter(|request| request["method"] == method)
             .cloned()
             .collect()
+    }
+
+    pub fn responses(&self) -> Vec<serde_json::Value> {
+        self.responses.lock().unwrap().clone()
     }
 
     pub fn stop(mut self) {
