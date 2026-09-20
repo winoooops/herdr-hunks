@@ -6,6 +6,8 @@ pub mod filesystem;
 #[allow(dead_code)]
 pub mod git;
 pub mod runtime;
+#[cfg(feature = "tui")]
+pub mod tui;
 
 #[cfg(test)]
 mod git_diff_response_tests;

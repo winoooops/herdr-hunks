@@ -168,3 +168,8 @@ API in a separate process with one test, before starting its Tokio runtime.
 
 | file | source | adaptation |
 | --- | --- | --- |
+| `src/tui/style.rs` | `src/sidebar/style.rs:1-84` | Unchanged `Role`, `Semantic`, `Style`, `Span`, and `Line`; excludes `Rendered` and its layout import. |
+| `src/tui/format.rs` | `src/sidebar/format.rs` | Unchanged `width`, `pad`, and `truncate`, with their relevant tests and Unicode width import. |
+| `src/tui/dialog.rs` | `src/sidebar/dialog.rs` | All seven `crate::sidebar::` references changed to `crate::tui::`, including test references. |
+| `src/tui/guard.rs` | `src/sidebar/tui.rs:20-75,85-119,2173-2178` | Terminal guard, polling, and mouse-transition code with required imports and guard tests; `TerminalGuard`, `enter`, `set_mouse`, `poll_terminal`, and `mouse_transition` made public. |
+| `src/tui/layout.rs` | `src/sidebar/layout.rs` | Adapted scroll arithmetic: content offsets and row counts use `usize`, while viewport sizes remain `u16`, so diffs can scroll past row 65,535; reanchoring preserves the cursor's viewport row. |
