@@ -17,6 +17,16 @@ for f in mod.rs watcher.rs test_helpers.rs; do
 done
 for p in port/patches/*.patch; do
   [ -e "$p" ] || continue
+  # The registry parser below only sees canonical names, so nothing else may exist.
+  case "${p##*/}" in
+    *[!A-Za-z0-9._-]*) canonical=no ;;
+    [0-9][0-9][0-9][0-9]-*.patch) canonical=yes ;;
+    *) canonical=no ;;
+  esac
+  if [ "$canonical" = no ]; then
+    echo "port-check: patch ${p##*/} must be named NNNN-<name>.patch using only letters, digits, '.', '_' and '-'" >&2
+    exit 1
+  fi
   if ! grep -Fq -e "${p##*/}" PORT-SURFACE.md; then
     echo "port-check: patch ${p##*/} is not registered in PORT-SURFACE.md" >&2
     exit 1
