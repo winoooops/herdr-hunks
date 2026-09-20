@@ -420,7 +420,7 @@ Spec: 2.4 D3, 3.3 "Version check", 3.5.
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `engine::init_process_env()`, `engine::GIT_CHILD_ENV: [(&str, &str); 3]`, `engine::gitver::{GitVersion, MIN_GIT, parse(&str) -> Option<GitVersion>, check() -> Result<GitVersion, String>}`.
+- Produces: `engine::init_process_env()`, `engine::GIT_CHILD_ENV: [(&str, &str); 3]`, `engine::gitver::{GitVersion, MIN_GIT, GitCheckError::{Missing(String), TooOld(String)}, parse(&str) -> Option<GitVersion>, check() -> Result<GitVersion, GitCheckError>}`.
 
 - [ ] **Step 1: Write the failing tests in `src/engine/gitver.rs`**
 
@@ -470,18 +470,25 @@ pub fn parse(output: &str) -> Option<GitVersion> {
     Some(GitVersion { major, minor })
 }
 
-pub fn check() -> Result<GitVersion, String> {
+/// `Missing` is retryable (the user can fix PATH and press `r`); `TooOld` is fatal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitCheckError {
+    Missing(String),
+    TooOld(String),
+}
+
+pub fn check() -> Result<GitVersion, GitCheckError> {
     let output = std::process::Command::new("git")
         .arg("--version")
         .output()
-        .map_err(|e| format!("Failed to spawn git: {e}"))?;
+        .map_err(|e| GitCheckError::Missing(format!("Failed to spawn git: {e}")))?;
     let text = String::from_utf8_lossy(&output.stdout);
-    let version = parse(&text).ok_or_else(|| format!("unrecognised git version: {}", text.trim()))?;
+    let version = parse(&text).ok_or_else(|| GitCheckError::Missing(format!("unrecognised git version: {}", text.trim())))?;
     if version < MIN_GIT {
-        return Err(format!(
+        return Err(GitCheckError::TooOld(format!(
             "git {}.{} is too old: herdr-hunks needs git {}.{} or newer",
             version.major, version.minor, MIN_GIT.major, MIN_GIT.minor
-        ));
+        )));
     }
     Ok(version)
 }
@@ -510,12 +517,14 @@ pub fn init_process_env() {
 
 #[cfg(test)]
 mod tests {
+    // `init_process_env` must run before any thread exists, so it is never called from
+    // a unit test: libtest runs tests on threads, next to other tests that spawn git.
+    // Its process-level effect is asserted in tests/env_policy.rs (Task 7) and
+    // tests/readonly_guarantee.rs (Task 8), each of which is a process of its own.
     #[test]
-    fn sets_all_three_variables() {
-        super::init_process_env();
-        for (key, value) in super::GIT_CHILD_ENV {
-            assert_eq!(std::env::var(key).as_deref(), Ok(value));
-        }
+    fn the_policy_names_the_three_variables() {
+        let keys: Vec<&str> = super::GIT_CHILD_ENV.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, ["GIT_OPTIONAL_LOCKS", "GIT_LITERAL_PATHSPECS", "GIT_NO_LAZY_FETCH"]);
     }
 }
 ```
@@ -1101,7 +1110,8 @@ pub struct SessionConfig {
     pub path: std::path::PathBuf,
     pub poll_interval: std::time::Duration,      // 5 s in production
     pub watcher: std::sync::Arc<dyn WatcherControl>, // FrozenWatcher in production
-    pub check_git_version: bool,                 // true in production
+    /// `gitver::check` in production. Injected so tests never touch the process PATH.
+    pub git_check: std::sync::Arc<dyn Fn() -> Result<gitver::GitVersion, gitver::GitCheckError> + Send + Sync>,
     pub diff_delay: Option<std::time::Duration>, // None in production; tests delay diff requests with it
 }
 
@@ -1121,7 +1131,7 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
 
 - [ ] **Step 1: Write the failing tests in `src/engine/session.rs`**
 
-The helpers build a fixture repo and a controllable watcher. Every test uses `poll_interval: 50 ms` and `check_git_version: false`.
+The helpers build a fixture repo and a controllable watcher. Tests pass `git_check: ok_git()`, which always succeeds, so none of them depends on or changes the process `PATH`.
 
 ```rust
 #[cfg(test)]
@@ -1151,6 +1161,10 @@ mod tests {
         dir
     }
 
+    fn ok_git() -> Arc<dyn Fn() -> Result<gitver::GitVersion, gitver::GitCheckError> + Send + Sync> {
+        Arc::new(|| Ok(gitver::GitVersion { major: 2, minor: 99 }))
+    }
+
     /// Fails to start until `allow` is set; never emits events.
     struct FlakyWatcher { allow: Arc<AtomicBool> }
     impl WatcherControl for FlakyWatcher {
@@ -1167,7 +1181,7 @@ mod tests {
             path: dir.to_path_buf(),
             poll_interval: Duration::from_millis(50),
             watcher: Arc::new(FlakyWatcher { allow }),
-            check_git_version: false,
+            git_check: ok_git(),
             diff_delay: None,
         });
         (rt, handle)
@@ -1286,7 +1300,7 @@ mod tests {
             path: dir.path().to_path_buf(),
             poll_interval: Duration::from_secs(3600),
             watcher: Arc::new(EmittingWatcher { sink: slot.clone() }),
-            check_git_version: false,
+            git_check: ok_git(),
             diff_delay: None,
         });
         wait_for(&h, "first", |s| ready(s).is_some());
@@ -1301,6 +1315,107 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_diff_is_not_starved_by_frequent_polls() {
+        let dir = fixture();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        // the watcher never starts, so every 50 ms tick refreshes while each diff takes 400 ms
+        let h = spawn(rt.handle(), SessionConfig {
+            path: dir.path().to_path_buf(),
+            poll_interval: Duration::from_millis(50),
+            watcher: Arc::new(FlakyWatcher { allow: Arc::new(AtomicBool::new(false)) }),
+            git_check: ok_git(),
+            diff_delay: Some(Duration::from_millis(400)),
+        });
+        wait_for(&h, "a diff despite constant polling", |s| ready(s).is_some());
+    }
+
+    #[test]
+    fn refresh_without_a_selected_row_clears_the_busy_flag() {
+        let dir = fixture();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-q", "-m", "clean"]);
+        let (_rt, h) = start(dir.path(), Arc::new(AtomicBool::new(true)));
+        wait_for(&h, "clean repository", |s| matches!(s.repo, RepoState::Repo { .. }) && s.files.is_empty());
+        h.commands.send(Command::Refresh).unwrap();
+        wait_for(&h, "busy", |s| s.refreshing);
+        wait_for(&h, "idle again", |s| !s.refreshing);
+    }
+
+    /// Takes 300 ms to start and counts calls.
+    struct SlowWatcher { starts: Arc<std::sync::atomic::AtomicUsize>, stops: Arc<std::sync::atomic::AtomicUsize>, fail_first: AtomicBool }
+    impl WatcherControl for SlowWatcher {
+        fn start(&self, _cwd: String, _sink: Arc<dyn crate::runtime::EventSink>) -> BoxFut<Result<(), String>> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let fail = self.fail_first.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if fail { Err("first start fails".to_string()) } else { Ok(()) }
+            })
+        }
+        fn stop(&self, _cwd: String) -> BoxFut<Result<(), String>> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn a_pending_watcher_start_is_not_repeated_and_is_stopped_exactly_once() {
+        let dir = fixture();
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let h = spawn(rt.handle(), SessionConfig {
+            path: dir.path().to_path_buf(),
+            poll_interval: Duration::from_secs(3600),
+            watcher: Arc::new(SlowWatcher { starts: starts.clone(), stops: stops.clone(), fail_first: AtomicBool::new(false) }),
+            git_check: ok_git(),
+            diff_delay: None,
+        });
+        for _ in 0..3 {
+            h.commands.send(Command::Refresh).unwrap(); // arrives while the first start is pending
+        }
+        h.commands.send(Command::Shutdown).unwrap();     // also while it is pending
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "a pending start must not be repeated");
+        assert_eq!(stops.load(Ordering::SeqCst), 1, "a registered watcher must be stopped exactly once");
+    }
+
+    #[test]
+    fn a_missing_git_is_retryable_and_an_old_git_is_fatal() {
+        let dir = fixture();
+        let fixed = Arc::new(AtomicBool::new(false));
+        let flag = fixed.clone();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let h = spawn(rt.handle(), SessionConfig {
+            path: dir.path().to_path_buf(),
+            poll_interval: Duration::from_millis(50),
+            watcher: Arc::new(FlakyWatcher { allow: Arc::new(AtomicBool::new(true)) }),
+            git_check: Arc::new(move || {
+                if flag.load(Ordering::SeqCst) {
+                    Ok(gitver::GitVersion { major: 2, minor: 99 })
+                } else {
+                    Err(gitver::GitCheckError::Missing("Failed to spawn git: not found".into()))
+                }
+            }),
+            diff_delay: None,
+        });
+        let s = wait_for(&h, "missing git reported", |s| s.status_error.is_some());
+        assert!(!matches!(s.repo, RepoState::Unusable { .. }), "a missing git must stay retryable");
+        fixed.store(true, Ordering::SeqCst);
+        h.commands.send(Command::Refresh).unwrap();
+        wait_for(&h, "recovered", |s| s.status_error.is_none() && ready(s).is_some());
+
+        let old = spawn(rt.handle(), SessionConfig {
+            path: dir.path().to_path_buf(),
+            poll_interval: Duration::from_millis(50),
+            watcher: Arc::new(FlakyWatcher { allow: Arc::new(AtomicBool::new(true)) }),
+            git_check: Arc::new(|| Err(gitver::GitCheckError::TooOld("git 2.20 is too old".into()))),
+            diff_delay: None,
+        });
+        wait_for(&old, "unusable", |s| matches!(&s.repo, RepoState::Unusable { reason } if reason.contains("2.20")));
+    }
+
+    #[test]
     fn rapid_selection_does_not_wait_for_superseded_diffs() {
         let dir = fixture();
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
@@ -1308,7 +1423,7 @@ mod tests {
             path: dir.path().to_path_buf(),
             poll_interval: Duration::from_secs(3600),
             watcher: Arc::new(FlakyWatcher { allow: Arc::new(AtomicBool::new(true)) }),
-            check_git_version: false,
+            git_check: ok_git(),
             diff_delay: Some(Duration::from_millis(400)),
         });
         wait_for(&h, "first", |s| ready(s).is_some());
@@ -1347,7 +1462,7 @@ Run: `cargo test session` — Expected: FAIL (does not compile).
 Structure of `src/engine/session.rs`, top to bottom:
 
 1. `BoxFut`, `WatcherControl`, `SessionConfig`, `EngineHandle` as in **Interfaces**.
-2. `FrozenWatcher { state: crate::git::watcher::GitWatcherState }` implementing `WatcherControl` by calling `crate::git::watcher::start_git_watcher_backend(cwd, sink, self.state.clone())` and `stop_git_watcher_backend(cwd, self.state.clone())`. `SessionConfig::production(path)` uses it with `poll_interval = 5 s`, `check_git_version = true` and `diff_delay = None`.
+2. `FrozenWatcher { state: crate::git::watcher::GitWatcherState }` implementing `WatcherControl` by calling `crate::git::watcher::start_git_watcher_backend(cwd, sink, self.state.clone())` and `stop_git_watcher_backend(cwd, self.state.clone())`. `SessionConfig::production(path)` uses it with `poll_interval = 5 s`, `git_check = Arc::new(gitver::check)` and `diff_delay = None`.
 3. `ChannelSink { tx: tokio::sync::mpsc::UnboundedSender<Trigger> }` implementing `crate::runtime::EventSink`:
 
 ```rust
@@ -1368,11 +1483,21 @@ impl crate::runtime::EventSink for ChannelSink {
 4. The loop state and the single publishing function. Equality is by fingerprint, because the frozen types derive `Serialize` but not `PartialEq`:
 
 ```rust
+enum WatcherPhase { Starting, Running, Failed }
+
 struct State {
-    snapshot: Snapshot,          // the last published value
-    status_fp: String,           // serde_json of the last GitStatusResponse
+    snapshot: Snapshot,                 // the last published value
+    branch: Option<String>,             // retained between status results
+    worktree: Option<String>,
     last_watcher_refresh: std::time::Instant,
-    watcher_running: bool,
+    watcher: WatcherPhase,
+    git_missing: bool,                  // set while the git check reports Missing
+    status_in_flight: bool,
+    status_dirty: bool,                 // a trigger arrived while a status task was running
+    status_dirty_head: bool,
+    diff_generation: u64,               // bumped only when a different key is requested
+    diff_in_flight: Option<(u64, FileKey)>,
+    diff_dirty: bool,                   // a refresh wanted the same key while it was loading
 }
 
 fn fingerprint(s: &Snapshot) -> String {
@@ -1416,19 +1541,19 @@ fn publish(state: &mut State, next: Snapshot, out: &std::sync::mpsc::Sender<std:
    ```
 
    - Canonicalize `config.path`. If that fails or it is not a directory, publish `RepoState::Unusable { reason }` and return.
-   - If `config.check_git_version`, call `gitver::check()` inside `tokio::task::spawn_blocking`; on `Err(reason)` publish `Unusable` and return.
+   - Run `(config.git_check)()` inside `tokio::task::spawn_blocking`. `Err(TooOld(reason))` publishes `Unusable` and returns. `Err(Missing(reason))` is not fatal: publish `status_error = Some(reason)`, set `git_missing = true`, and keep looping without starting the watcher or any git task; ticks do nothing while `git_missing`. `Command::Refresh` runs the check again, and on success clears `git_missing`, starts the watcher and calls `request_status(true)`.
    - Create the trigger channel and `ChannelSink`. Spawn the watcher start as a task that sends `Done::Watcher`; the first refresh does not wait for it.
    - `request_status(with_head)`: if `status_in_flight`, set `status_dirty = true` (and remember `with_head`); otherwise set `status_in_flight = true`, `refreshes.fetch_add(1, SeqCst)`, and spawn a task that runs `git_status_inner`, plus `git_branch_inner` and `git_worktree_name_inner` when `with_head`, and sends `Done::Status`.
-   - `request_diff(key)`: `diff_generation += 1`, then spawn a task that sleeps `config.diff_delay` when set, runs `get_git_diff_inner(cwd, key.path, key.staged, Some(untracked))`, and sends `Done::Diff { generation, key, result }`. Diff tasks are never awaited by the loop; a superseded one is discarded when it reports.
+   - `request_diff(key)`: if `diff_in_flight` already holds this `key`, set `diff_dirty = true` and return; a background refresh must never restart a diff that is still loading, or frequent polls would bump the generation faster than a slow diff can finish and every result would be discarded. Otherwise `diff_generation += 1`, `diff_in_flight = Some((diff_generation, key.clone()))`, and spawn a task that sleeps `config.diff_delay` when set, runs `get_git_diff_inner(cwd, key.path, key.staged, Some(untracked))`, and sends `Done::Diff { generation, key, result }`. Only a request for a different key supersedes the one in flight.
    - Start with `request_status(true)`, then loop on `tokio::select!` over `commands_rx`, the trigger receiver, `tokio::time::interval(config.poll_interval)` and `results`.
    - A trigger: drain the trigger channel with `try_recv` first (a burst becomes one request), call `request_status(any_head)`, set `last_watcher_refresh = now`.
-   - The tick (D2): when `!watcher_running`, `request_status(true)` every tick; otherwise `request_status(false)` only when `last_watcher_refresh.elapsed() >= config.poll_interval`.
-   - `Done::Watcher(Ok)` sets `watcher_running = true` and clears `watcher_error`; `Err(e)` sets `watcher_error = Some(e)`. Publish either way.
-   - `Done::Status`: apply the status rules of item 6, publish, clear `status_in_flight`; if `status_dirty`, clear it and `request_status` again; if a row is selected, `request_diff(selected)`.
-   - `Done::Diff { generation, key, result }`: discard it unless `generation == diff_generation` and `Some(&key) == snapshot.selected.as_ref()`. Otherwise apply the diff rules of item 6, clear `refreshing`, publish.
-   - `Command::Refresh`: if `!watcher_running`, spawn the watcher start again; set `refreshing = true`, publish, `request_status(true)`.
+   - The tick (D2): when the watcher is not `Running`, `request_status(true)` every tick; otherwise `request_status(false)` only when `last_watcher_refresh.elapsed() >= config.poll_interval`. `request_status` and `request_diff` both coalesce, so a tick during a slow refresh costs nothing.
+   - `Done::Watcher(Ok)` sets `watcher = Running` and clears `watcher_error`; `Err(e)` sets `watcher = Failed` and `watcher_error = Some(e)`. Publish either way.
+   - `Done::Status`: apply the status rules of item 6 and clear `status_in_flight`. If a row is selected and the status succeeded, `request_diff(selected)`; otherwise nothing more will arrive for this refresh, so set `refreshing = false`. Publish. If `status_dirty`, clear it and `request_status(status_dirty_head)` again.
+   - `Done::Diff { generation, key, result }`: if `generation != diff_generation`, discard it; a newer request for another key is in flight and will report itself. Otherwise clear `diff_in_flight`; if `Some(&key) == snapshot.selected.as_ref()`, apply the diff rules of item 6, set `refreshing = false` and publish; then, if `diff_dirty`, clear it and `request_diff(selected)` once more.
+   - `Command::Refresh`: if `watcher` is `Failed`, set it to `Starting` and spawn the start again; never while it is `Starting` or `Running`, because the frozen watcher counts every start as a subscription. Set `refreshing = true`, publish, `request_status(true)`.
    - `Command::Select(key)`, `SelectNext`, `SelectPrev` (wrapping with `rem_euclid`): publish `selected = key, diff = Loading` at once, then `request_diff(key)`. The loop does not wait, so five quick selections start five tasks and only the last result is applied.
-   - `Command::Shutdown` or a closed command channel: `watcher.stop(cwd)` and return.
+   - `Command::Shutdown` or a closed command channel: if `watcher` is `Starting`, first wait for its `Done::Watcher` on `results` (at most 5 s) so a registration that lands late is not leaked; then call `watcher.stop(cwd)` exactly once if it is `Running`, and return.
 
 6. The rules applied when results arrive:
 
@@ -1477,7 +1602,7 @@ match result {
 - [ ] **Step 3: Run the tests**
 
 Run: `cargo test session -- --test-threads=1`
-Expected: PASS (9 tests). They also pass under plain `cargo test`, because nothing in them is process-global. They spawn real git processes; single-threaded keeps timing stable.
+Expected: PASS (13 tests). They also pass under plain `cargo test`, because nothing in them is process-global. They spawn real git processes; single-threaded keeps timing stable.
 
 - [ ] **Step 4: Commit**
 
@@ -1493,11 +1618,11 @@ git commit -m "feat: add engine session loop with live refresh and degraded mode
 Spec: 5.2 items 2 and 4 (literal pathspecs), 1.5 criterion 1.
 
 **Files:**
-- Create: `src/git_diff_response_tests.rs`
+- Create: `src/git_diff_response_tests.rs`, `tests/env_policy.rs`
 - Modify: `src/lib.rs` (add `#[cfg(test)] mod git_diff_response_tests;`)
 
 **Interfaces:**
-- Consumes: the `#[cfg(test)]` wrappers `crate::git::get_git_diff` and `crate::git::git_status`; `engine::init_process_env`.
+- Consumes: the `#[cfg(test)]` wrappers `crate::git::get_git_diff` and `crate::git::git_status`; for `tests/env_policy.rs`, the public engine API.
 - Produces: nothing for later tasks.
 
 - [ ] **Step 1: Port the cases**
@@ -1525,7 +1650,9 @@ Register the change in `PORT-SURFACE.md` under a heading **Adapted tests**. Then
 Run: `cargo test git_diff_response_tests -- --list | grep -c ': test$'`
 Expected: `15`.
 
-- [ ] **Step 2: Add the criterion-1 fixture and the literal-pathspec test to the same file**
+- [ ] **Step 2: Add the criterion-1 fixture to the same file, and the literal-pathspec test to its own process**
+
+Unit tests never call `init_process_env`: it must run before any thread exists, and libtest runs tests on threads beside other tests that spawn git. The literal-pathspec case needs the variable, so it lives in `tests/env_policy.rs`, an integration test with exactly one `#[test]`, which initializes the environment first and only then builds a runtime.
 
 ```rust
 fn git(dir: &std::path::Path, args: &[&str]) {
@@ -1542,24 +1669,7 @@ fn repo() -> tempfile::TempDir {
 }
 
 #[tokio::test]
-async fn literal_pathspecs_keep_a_glob_named_file_to_itself() {
-    crate::engine::init_process_env();
-    let dir = repo();
-    let p = dir.path();
-    std::fs::write(p.join("a*.txt"), "star\n").unwrap();
-    std::fs::write(p.join("ab.txt"), "plain\n").unwrap();
-    git(p, &["add", "-A"]);
-    git(p, &["commit", "-q", "-m", "init"]);
-    std::fs::write(p.join("a*.txt"), "STAR\n").unwrap();
-    std::fs::write(p.join("ab.txt"), "PLAIN\n").unwrap();
-    let resp = crate::git::get_git_diff(p.to_string_lossy().into(), "a*.txt".into(), false, None).await.unwrap();
-    assert_eq!(resp.file_diff.hunks.len(), 1);
-    assert!(resp.raw_diff.contains("STAR") && !resp.raw_diff.contains("PLAIN"));
-}
-
-#[tokio::test]
 async fn status_rows_cover_the_criterion_one_fixture() {
-    crate::engine::init_process_env();
     let dir = repo();
     let p = dir.path();
     for (name, body) in [("mm.txt", "1\n2\n3\n4\n5\n6\n7\n8\n"), ("del.txt", "d\n"), ("ren.txt", "r1\nr2\nr3\n")] {
@@ -1588,9 +1698,61 @@ async fn status_rows_cover_the_criterion_one_fixture() {
 }
 ```
 
+`tests/env_policy.rs`:
+
+```rust
+use herdr_hunks::engine::{init_process_env, spawn, Command, DiffState, FileKey, SessionConfig, GIT_CHILD_ENV};
+use std::time::{Duration, Instant};
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    assert!(std::process::Command::new("git").arg("-C").arg(dir).args(args).status().unwrap().success(), "git {args:?}");
+}
+
+// The only test in this binary, so nothing else reads the environment while it is set.
+#[test]
+fn the_environment_policy_is_applied_and_makes_pathspecs_literal() {
+    init_process_env();
+    for (key, value) in GIT_CHILD_ENV {
+        assert_eq!(std::env::var(key).as_deref(), Ok(value));
+    }
+    assert!(std::env::var_os("GIT_EXTERNAL_DIFF").is_none());
+
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    git(p, &["init", "-q", "-b", "main"]);
+    git(p, &["config", "user.email", "t@example.com"]);
+    git(p, &["config", "user.name", "t"]);
+    std::fs::write(p.join("a*.txt"), "star\n").unwrap();
+    std::fs::write(p.join("ab.txt"), "plain\n").unwrap();
+    git(p, &["add", "-A"]);
+    git(p, &["commit", "-q", "-m", "init"]);
+    std::fs::write(p.join("a*.txt"), "STAR\n").unwrap();
+    std::fs::write(p.join("ab.txt"), "PLAIN\n").unwrap();
+
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let handle = spawn(rt.handle(), SessionConfig::production(p.to_path_buf()));
+    handle.commands.send(Command::Select(FileKey { path: "a*.txt".into(), staged: false })).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(Instant::now() < deadline, "the glob-named file never loaded");
+        if let Ok(s) = handle.snapshots.recv_timeout(Duration::from_millis(200)) {
+            if let DiffState::Ready(d) = &s.diff {
+                if d.key.path == "a*.txt" {
+                    assert!(d.raw_diff.contains("STAR"), "its own change is missing");
+                    assert!(!d.raw_diff.contains("PLAIN"), "a neighbouring file leaked into the diff");
+                    assert_eq!(d.file_diff.hunks.len(), 1);
+                    break;
+                }
+            }
+        }
+    }
+}
+```
+
 - [ ] **Step 3: Run and commit**
 
-Run: `cargo test git_diff_response_tests -- --list | grep -c ': test$'` — Expected: `17`.
+Run: `cargo test --test env_policy` — Expected: PASS.
+Run: `cargo test git_diff_response_tests -- --list | grep -c ': test$'` — Expected: `16`.
 Run: `cargo test git_diff_response_tests` — Expected: PASS.
 
 ```bash
@@ -1670,8 +1832,14 @@ fn the_engine_never_mutates_the_repository() {
     std::fs::write(p.join("a.txt"), "one\n").unwrap();
     git(&real, p, &["add", "-A"]);
     git(&real, p, &["commit", "-q", "-m", "init"]);
-    std::fs::write(p.join("a.txt"), "ONE\n").unwrap();
-    std::fs::write(p.join("new.txt"), "n\n").unwrap();
+    std::fs::write(p.join("b.txt"), "b\n").unwrap();
+    git(&real, p, &["add", "b.txt"]);
+    git(&real, p, &["commit", "-q", "-m", "b"]);
+    git(&real, p, &["branch", "other"]); // same commit, so switching HEAD touches neither index nor worktree
+    std::fs::write(p.join("b.txt"), "B\n").unwrap();
+    git(&real, p, &["add", "b.txt"]);     // a staged row
+    std::fs::write(p.join("a.txt"), "ONE\n").unwrap(); // an unstaged row
+    std::fs::write(p.join("new.txt"), "n\n").unwrap(); // an untracked row
 
     // recording wrapper, first in PATH
     let bin = tempfile::tempdir().unwrap();
@@ -1690,6 +1858,7 @@ fn the_engine_never_mutates_the_repository() {
     std::env::set_var("PATH", format!("{}:{}", bin.path().display(), std::env::var("PATH").unwrap()));
     init_process_env();
 
+    // taken after all harness setup, so only the engine's effect is measured
     let index_before = std::fs::read(p.join(".git/index")).unwrap();
     let refs_before = git(&real, p, &["for-each-ref"]);
     let tree_before = tree_hash(p);
@@ -1698,21 +1867,33 @@ fn the_engine_never_mutates_the_repository() {
     let mut config = SessionConfig::production(p.to_path_buf());
     config.poll_interval = Duration::from_millis(100);
     let handle = spawn(rt.handle(), config);
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut seen_ready = 0;
-    while Instant::now() < deadline && seen_ready < 3 {
-        if let Ok(s) = handle.snapshots.recv_timeout(Duration::from_millis(200)) {
-            if matches!(s.diff, DiffState::Ready(_)) {
-                seen_ready += 1;
+    // Load every row, then switch branches underneath the engine.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut loaded = std::collections::BTreeSet::new();
+    let mut rows = 0usize;
+    let mut switched = false;
+    let mut saw_other = false;
+    while Instant::now() < deadline && !(rows > 0 && loaded.len() == rows && saw_other) {
+        let Ok(s) = handle.snapshots.recv_timeout(Duration::from_millis(200)) else { continue };
+        rows = s.files.len();
+        saw_other |= matches!(&s.repo, herdr_hunks::engine::RepoState::Repo { branch: Some(b), .. } if b == "other");
+        if let DiffState::Ready(d) = &s.diff {
+            if loaded.insert((d.key.path.clone(), d.key.staged)) {
                 handle.commands.send(Command::SelectNext).unwrap();
                 handle.commands.send(Command::Refresh).unwrap();
             }
         }
+        if rows > 0 && loaded.len() == rows && !switched {
+            switched = true;
+            git(&real, p, &["symbolic-ref", "HEAD", "refs/heads/other"]); // the harness, through the real git
+        }
     }
-    assert!(seen_ready >= 3, "engine never loaded diffs");
+    assert_eq!(rows, 3, "expected a staged, an unstaged and an untracked row");
+    assert_eq!(loaded.len(), rows, "not every row was loaded: {loaded:?}");
+    assert!(saw_other, "the branch switch never reached the engine");
     std::thread::sleep(Duration::from_millis(400)); // a few D2 ticks
     handle.commands.send(Command::Shutdown).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(300));
 
     let recorded = std::fs::read_to_string(&log).unwrap();
     assert!(!recorded.is_empty(), "wrapper recorded nothing");
@@ -1768,7 +1949,7 @@ cp "$WATCHER/src/sidebar/dialog.rs" src/tui/dialog.rs
 Then, by hand:
 - `src/tui/style.rs`: delete any `use` of `crate::sidebar::layout::LineSpan` left in the first 84 lines (it serves the `Rendered` type that is not copied).
 - `src/tui/format.rs`: copy the three functions `width`, `pad` and `truncate` from `$WATCHER/src/sidebar/format.rs` (they start at lines 15, 32 and 40) together with the tests that cover them.
-- `src/tui/dialog.rs`: change the two imports to `use crate::tui::format;` and `use crate::tui::style::{Line, Role, Semantic, Span, Style};`.
+- `src/tui/dialog.rs`: it names `crate::sidebar::` seven times (two imports and five uses inside its tests). Rewrite all of them: `sed -i.bak 's/crate::sidebar::/crate::tui::/g' src/tui/dialog.rs && rm src/tui/dialog.rs.bak`, then check `rg -c 'crate::sidebar' src/tui/` prints nothing.
 - `src/tui/guard.rs`: copy from `$WATCHER/src/sidebar/tui.rs` the `TerminalGuard` struct, its two `impl` blocks and its `Drop` (lines 22-75), `terminal_is_gone` and `poll_terminal` (lines 85-119), `mouse_transition` (lines 2176-2178), the `DisableRawMode` type they name, and the guard's tests (search for `FlakyWriter`). Make `TerminalGuard`, its constructor `TerminalGuard::enter`, `TerminalGuard::set_mouse`, `poll_terminal` and `mouse_transition` `pub`.
 
 `src/tui/mod.rs`:
@@ -2259,7 +2440,8 @@ pub struct ViewState {
     pub notice: Option<String>,
     pub rows: Option<rows::Rows>,
     pub body_height: u16,
-    built_for: Option<(FileKey, String, ViewMode)>, // key, raw_diff, mode
+    pub help_offset: usize,                // first key-sheet row drawn
+    built_from: Option<(std::sync::Arc<LoadedDiff>, ViewMode)>, // held so identity compares are safe
 }
 impl ViewState {
     pub fn new(mode: ViewMode, files_panel: FilesPanel, mouse: bool) -> Self;
@@ -2408,7 +2590,10 @@ pub struct ViewState {
     pub notice: Option<String>,
     pub rows: Option<Rows>,
     pub body_height: u16,
-    built_for: Option<(FileKey, String, ViewMode)>,
+    pub help_offset: usize,
+    /// The diff the rows were built from. Holding the Arc makes `Arc::ptr_eq` a safe,
+    /// allocation-free "did anything change" test; the engine swaps the Arc only on change.
+    built_from: Option<(std::sync::Arc<LoadedDiff>, ViewMode)>,
 }
 
 impl ViewState {
@@ -2425,7 +2610,8 @@ impl ViewState {
             notice: None,
             rows: None,
             body_height: 0,
-            built_for: None,
+            help_offset: 0,
+            built_from: None,
         }
     }
 
@@ -2464,14 +2650,16 @@ impl ViewState {
             self.cursor_id = None;
             self.offset = 0;
             self.hscroll = 0;
-            self.built_for = None;
+            self.built_from = None;
             return;
         };
-        let wanted = (diff.key.clone(), diff.raw_diff.clone(), self.mode);
-        if self.built_for.as_ref() == Some(&wanted) {
-            return;
+        // Runs before every frame, so the unchanged case must cost nothing: no clone, no compare of text.
+        if let Some((built, mode)) = &self.built_from {
+            if std::sync::Arc::ptr_eq(built, diff) && *mode == self.mode {
+                return;
+            }
         }
-        let same_file = self.built_for.as_ref().map(|(k, _, _)| k == &diff.key).unwrap_or(false);
+        let same_file = self.built_from.as_ref().map(|(built, _)| built.key == diff.key).unwrap_or(false);
         let old_row = match (&self.rows, self.cursor) {
             (Some(rows), Some(c)) => rows.row_of_target.get(c).copied(),
             _ => None,
@@ -2499,7 +2687,7 @@ impl ViewState {
         }
         self.rows = Some(rows);
         self.keep_cursor_visible();
-        self.built_for = Some(wanted);
+        self.built_from = Some((diff.clone(), self.mode));
     }
 }
 ```
@@ -2571,8 +2759,8 @@ mod tests {
         let (r, _) = rendered(120, 20, FilesPanel::Pinned);
         let text = r.plain();
         assert!(text[1].starts_with("CHANGED 2"));
-        assert!(text[2].contains("M a.rs") && text[2].contains("S"));
-        assert!(text[3].starts_with("▸M a.rs"));
+        assert!(text[2].contains("M a.rs src/") && text[2].contains("S"), "{}", text[2]);
+        assert!(text[3].starts_with("▸M a.rs ./"), "{}", text[3]);
         assert!(r.hits.iter().any(|h| matches!(h.action, Action::SelectFile(0)) && h.y == 2));
     }
 
@@ -2741,9 +2929,9 @@ fn toolbar(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> (Line, V
 The remaining functions, in this order, complete the file:
 
 - `fn state_message(snapshot: &Snapshot) -> Option<String>`: `RepoState::Unusable { reason }` gives `reason`; `NotARepo` gives `not a git repository`; a `status_error` with no files gives the error; no files gives `working tree clean`; `DiffState::Loading` gives `loading…`; `DiffState::Failed(e)` gives `e`; a `Ready` diff with zero hunks gives `unmerged path: resolve conflicts to see hunks` when `is_conflict(&diff.raw_diff)`, else `binary file or no textual changes`. Otherwise `None`. (The frozen parser reports `UU`, `AA`, `AU` and `UA` as one unstaged `Modified` row, so the status list cannot tell a conflict apart; the raw diff can.)
-- `fn files_lines(snapshot, state, height) -> (Vec<String>, Vec<Hit>)`: line 0 `CHANGED n`; one line per file `{marker}{status} {basename}` padded to `FILES_WIDTH - 2` plus `S` for staged rows, where marker is `▸` for the selected row else a space, and status is `M A D R ?`; the basename is `sanitize`d and `truncate`d; the last line is `+a −d · n files`. Each file line gets `Hit { action: SelectFile(i) }` spanning the panel width.
+- `fn files_lines(snapshot, state, height) -> (Vec<String>, Vec<Hit>)`: line 0 `CHANGED n`; one line per file `{marker}{status} {name}` padded to `FILES_WIDTH - 2` plus `S` for staged rows, where marker is `▸` for the selected row else a space, and status is `M A D R ?`. `name` is the basename; when another row has the same basename and a different directory, it is `{basename} {dir}/` with the directory in `Role::Label` (`./` for a file at the repository root), so `src/a.rs` and `a.rs` read `a.rs src/` and `a.rs ./`. Two halves of one path share a directory and are told apart by the `S`. The name is `sanitize`d and `truncate`d; the last line is `+a −d · n files`. Each file line gets `Hit { action: SelectFile(i) }` spanning the panel width.
 - `fn body_line(row: &Row, width: u16, hscroll: usize, mode: ViewMode, cursor: bool) -> Line`. Unified format: `{old:>5} {new:>5} {sign} {text}`; split format: two halves of `(width - 1) / 2` columns, each `{no:>5} {sign} {text}`, separated by `│`. `Gap` renders `··· n unmodified lines ···`, `HunkHeader` renders its text, `Truncated` renders `… n more lines not shown`, `FileHeader` renders the path. Text is cut with `hscroll` then `truncate`d to the remaining width. Styles: `+` rows `Style::semantic(Role::Body, Semantic::Good)`, `-` rows `Semantic::Bad`, hunk headers `Semantic::Accent`, numbers and gaps `Role::Label`, the file header `Role::Emphasis`. When `cursor` is true every span of the line gets `reverse = true`, and the line is padded to the full width so the bar spans the pane.
-- `pub fn render(...)`: assemble toolbar, body (panel + separator + diff rows `state.offset .. state.offset + body_height`, or the centred `state_message`), the optional line from `notice(state, snapshot)`, and the footer `j/k line  [ ] hunk  n/p file  t view  e files  r refresh  ? help  q quit`, cut from the right with `truncate`. Every diff row at screen line `y` adds `Hit { y, x0: panel_width, x1: width, action: CursorToRow(row_index) }`. When `state.help_open`, overlay `dialog::render` of the key sheet (Task 12 supplies the panel) centred at `min(width, 60)` columns.
+- `pub fn render(...)`: assemble toolbar, body (panel + separator + diff rows `state.offset .. state.offset + body_height`, or the centred `state_message`), the optional line from `notice(state, snapshot)`, and the footer `j/k line  [ ] hunk  n/p file  t view  e files  r refresh  ? help  q quit`, cut from the right with `truncate`. Every diff row at screen line `y` adds `Hit { y, x0: panel_width, x1: width, action: CursorToRow(row_index) }`.
 
 Run: `cargo test tui::view` — Expected: PASS.
 
@@ -2905,6 +3093,24 @@ mod tests {
     }
 
     #[test]
+    fn every_binding_is_reachable_on_the_key_sheet_in_a_short_terminal() {
+        let (snap, mut st) = setup(&[(10, " + ")]);
+        handle_key(&mut st, &snap, key("?"), 120);
+        let mut seen = String::new();
+        for _ in 0..40 {
+            seen.push_str(&render(&snap, &st, 120, 12).plain().join("\n"));
+            if matches!(handle_key(&mut st, &snap, key("j"), 120), Outcome::Inert) {
+                break;
+            }
+        }
+        for binding in KEYS {
+            assert!(seen.contains(binding.label), "`{}` never appears on the sheet at 12 rows", binding.label);
+        }
+        assert!(matches!(handle_key(&mut st, &snap, key("q"), 120), Outcome::Redraw), "q closes the sheet");
+        assert!(!st.help_open);
+    }
+
+    #[test]
     fn a_diff_without_targets_makes_movement_inert() {
         let (snap, mut st) = setup(&[]);
         for k in ["j", "k", "[", "]", "h", "l", "g", "G"] {
@@ -2940,7 +3146,8 @@ Run: `cargo test tui::input` — Expected: FAIL (does not compile).
 
 Rules, each a few lines over `ViewState` and `engine::nav`:
 
-- When `state.help_open`: `Esc` or `?` closes it (`Redraw`); every other key is `Inert`.
+- When `state.help_open`: `Esc`, `?` and `q` close it and reset `help_offset` (`Redraw`). The sheet has 21 rows and may not fit, so `j` / `k` and the wheel move `state.help_offset` by one and three rows, clamped to `dialog::line_count(&help_panel(), panel_width).saturating_sub(panel_height)`; they are `Inert` at the ends. Every other key is `Inert`.
+- In `view::render` (this task wires it; Task 11 drew no overlay): when `state.help_open`, take `let mut panel = keys::help_panel(); panel.offset = state.help_offset;` (its `cursor` is `None`, which is the watcher dialog's scrolling mode), call `dialog::render(&panel, min(width, 60), height.saturating_sub(2))` and overlay the result centred over the body.
 - Resolve the key with `keys::lookup`; an unknown key is `Inert`. Clear `state.notice` on any handled key.
 - With `DiffState::Ready(diff)` and `Some(cursor)`: `LineDown`/`LineUp` call `nav::move_line(&diff.targets, &diff.unified_order, cursor, ±1, state.mode)`; `SideDeletions`/`SideAdditions` call `nav::move_side`; `HunkNext`/`HunkPrev` call `nav::target_index_for_hunk` for `hunk_index ± 1`; `First`/`Last` pick the first or last entry of the display order (`unified_order` in unified mode, `0` and `len - 1` in split mode). If the target did not change, return `Inert`; otherwise `state.set_cursor(diff, target)` and `Redraw`.
 - `HalfPageDown`/`HalfPageUp`: move `state.offset` by `body_height / 2` through `layout::clamp_scroll`; then set the cursor to the target whose row is nearest `offset + body_height / 2` (scan `rows.row_of_target`); `Inert` when the offset did not change.
@@ -3196,7 +3403,7 @@ cp "$WATCHER/tests/support/mod.rs" tests/support/mod.rs
 "$HERDR_BIN_PATH" api schema --json > tests/fixtures/herdr-0.8.0-schema.json   # from a herdr 0.8.0 session
 ```
 
-`src/herdr/mod.rs` is `pub mod api; pub mod client;`. In `tests/support/mod.rs` keep `FakeHerdr` (socket accept loop, object-`params` enforcement, `calls_named`, `stop`) and `wait_for`; delete the agent fixtures (`write_claude_fixture` and the three after it) and `state_snapshot`. Replace its response table with: `pane.get` returns `{"type":"pane","pane": <the pane set by set_panes whose pane_id matches>}` or `{"error":{"code":"pane_not_found","message":"no such pane"}}`; `plugin.pane.open` returns `{"type":"plugin_pane_opened","plugin_pane":{"pane":{"pane_id":"w1:p9"}}}`; `plugin.pane.focus` returns `{"type":"ok"}` unless `fail_focus(true)` was called, then an error. Register both copies in `PORT-SURFACE.md`.
+`src/herdr/mod.rs` is `pub mod api; pub mod client;`. In `tests/support/mod.rs` keep `FakeHerdr` (socket accept loop, object-`params` enforcement, `calls_named`, `stop`) and `wait_for`. Delete line 1 (`pub mod fake_herdr;`, a fake CLI this plan does not use), the `use rusqlite::{params, Connection};` and `use sha2::{Digest, Sha256};` imports, the agent fixtures that needed them (`write_claude_fixture` and the three after it) and `state_snapshot`. `cargo test --test actions_tier_a --no-run` must compile without `rusqlite`. Replace its response table with: `pane.get` returns `{"type":"pane","pane": <the pane set by set_panes whose pane_id matches>}` or `{"error":{"code":"pane_not_found","message":"no such pane"}}`; `plugin.pane.open` returns `{"type":"plugin_pane_opened","plugin_pane":{"pane":{"pane_id":"w1:p9"}}}`; `plugin.pane.focus` returns `{"type":"ok"}` unless `fail_focus(true)` was called, then an error. Register both copies in `PORT-SURFACE.md`.
 
 - [ ] **Step 2: Write the failing pure tests in `src/actions/mod.rs` and `src/actions/reuse.rs`**
 
@@ -3357,7 +3564,7 @@ pub fn may_reuse(record: &Record, toplevel: &str, viewer: Option<&PaneInfo>) -> 
 1. Parse `$HERDR_PLUGIN_CONTEXT_JSON`; `opener = context["focused_pane_id"]`.
 2. `pane = client.pane_get(opener)` when an opener exists. If that pane's label is `VIEWER_TITLE`, the focused pane is already a viewer: print `herdr-hunks: already in the hunk viewer` and return 0 without opening anything. Otherwise `repo_cwd = pane.foreground_cwd`, else `pane.cwd`, else `context["focused_pane_cwd"]`, else `context["workspace_cwd"]`. With none of them, print `herdr-hunks: no working directory for the focused pane` and return 1.
 3. `Placement::Overlay` goes straight to step 4. For `Placement::Split`, steps 3 and 4 run inside one `reuse::with_lock(state_dir, ...)`, so two invocations cannot both miss the record and open two viewers, and two sessions cannot overwrite each other's records. `toplevel` is the trimmed stdout of `git -C <repo_cwd> rev-parse --show-toplevel` (or `repo_cwd` when that fails); `records = reuse::load(state_dir)`; if a record exists under `reuse::key(socket, opener)` and `may_reuse(record, toplevel, client.pane_get(&record.viewer_pane_id).ok().as_ref())` and `client.plugin_pane_focus(..)` is `Ok`, return 0.
-4. `client.plugin_pane_open(open_params($HERDR_PLUGIN_ID or "winoooops.hunks", placement, opener, repo_cwd))`. For `Split`, store `Record { viewer_pane_id, repo_cwd, toplevel }` and `save`, still under the lock.
+4. `client.plugin_pane_open(open_params(plugin_id, placement, opener, repo_cwd))`, where `plugin_id` is `$HERDR_PLUGIN_ID`. herdr always sets it for an action; when it is absent, print `herdr-hunks: HERDR_PLUGIN_ID is not set (run this through a herdr plugin action)` and return 1. The id is never hardcoded. For `Split`, store `Record { viewer_pane_id, repo_cwd, toplevel }` and `save`, still under the lock.
 5. Any client error prints `herdr-hunks: <error>` to stderr and returns 1.
 
 `src/main.rs`: add arms `Some("open") => herdr_hunks::actions::run_open(Placement::Overlay)` and `Some("open-split") => herdr_hunks::actions::run_open(Placement::Split)`, and call `herdr_hunks::engine::init_process_env()` at the top of `main`.
@@ -3371,6 +3578,7 @@ Each test starts `support::FakeHerdr`, sets `HERDR_SOCKET_PATH`, `HERDR_PLUGIN_I
 3. The same record under a different `HERDR_SOCKET_PATH`: a second open, no focus.
 4. The recorded pane relabelled `zsh`: a second open.
 5. `fail_focus(true)`: a second open after the failed focus.
+5b. With `HERDR_PLUGIN_ID=someone.else`, the open request carries `"plugin_id":"someone.else"`; with the variable unset, no request is sent and the exit code is 1.
 5a. The focused pane is itself labelled `Hunks`: no `plugin.pane.open` and no `plugin.pane.focus` is sent, and the exit code is 0.
 6. Every recorded request's params validate against `tests/fixtures/herdr-0.8.0-schema.json`: assert each param key exists in the schema's definition for that method, and each `required` key is present.
 7. `rg -n '"herdr"' src/` finds nothing (run it through `std::process::Command` and assert an empty stdout): the host binary is never named literally.
@@ -3731,11 +3939,13 @@ fn open_split_creates_one_viewer_and_reuses_it() {
 
 - [ ] **Step 3: Write `docs/acceptance-p1.md`**
 
-A checklist with one line per success criterion of spec 1.5, each with the command to run and the expected observation: criterion 1 (`cargo test git_diff_response`), criterion 2 (open from an agent pane inside a linked worktree; the toolbar file list shows that worktree's changes), criterion 3 (an agent edits the same file twice; the view follows; repeat with `fs.inotify.max_user_watches` exhausted and confirm the degraded notice and convergence), criterion 4 (link the same build into upstream herdr 0.8.0 and into the fork with its `vimeflow` binary; `open` works in both), criterion 5 (`cargo test --test readonly_guarantee`).
+A release gate, not a note. It is a table with one row per success criterion of spec 1.5 and the columns `criterion | how to check | expected | result | date | herdr version | host`. The file's first line is `Status: PENDING`. It becomes `Status: PASS` only when every row's `result` reads `pass` with its date and versions filled in, and the release workflow's guard job refuses to build a `v*` tag while that line is missing. The rows: criterion 1 (`cargo test git_diff_response`), criterion 2 (open from an agent pane inside a linked worktree; the toolbar file list shows that worktree's changes), criterion 3 (an agent edits the same file twice; the view follows; repeat with `fs.inotify.max_user_watches` exhausted and confirm the degraded notice and convergence), criterion 4 (link the same build into upstream herdr 0.8.0 and into the fork with its `vimeflow` binary; `open` works in both), criterion 5 (`cargo test --test readonly_guarantee`).
 
-- [ ] **Step 4: Run and commit**
+- [ ] **Step 4: Run, record the results, and commit**
 
 Run: `cargo build --release && cargo test --test e2e_real_herdr -- --ignored` on a machine with herdr 0.8.0 — Expected: PASS.
+
+Then carry out every row of `docs/acceptance-p1.md` by hand, in upstream herdr 0.8.0 and in the fork, and fill in its `result`, `date`, `herdr version` and `host` columns. Change the first line to `Status: PASS`. Add this step to the guard job of `.github/workflows/release.yml`: `grep -qx 'Status: PASS' docs/acceptance-p1.md || { echo 'docs/acceptance-p1.md is not marked PASS'; exit 1; }`. Phase 1 is not release-ready until all five rows read `pass`.
 
 ```bash
 git add -A
