@@ -187,8 +187,9 @@ API in a separate process with one test, before starting its Tokio runtime.
 | `tests/support/mod.rs` | `tests/support/mod.rs` | Keeps the socket accept loop, object-params enforcement, request recording, `set_panes`, `calls_named`, `stop`, and `wait_for`; replaces responses with `pane.get`, `plugin.pane.open`, and `plugin.pane.focus`, adds `fail_focus`, and removes the fake CLI, process-info support, agent fixtures, state snapshot, and rusqlite/sha2 imports. |
 | `tests/fixtures/ping-response.json` | `tests/fixtures/ping-response.json` | Unchanged captured ping response used by the client tests. |
 | `scripts/fetch-or-build.sh` | `scripts/fetch-or-build.sh` | Replaces the repository/binary name with `herdr-hunks` and the override with `HERDR_HUNKS_RELEASE_BASE`; retains four targets, checksum verification, and source-build fallback. |
-| `.github/workflows/release.yml` | `.github/workflows/release.yml` | Replaces `herdr-agent-watcher` with `herdr-hunks`; retains the four-target matrix, tag/version guard, and two-space `SHA256SUMS` format. |
+| `.github/workflows/release.yml` | `.github/workflows/release.yml` | Replaces `herdr-agent-watcher` with `herdr-hunks`; retains the four-target matrix, tag/version guard, and two-space `SHA256SUMS` format; adds the Phase 1 manual acceptance gate. |
 | `LICENSE` | `LICENSE` | Unchanged Apache-2.0 license and original attribution. |
+| `tests/e2e_real_herdr.rs` | `tests/e2e_real_herdr.rs` | Copies only `ProcessGuard` and `modified`; adapts isolation for a named server with cleared child environments and explicit CLI targeting, then checks split creation/reuse and the real session mtime. |
 
 `tests/fixtures/herdr-0.8.0-schema.json` is the complete output of
 `$HERDR_BIN_PATH api schema --json`, captured from the installed Herdr 0.8.0

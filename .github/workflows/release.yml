@@ -20,6 +20,9 @@ jobs:
       version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+      - name: Require Phase 1 acceptance
+        run: |
+          grep -qx 'Status: PASS' docs/acceptance-p1.md || { echo 'docs/acceptance-p1.md is not marked PASS'; exit 1; }
       - id: check
         run: |
           set -euo pipefail

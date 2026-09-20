@@ -3,21 +3,23 @@ use std::process::Command;
 
 const REPO: &str = "winoooops/herdr-hunks";
 
+fn version(value: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = value.split('.').map(|part| part.parse::<u64>());
+    let version = (
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    );
+    parts.next().is_none().then_some(version)
+}
+
 pub fn latest_tag(ls_remote_output: &str) -> Option<String> {
     ls_remote_output
         .lines()
         .filter_map(|l| l.split('\t').nth(1))
         .filter_map(|r| r.strip_prefix("refs/tags/"))
         .filter(|t| !t.ends_with("^{}"))
-        .filter_map(|t| {
-            let mut parts = t.strip_prefix('v')?.split('.').map(|p| p.parse::<u64>());
-            let version = (
-                parts.next()?.ok()?,
-                parts.next()?.ok()?,
-                parts.next()?.ok()?,
-            );
-            parts.next().is_none().then(|| (version, t.to_string()))
-        })
+        .filter_map(|t| Some((version(t.strip_prefix('v')?)?, t.to_string())))
         .max_by_key(|(version, _)| *version)
         .map(|(_, tag)| tag)
 }
@@ -67,7 +69,9 @@ fn update(host: &Path, git: &str, plugin_id: &str) -> Result<i32, Box<dyn std::e
     }
     let tag = latest_tag(&String::from_utf8(output.stdout)?)
         .ok_or("no release tags found (expected vMAJOR.MINOR.PATCH)")?;
-    if tag == format!("v{}", env!("CARGO_PKG_VERSION")) {
+    let newest = version(&tag[1..]).ok_or("invalid release version")?;
+    let current = version(env!("CARGO_PKG_VERSION")).ok_or("invalid running version")?;
+    if newest <= current {
         eprintln!("herdr-hunks: already up to date");
         return Ok(0);
     }
@@ -171,10 +175,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_tags_and_the_current_version_never_install() {
+    fn missing_tags_and_current_or_older_versions_never_install() {
         for (tags, expected) in [
             ("nightly".to_string(), 1),
             (format!("v{}", env!("CARGO_PKG_VERSION")), 0),
+            ("v0.0.9".to_string(), 0),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let host = host(dir.path(), "github", 0);
