@@ -769,9 +769,10 @@ view slices rows itself, so ratatui's `u16` scroll limit never applies.
 5. **Navigation tests.** Table tests for `targets_for_diff`,
    `target_index_for_hunk`, `move_line` in both modes (including a replacement
    block with more deletions than additions, and clamping at both ends) and
-   `move_side`. The two cases in
-   `vimeflow:src/features/diff/hooks/useReviewTargetNavigation.test.ts` are carried
-   over.
+   `move_side`. The target-shape fixture of the first case in
+   `vimeflow:src/features/diff/hooks/useReviewTargetNavigation.test.ts` is carried
+   over; that file's other assertions concern comment selection and precedence,
+   which belong to P3.
 6. **View tests.** Plain-text projections of `Rendered` (no snapshot crate, as in
    `herdr-agent-watcher`): unified and split bodies, gap rows, the toolbar at 120,
    80 and 50 columns, files panel pinned and hidden, every empty and error state,
