@@ -1,6 +1,8 @@
 //! UI-agnostic engine. No ratatui or crossterm types appear here.
 pub mod gitver;
 pub mod nav;
+pub mod types;
+pub use types::*;
 
 /// D3. The frozen tree spawns git itself, so policy is process-wide.
 pub const GIT_CHILD_ENV: [(&str, &str); 3] = [
