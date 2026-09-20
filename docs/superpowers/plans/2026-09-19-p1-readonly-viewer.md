@@ -6,7 +6,7 @@
 
 **Architecture:** One Rust crate with a library and a binary. `src/git/` is vimeflow's git module at a pinned commit plus two registered patches. `src/engine/` wraps it in a UI-agnostic session that publishes immutable snapshots and owns a pure navigation model. `src/tui/` is a pure view plus a thin ratatui shell. `src/herdr/` and `src/actions/` implement the `open`, `open-split` and `update` plugin actions.
 
-**Tech Stack:** Rust 1.88, edition 2021. `tokio` 1, `notify` 6, `ignore` 0.4, `sha2` 0.10, `libc` 0.2, `serde`/`serde_json` 1, `toml` 0.8, `log` 0.4. Behind the default `tui` feature: `ratatui` 0.30 (`default-features = false`, feature `crossterm_0_29`), `crossterm` 0.29, `unicode-width` 0.2. Dev: `tempfile` 3, `ts-rs` 10. Runtime: `git` 2.31 or newer.
+**Tech Stack:** Rust 1.88, edition 2021. `tokio` 1, `notify` 6, `ignore` 0.4, `sha2` 0.10, `libc` 0.2, `dirs` 6, `thiserror` 2, `serde`/`serde_json` 1, `toml` 0.8, `log` 0.4. Behind the default `tui` feature: `ratatui` 0.30 (`default-features = false`, feature `crossterm_0_29`), `crossterm` 0.29, `unicode-width` 0.2. Dev: `tempfile` 3, `ts-rs` 10. Runtime: `git` 2.31 or newer.
 
 **Spec:** `docs/superpowers/specs/2026-09-18-hunks-roadmap-p1-viewer-design.md`. Executors read the spec section named in each task before starting it.
 
@@ -104,6 +104,8 @@ notify = "6"
 ignore = "0.4"
 sha2 = "0.10"
 libc = "0.2"
+dirs = "6"
+thiserror = "2.0"
 toml = "0.8"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"], optional = true }
 crossterm = { version = "0.29", optional = true }
@@ -148,9 +150,12 @@ pub mod scope;
 
 ```rust
 //! Port-surface shim for the frozen git tree. Policy differs from vimeflow: D1.
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 // expand_home, home_canonical, reject_parent_refs: copy verbatim from the pin.
+// They use `dirs::home_dir`, `fs::canonicalize` and `Component`, hence the imports above.
+// `open_nofollow` (pin line 196) is not part of the port surface and is not copied.
 
 /// Accepts any canonical absolute path. vimeflow restricts to $HOME because its
 /// cwd arrives over IPC; here it comes from the user's own pane or command line.
@@ -676,7 +681,7 @@ Run: `cargo test nav` — Expected: FAIL (does not compile).
 //! Pure navigation model, ported from vimeflow's useReviewTargetNavigation.
 use crate::git::{DiffLineType, FileDiff};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Side {
     /// New-file line numbers.
     Additions,
@@ -1097,6 +1102,7 @@ pub struct SessionConfig {
     pub poll_interval: std::time::Duration,      // 5 s in production
     pub watcher: std::sync::Arc<dyn WatcherControl>, // FrozenWatcher in production
     pub check_git_version: bool,                 // true in production
+    pub diff_delay: Option<std::time::Duration>, // None in production; tests delay diff requests with it
 }
 
 impl SessionConfig { pub fn production(path: std::path::PathBuf) -> Self }
@@ -1104,17 +1110,14 @@ impl SessionConfig { pub fn production(path: std::path::PathBuf) -> Self }
 pub struct EngineHandle {
     pub commands: tokio::sync::mpsc::UnboundedSender<Command>,
     pub snapshots: std::sync::mpsc::Receiver<std::sync::Arc<Snapshot>>,
+    /// Status refreshes started by this session. Per session, so parallel tests cannot disturb it.
+    pub refreshes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Spawns the loop on `runtime` and returns immediately.
 pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineHandle;
 
-/// Number of refreshes run so far in this process. Test instrumentation only.
-#[cfg(test)]
-pub(crate) fn refresh_runs() -> usize;
 ```
-
-`refresh_runs` reads a `static REFRESHES: AtomicUsize` that `refresh` increments on entry.
 
 - [ ] **Step 1: Write the failing tests in `src/engine/session.rs`**
 
@@ -1165,6 +1168,7 @@ mod tests {
             poll_interval: Duration::from_millis(50),
             watcher: Arc::new(FlakyWatcher { allow }),
             check_git_version: false,
+            diff_delay: None,
         });
         (rt, handle)
     }
@@ -1283,16 +1287,40 @@ mod tests {
             poll_interval: Duration::from_secs(3600),
             watcher: Arc::new(EmittingWatcher { sink: slot.clone() }),
             check_git_version: false,
+            diff_delay: None,
         });
         wait_for(&h, "first", |s| ready(s).is_some());
         let sink = wait_until(|| slot.lock().unwrap().clone());
-        let before = refresh_runs();
+        let before = h.refreshes.load(Ordering::SeqCst);
         for _ in 0..20 {
             sink.emit_json("git-status-changed", serde_json::json!({ "cwds": [] })).unwrap();
         }
         std::thread::sleep(Duration::from_millis(1500));
-        let runs = refresh_runs() - before;
+        let runs = h.refreshes.load(Ordering::SeqCst) - before;
         assert!((1..=3).contains(&runs), "20 events must coalesce into at most 3 refreshes, got {runs}");
+    }
+
+    #[test]
+    fn rapid_selection_does_not_wait_for_superseded_diffs() {
+        let dir = fixture();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let h = spawn(rt.handle(), SessionConfig {
+            path: dir.path().to_path_buf(),
+            poll_interval: Duration::from_secs(3600),
+            watcher: Arc::new(FlakyWatcher { allow: Arc::new(AtomicBool::new(true)) }),
+            check_git_version: false,
+            diff_delay: Some(Duration::from_millis(400)),
+        });
+        wait_for(&h, "first", |s| ready(s).is_some());
+        let started = Instant::now();
+        for _ in 0..5 {
+            h.commands.send(Command::SelectNext).unwrap(); // a -> b -> a -> b -> a -> b
+        }
+        wait_for(&h, "the last selection loaded", |s| {
+            s.selected.as_ref().map(|k| k.path == "b.txt").unwrap_or(false) && ready(s).map(|d| d.key.path == "b.txt").unwrap_or(false)
+        });
+        // Back to back, five delayed requests would take at least 2 s.
+        assert!(started.elapsed() < Duration::from_millis(1500), "superseded diffs were waited for: {:?}", started.elapsed());
     }
 
     fn wait_until<T>(mut f: impl FnMut() -> Option<T>) -> T {
@@ -1319,7 +1347,7 @@ Run: `cargo test session` — Expected: FAIL (does not compile).
 Structure of `src/engine/session.rs`, top to bottom:
 
 1. `BoxFut`, `WatcherControl`, `SessionConfig`, `EngineHandle` as in **Interfaces**.
-2. `FrozenWatcher { state: crate::git::watcher::GitWatcherState }` implementing `WatcherControl` by calling `crate::git::watcher::start_git_watcher_backend(cwd, sink, self.state.clone())` and `stop_git_watcher_backend(cwd, self.state.clone())`. `SessionConfig::production(path)` uses it with `poll_interval = 5 s` and `check_git_version = true`.
+2. `FrozenWatcher { state: crate::git::watcher::GitWatcherState }` implementing `WatcherControl` by calling `crate::git::watcher::start_git_watcher_backend(cwd, sink, self.state.clone())` and `stop_git_watcher_backend(cwd, self.state.clone())`. `SessionConfig::production(path)` uses it with `poll_interval = 5 s`, `check_git_version = true` and `diff_delay = None`.
 3. `ChannelSink { tx: tokio::sync::mpsc::UnboundedSender<Trigger> }` implementing `crate::runtime::EventSink`:
 
 ```rust
@@ -1377,65 +1405,79 @@ fn publish(state: &mut State, next: Snapshot, out: &std::sync::mpsc::Sender<std:
 }
 ```
 
-5. `async fn run(config, commands_rx, snapshots_tx)`:
+5. `async fn run(config, commands_rx, snapshots_tx, refreshes)`. Git never runs inline in the loop. It runs in spawned tasks that report on an internal `results` channel, so the loop keeps serving commands while git is busy; this is what makes the spec's generation rule observable.
+
+   ```rust
+   enum Done {
+       Watcher(Result<(), String>),
+       Status { response: Result<crate::git::GitStatusResponse, String>, head: Option<(Option<String>, Option<String>)> },
+       Diff { generation: u64, key: FileKey, result: Result<crate::git::GetGitDiffResponse, String> },
+   }
+   ```
+
    - Canonicalize `config.path`. If that fails or it is not a directory, publish `RepoState::Unusable { reason }` and return.
    - If `config.check_git_version`, call `gitver::check()` inside `tokio::task::spawn_blocking`; on `Err(reason)` publish `Unusable` and return.
-   - Create the trigger channel and `ChannelSink`. Spawn the watcher start as its own task that reports `Result<(), String>` on a oneshot; do not await it before the first refresh.
-   - Run `refresh(&mut state, Kind::Initial)`.
-   - Then loop on `tokio::select!` over: `commands_rx.recv()`, the trigger receiver, `tokio::time::interval(config.poll_interval)` and the watcher-start oneshot. Commands arriving while a refresh is in flight are handled after it (the loop is single-task, so refreshes never overlap; a burst of triggers is coalesced by draining the trigger channel with `try_recv` before refreshing once).
-   - Tick rule (D2): if `!state.watcher_running`, always refresh and also refetch branch and worktree; otherwise refresh only when `state.last_watcher_refresh.elapsed() >= config.poll_interval`.
-   - `Trigger::Head` refetches branch and worktree, then refreshes. `Trigger::Status` refreshes. Both set `last_watcher_refresh = now`.
-   - `Command::Refresh`: if `!watcher_running`, retry `watcher.start`; publish with `refreshing = true`; refresh; publish with `refreshing = false`.
-   - `Command::Select*`: compute the new `FileKey` (wrap with `rem_euclid`), publish `selected = key, diff = Loading`, then load that diff.
-   - `Command::Shutdown` or a closed channel: `watcher.stop(cwd)` and return.
+   - Create the trigger channel and `ChannelSink`. Spawn the watcher start as a task that sends `Done::Watcher`; the first refresh does not wait for it.
+   - `request_status(with_head)`: if `status_in_flight`, set `status_dirty = true` (and remember `with_head`); otherwise set `status_in_flight = true`, `refreshes.fetch_add(1, SeqCst)`, and spawn a task that runs `git_status_inner`, plus `git_branch_inner` and `git_worktree_name_inner` when `with_head`, and sends `Done::Status`.
+   - `request_diff(key)`: `diff_generation += 1`, then spawn a task that sleeps `config.diff_delay` when set, runs `get_git_diff_inner(cwd, key.path, key.staged, Some(untracked))`, and sends `Done::Diff { generation, key, result }`. Diff tasks are never awaited by the loop; a superseded one is discarded when it reports.
+   - Start with `request_status(true)`, then loop on `tokio::select!` over `commands_rx`, the trigger receiver, `tokio::time::interval(config.poll_interval)` and `results`.
+   - A trigger: drain the trigger channel with `try_recv` first (a burst becomes one request), call `request_status(any_head)`, set `last_watcher_refresh = now`.
+   - The tick (D2): when `!watcher_running`, `request_status(true)` every tick; otherwise `request_status(false)` only when `last_watcher_refresh.elapsed() >= config.poll_interval`.
+   - `Done::Watcher(Ok)` sets `watcher_running = true` and clears `watcher_error`; `Err(e)` sets `watcher_error = Some(e)`. Publish either way.
+   - `Done::Status`: apply the status rules of item 6, publish, clear `status_in_flight`; if `status_dirty`, clear it and `request_status` again; if a row is selected, `request_diff(selected)`.
+   - `Done::Diff { generation, key, result }`: discard it unless `generation == diff_generation` and `Some(&key) == snapshot.selected.as_ref()`. Otherwise apply the diff rules of item 6, clear `refreshing`, publish.
+   - `Command::Refresh`: if `!watcher_running`, spawn the watcher start again; set `refreshing = true`, publish, `request_status(true)`.
+   - `Command::Select(key)`, `SelectNext`, `SelectPrev` (wrapping with `rem_euclid`): publish `selected = key, diff = Loading` at once, then `request_diff(key)`. The loop does not wait, so five quick selections start five tasks and only the last result is applied.
+   - `Command::Shutdown` or a closed command channel: `watcher.stop(cwd)` and return.
 
-6. `refresh` implements the spec rules:
+6. The rules applied when results arrive:
 
 ```rust
-// status
-match crate::git::git_status_inner(cwd.clone()).await {
-    Err(e) => { next.status_error = Some(e); /* keep next.files */ }
+// Done::Status
+match response {
+    Err(e) => next.status_error = Some(e), // next.files keeps the last good list
     Ok(resp) => {
         next.status_error = None;
+        if let Some((branch, worktree)) = head { state.branch = branch; state.worktree = worktree; }
         next.repo = if resp.repo_root.is_empty() {
             RepoState::NotARepo { cwd: cwd.clone() }
         } else {
-            RepoState::Repo { toplevel: resp.repo_root.clone(), branch, worktree }
+            RepoState::Repo { toplevel: resp.repo_root.clone(), branch: state.branch.clone(), worktree: state.worktree.clone() }
         };
+        let old_index = next.files.iter().position(|f| Some(key_of(f)) == next.selected);
         next.files = resp.files;
-    }
-}
-// selection: same key if still listed, else same index clamped, else first, else none
-let old_index = prev_files.iter().position(|f| Some(key_of(f)) == next.selected);
-next.selected = next.selected.clone().filter(|k| next.files.iter().any(|f| &key_of(f) == k))
-    .or_else(|| old_index.and_then(|i| next.files.get(i.min(next.files.len().saturating_sub(1))).map(key_of)))
-    .or_else(|| next.files.first().map(key_of));
-// diff: Loading only when there is nothing to show for this key
-let same_key = matches!(&next.diff, DiffState::Ready(d) if Some(&d.key) == next.selected.as_ref());
-if !same_key { next.diff = if next.selected.is_some() { DiffState::Loading } else { DiffState::Idle }; publish(...); }
-if let Some(key) = next.selected.clone() {
-    let untracked = next.files.iter().any(|f| key_of(f) == key && matches!(f.status, ChangedFileStatus::Untracked));
-    match crate::git::get_git_diff_inner(cwd.clone(), key.path.clone(), key.staged, Some(untracked)).await {
-        Ok(resp) => {
-            if next.selected.as_ref() == Some(&key) { // stale-result guard
-                let changed = !matches!(&next.diff, DiffState::Ready(d) if d.raw_diff == resp.raw_diff && d.key == key);
-                if changed { next.diff = DiffState::Ready(Arc::new(LoadedDiff::build(key, resp))); }
-            }
+        // same key if still listed, else the same index clamped, else the first row, else none
+        next.selected = next.selected.clone().filter(|k| next.files.iter().any(|f| &key_of(f) == k))
+            .or_else(|| old_index.and_then(|i| next.files.get(i.min(next.files.len().saturating_sub(1))).map(key_of)))
+            .or_else(|| next.files.first().map(key_of));
+        // Loading only when there is nothing to show for the selected key
+        let same_key = matches!(&next.diff, DiffState::Ready(d) if Some(&d.key) == next.selected.as_ref());
+        if !same_key {
+            next.diff = if next.selected.is_some() { DiffState::Loading } else { DiffState::Idle };
         }
-        Err(e) => next.diff = DiffState::Failed(e),
     }
 }
-publish(state, next, out);
+
+// Done::Diff, after the generation and selection guard
+match result {
+    Ok(resp) => {
+        let unchanged = matches!(&next.diff, DiffState::Ready(d) if d.key == key && d.raw_diff == resp.raw_diff);
+        if !unchanged {
+            next.diff = DiffState::Ready(Arc::new(LoadedDiff::build(key, resp)));
+        }
+    }
+    Err(e) => next.diff = DiffState::Failed(e),
+}
 ```
 
-`key_of(f: &ChangedFile) -> FileKey { FileKey { path: f.path.clone(), staged: f.staged } }`. Branch and worktree come from `git_branch_inner(cwd).await.ok()` and `git_worktree_name_inner(cwd).await.ok().flatten()`.
+`key_of(f: &ChangedFile) -> FileKey { FileKey { path: f.path.clone(), staged: f.staged } }`. `untracked` for a diff request is `files.iter().any(|f| key_of(f) == key && matches!(f.status, ChangedFileStatus::Untracked))`.
 
-7. `pub fn spawn(runtime, config)` creates the two channels, calls `runtime.spawn(run(...))` and returns the handle.
+7. `pub fn spawn(runtime, config)` creates the two channels and the `refreshes` counter, calls `runtime.spawn(run(...))` and returns the handle.
 
 - [ ] **Step 3: Run the tests**
 
 Run: `cargo test session -- --test-threads=1`
-Expected: PASS (8 tests). They spawn real git processes; single-threaded keeps timing stable.
+Expected: PASS (9 tests). They also pass under plain `cargo test`, because nothing in them is process-global. They spawn real git processes; single-threaded keeps timing stable.
 
 - [ ] **Step 4: Commit**
 
@@ -1460,15 +1502,28 @@ Spec: 5.2 items 2 and 4 (literal pathspecs), 1.5 criterion 1.
 
 - [ ] **Step 1: Port the cases**
 
-Open `$VIMEFLOW/crates/backend/tests/git_diff_response.rs`. For every `#[tokio::test]` in it, copy the fixture setup and the assertions unchanged into `src/git_diff_response_tests.rs`, and replace the request that goes through `BackendState` with a direct call:
+`$VIMEFLOW/crates/backend/tests/git_diff_response.rs` holds 15 synchronous `#[test]` cases. None of them touches `BackendState` directly: every request goes through one helper, `diff_value(state, repo, file, staged, untracked)`, which blocks on a private tokio runtime. So the port is mechanical:
+
+1. Copy the whole file to `src/git_diff_response_tests.rs`.
+2. Delete `use vimeflow_lib::runtime::{BackendState, EventSink};`, the `NullEventSink` type and `make_state()`.
+3. Replace `diff_value` with the version below. Its signature loses the `state` parameter.
+4. In each of the 15 tests delete the `let (state, _app_data) = make_state();` line and the `&state,` argument of every `diff_value` call. Change nothing else: fixtures, helper functions and assertions stay byte for byte.
 
 ```rust
-// vimeflow: state.handle("get_git_diff", json!({"cwd": cwd, "file": file, "staged": staged, "untracked": untracked})).await
-let response = crate::git::get_git_diff(cwd.clone(), file.to_string(), staged, untracked).await.expect("diff");
-let value = serde_json::to_value(&response).expect("serialize"); // keep the original JSON assertions
+fn diff_value(repo: &Path, file: &str, staged: bool, untracked: Option<bool>) -> Value {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let cwd = repo.to_string_lossy().to_string();
+    let response = runtime
+        .block_on(crate::git::get_git_diff(cwd, file.to_string(), staged, untracked))
+        .expect("get_git_diff failed");
+    serde_json::to_value(&response).expect("encode response")
+}
 ```
 
-Delete the `BackendState`, `EventSink` and sink-construction lines. Register the change in `PORT-SURFACE.md` under a heading **Adapted tests**.
+Register the change in `PORT-SURFACE.md` under a heading **Adapted tests**. Then prove that all 15 were discovered, so the two tests added in Step 2 cannot mask a missing port:
+
+Run: `cargo test git_diff_response_tests -- --list | grep -c ': test$'`
+Expected: `15`.
 
 - [ ] **Step 2: Add the criterion-1 fixture and the literal-pathspec test to the same file**
 
@@ -1535,7 +1590,8 @@ async fn status_rows_cover_the_criterion_one_fixture() {
 
 - [ ] **Step 3: Run and commit**
 
-Run: `cargo test git_diff_response -- --test-threads=1` — Expected: PASS.
+Run: `cargo test git_diff_response_tests -- --list | grep -c ': test$'` — Expected: `17`.
+Run: `cargo test git_diff_response_tests` — Expected: PASS.
 
 ```bash
 git add -A
@@ -1579,16 +1635,28 @@ fn git(real: &Path, dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
-fn tree_hash(real: &Path, dir: &Path) -> String {
-    // content hash of every file outside .git, in path order
-    let out = Proc::new("sh")
-        .arg("-c")
-        .arg("find . -path ./.git -prune -o -type f -print0 | sort -z | xargs -0 sha256sum")
-        .current_dir(dir)
-        .output()
-        .unwrap();
-    let _ = real;
-    String::from_utf8_lossy(&out.stdout).to_string()
+/// Content hash of every file outside `.git`, in path order. Pure Rust, so it is the same on macOS.
+fn tree_hash(dir: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir).expect("read_dir").map(|e| e.expect("entry").path()).collect();
+        entries.sort();
+        for path in entries {
+            if path.strip_prefix(root).map(|p| p.starts_with(".git")).unwrap_or(false) {
+                continue;
+            }
+            if path.is_dir() { walk(&path, root, out) } else { out.push(path) }
+        }
+    }
+    let mut files = Vec::new();
+    walk(dir, dir, &mut files);
+    assert!(!files.is_empty(), "nothing was hashed");
+    let mut hasher = Sha256::new();
+    for file in files {
+        hasher.update(file.strip_prefix(dir).unwrap().to_string_lossy().as_bytes());
+        hasher.update(std::fs::read(&file).expect("read file"));
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 #[test]
@@ -1624,7 +1692,7 @@ fn the_engine_never_mutates_the_repository() {
 
     let index_before = std::fs::read(p.join(".git/index")).unwrap();
     let refs_before = git(&real, p, &["for-each-ref"]);
-    let tree_before = tree_hash(&real, p);
+    let tree_before = tree_hash(p);
 
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let mut config = SessionConfig::production(p.to_path_buf());
@@ -1662,7 +1730,7 @@ fn the_engine_never_mutates_the_repository() {
     }
     assert_eq!(std::fs::read(p.join(".git/index")).unwrap(), index_before, ".git/index changed");
     assert_eq!(git(&real, p, &["for-each-ref"]), refs_before, "refs changed");
-    assert_eq!(tree_hash(&real, p), tree_before, "worktree changed");
+    assert_eq!(tree_hash(p), tree_before, "worktree changed");
 }
 ```
 
@@ -1701,7 +1769,7 @@ Then, by hand:
 - `src/tui/style.rs`: delete any `use` of `crate::sidebar::layout::LineSpan` left in the first 84 lines (it serves the `Rendered` type that is not copied).
 - `src/tui/format.rs`: copy the three functions `width`, `pad` and `truncate` from `$WATCHER/src/sidebar/format.rs` (they start at lines 15, 32 and 40) together with the tests that cover them.
 - `src/tui/dialog.rs`: change the two imports to `use crate::tui::format;` and `use crate::tui::style::{Line, Role, Semantic, Span, Style};`.
-- `src/tui/guard.rs`: copy from `$WATCHER/src/sidebar/tui.rs` the `TerminalGuard` struct, its two `impl` blocks and its `Drop` (lines 22-75), `terminal_is_gone` and `poll_terminal` (lines 85-119), `mouse_transition` (lines 2176-2178), the `DisableRawMode` type they name, and the guard's tests (search for `FlakyWriter`). Make `TerminalGuard`, `TerminalGuard::set_mouse`, `poll_terminal` and `mouse_transition` `pub`.
+- `src/tui/guard.rs`: copy from `$WATCHER/src/sidebar/tui.rs` the `TerminalGuard` struct, its two `impl` blocks and its `Drop` (lines 22-75), `terminal_is_gone` and `poll_terminal` (lines 85-119), `mouse_transition` (lines 2176-2178), the `DisableRawMode` type they name, and the guard's tests (search for `FlakyWriter`). Make `TerminalGuard`, its constructor `TerminalGuard::enter`, `TerminalGuard::set_mouse`, `poll_terminal` and `mouse_transition` `pub`.
 
 `src/tui/mod.rs`:
 
@@ -2155,7 +2223,7 @@ pub fn build(diff: &LoadedDiff, mode: ViewMode) -> Rows {
 
 - [ ] **Step 5: Run and commit**
 
-Run: `cargo test rows sanitize` — Expected: PASS.
+Run: `cargo test tui::rows && cargo test tui::sanitize` — Expected: PASS. (Cargo accepts one test filter per invocation.)
 
 ```bash
 git add -A
@@ -2361,7 +2429,11 @@ impl ViewState {
         }
     }
 
+    /// Acts only when the height changed; the run loop calls it before every frame.
     pub fn resize(&mut self, body_height: u16) {
+        if self.body_height == body_height {
+            return;
+        }
         self.body_height = body_height;
         if let Some(rows) = &self.rows {
             self.offset = clamp_scroll(self.offset, rows.rows.len(), body_height);
@@ -2519,6 +2591,16 @@ mod tests {
     }
 
     #[test]
+    fn a_conflict_is_named_and_a_status_failure_stays_visible() {
+        let mut snap = files(snapshot("a.rs", "diff --cc a.rs\nindex 1,2..3\n@@@ -1,1 -1,1 +1,3 @@@\n", &[]));
+        let st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        assert!(render(&snap, &st, 80, 12).plain().iter().any(|l| l.contains("unmerged path")));
+        snap.status_error = Some("git command timed out after 30s".into());
+        let text = render(&snap, &st, 80, 12).plain();
+        assert!(text.iter().any(|l| l.contains("status failed: git command timed out after 30s")), "{text:?}");
+    }
+
+    #[test]
     fn a_tiny_terminal_draws_one_line() {
         let (r, _) = rendered(30, 5, FilesPanel::Hidden);
         assert_eq!(r.plain(), vec!["terminal too small".to_string()]);
@@ -2581,9 +2663,24 @@ impl Rendered {
     }
 }
 
+/// The one-line notice above the footer, by priority.
+pub fn notice(state: &ViewState, snapshot: &Snapshot) -> Option<String> {
+    if let (Some(error), false) = (&snapshot.status_error, snapshot.files.is_empty()) {
+        return Some(format!("status failed: {} · showing the last good list · r retries", sanitize(error)));
+    }
+    if let Some(reason) = &snapshot.watcher_error {
+        return Some(format!("live refresh degraded: {} · polling every 5 s · r retries", sanitize(reason)));
+    }
+    state.notice.clone()
+}
+
 pub fn body_height(state: &ViewState, snapshot: &Snapshot, height: u16) -> u16 {
-    let notice = u16::from(snapshot.watcher_error.is_some() || state.notice.is_some());
-    height.saturating_sub(2 + notice)
+    height.saturating_sub(2 + u16::from(notice(state, snapshot).is_some()))
+}
+
+/// The frozen parser yields zero hunks for a combined diff; the raw text still says so.
+fn is_conflict(raw_diff: &str) -> bool {
+    raw_diff.lines().any(|l| l.starts_with("diff --cc") || l.starts_with("diff --combined") || l.starts_with("@@@"))
 }
 
 /// Toolbar items left to right; the third field is the drop order (higher drops first).
@@ -2643,10 +2740,10 @@ fn toolbar(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> (Line, V
 
 The remaining functions, in this order, complete the file:
 
-- `fn state_message(snapshot: &Snapshot) -> Option<String>`: `RepoState::Unusable { reason }` gives `reason`; `NotARepo` gives `not a git repository`; a `status_error` with no files gives the error; no files gives `working tree clean`; `DiffState::Loading` gives `loading…`; `DiffState::Failed(e)` gives `e`; a `Ready` diff with zero hunks gives `binary file or no textual changes`, or `unmerged path: resolve conflicts to see hunks` when the selected file's status row is `Modified` and its path appears in `snapshot.files` twice unstaged (the frozen parser reports conflicts as unstaged-modified rows). Otherwise `None`.
+- `fn state_message(snapshot: &Snapshot) -> Option<String>`: `RepoState::Unusable { reason }` gives `reason`; `NotARepo` gives `not a git repository`; a `status_error` with no files gives the error; no files gives `working tree clean`; `DiffState::Loading` gives `loading…`; `DiffState::Failed(e)` gives `e`; a `Ready` diff with zero hunks gives `unmerged path: resolve conflicts to see hunks` when `is_conflict(&diff.raw_diff)`, else `binary file or no textual changes`. Otherwise `None`. (The frozen parser reports `UU`, `AA`, `AU` and `UA` as one unstaged `Modified` row, so the status list cannot tell a conflict apart; the raw diff can.)
 - `fn files_lines(snapshot, state, height) -> (Vec<String>, Vec<Hit>)`: line 0 `CHANGED n`; one line per file `{marker}{status} {basename}` padded to `FILES_WIDTH - 2` plus `S` for staged rows, where marker is `▸` for the selected row else a space, and status is `M A D R ?`; the basename is `sanitize`d and `truncate`d; the last line is `+a −d · n files`. Each file line gets `Hit { action: SelectFile(i) }` spanning the panel width.
 - `fn body_line(row: &Row, width: u16, hscroll: usize, mode: ViewMode, cursor: bool) -> Line`. Unified format: `{old:>5} {new:>5} {sign} {text}`; split format: two halves of `(width - 1) / 2` columns, each `{no:>5} {sign} {text}`, separated by `│`. `Gap` renders `··· n unmodified lines ···`, `HunkHeader` renders its text, `Truncated` renders `… n more lines not shown`, `FileHeader` renders the path. Text is cut with `hscroll` then `truncate`d to the remaining width. Styles: `+` rows `Style::semantic(Role::Body, Semantic::Good)`, `-` rows `Semantic::Bad`, hunk headers `Semantic::Accent`, numbers and gaps `Role::Label`, the file header `Role::Emphasis`. When `cursor` is true every span of the line gets `reverse = true`, and the line is padded to the full width so the bar spans the pane.
-- `pub fn render(...)`: assemble toolbar, body (panel + separator + diff rows `state.offset .. state.offset + body_height`, or the centred `state_message`), optional notice (`live refresh degraded: <reason> · polling every 5 s · r retries`, or `state.notice`), and the footer `j/k line  [ ] hunk  n/p file  t view  e files  r refresh  ? help  q quit`, cut from the right with `truncate`. Every diff row at screen line `y` adds `Hit { y, x0: panel_width, x1: width, action: CursorToRow(row_index) }`. When `state.help_open`, overlay `dialog::render` of the key sheet (Task 12 supplies the panel) centred at `min(width, 60)` columns.
+- `pub fn render(...)`: assemble toolbar, body (panel + separator + diff rows `state.offset .. state.offset + body_height`, or the centred `state_message`), the optional line from `notice(state, snapshot)`, and the footer `j/k line  [ ] hunk  n/p file  t view  e files  r refresh  ? help  q quit`, cut from the right with `truncate`. Every diff row at screen line `y` adds `Hit { y, x0: panel_width, x1: width, action: CursorToRow(row_index) }`. When `state.help_open`, overlay `dialog::render` of the key sheet (Task 12 supplies the panel) centred at `min(width, 60)` columns.
 
 Run: `cargo test tui::view` — Expected: PASS.
 
@@ -2826,6 +2923,10 @@ mod tests {
         let wheel = MouseEvent { kind: MouseEventKind::ScrollDown, column: 50, row: 10, modifiers: KeyModifiers::NONE };
         assert!(matches!(handle_mouse(&mut st, &snap, &r, wheel), Outcome::Redraw));
         assert_eq!(st.offset, 3);
+        // the run loop's redraw preparation must not pull the viewport back to the cursor
+        st.resize(body_height(&st, &snap, 24));
+        st.reconcile(&snap);
+        assert_eq!(st.offset, 3, "wheel scrolling was undone by the next frame");
         let shifted = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: hit.x0, row: hit.y, modifiers: KeyModifiers::SHIFT };
         assert!(matches!(handle_mouse(&mut st, &snap, &r, shifted), Outcome::Inert));
         let _ = DiffState::Idle;
@@ -3021,11 +3122,12 @@ fn main() {
             println!("herdr-hunks {}", env!("CARGO_PKG_VERSION"));
             0
         }
-        Some(other) if !other.starts_with('-') && std::path::Path::new(other).exists() => herdr_hunks::tui::shell::run(PathBuf::from(other)),
-        Some(other) => {
-            eprintln!("herdr-hunks: unknown command `{other}` (expected: tui [PATH], open, open-split, update)");
+        Some(flag) if flag.starts_with('-') => {
+            eprintln!("herdr-hunks: unknown option `{flag}` (expected: tui [PATH], open, open-split, update)");
             2
         }
+        // Any other word is a path. The engine validates it, so a missing path shows the error state.
+        Some(path) => herdr_hunks::tui::shell::run(PathBuf::from(path)),
     };
     std::process::exit(code);
 }
@@ -3080,6 +3182,8 @@ pub fn key(socket_path: &str, opener: &str) -> String;
 pub fn load(state_dir: &Path) -> BTreeMap<String, Record>;
 pub fn save(state_dir: &Path, records: &BTreeMap<String, Record>) -> std::io::Result<()>;
 pub fn may_reuse(record: &Record, toplevel: &str, viewer: Option<&PaneInfo>) -> bool;
+/// Holds an exclusive flock on `<state_dir>/split-panes.lock` while `f` runs.
+pub fn with_lock<T>(state_dir: &Path, f: impl FnOnce() -> T) -> std::io::Result<T>;
 ```
 
 - [ ] **Step 1: Copy the client and the test support**
@@ -3087,6 +3191,7 @@ pub fn may_reuse(record: &Record, toplevel: &str, viewer: Option<&PaneInfo>) -> 
 ```bash
 mkdir -p src/herdr src/actions tests/support tests/fixtures
 cp "$WATCHER/src/herdr/client.rs" src/herdr/client.rs
+cp "$WATCHER/tests/fixtures/ping-response.json" tests/fixtures/ping-response.json   # client.rs includes it in a test
 cp "$WATCHER/tests/support/mod.rs" tests/support/mod.rs
 "$HERDR_BIN_PATH" api schema --json > tests/fixtures/herdr-0.8.0-schema.json   # from a herdr 0.8.0 session
 ```
@@ -3150,6 +3255,30 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_updates_under_the_lock_keep_every_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let workers: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    with_lock(&path, || {
+                        let mut map = load(&path);
+                        std::thread::sleep(std::time::Duration::from_millis(15));
+                        map.insert(key("/s/herdr.sock", &format!("w1:p{i}")), record());
+                        save(&path, &map).unwrap();
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert_eq!(load(&path).len(), 8, "a read-modify-write was lost");
+    }
+
+    #[test]
     fn an_unreadable_file_is_an_empty_map_and_save_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("split-panes.json"), "{not json").unwrap();
@@ -3204,6 +3333,17 @@ pub fn save(state_dir: &Path, records: &BTreeMap<String, Record>) -> std::io::Re
     std::fs::rename(tmp, state_dir.join("split-panes.json"))
 }
 
+pub fn with_lock<T>(state_dir: &Path, f: impl FnOnce() -> T) -> std::io::Result<T> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::create_dir_all(state_dir)?;
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(state_dir.join("split-panes.lock"))?;
+    // flock is released when `file` drops, including on panic.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(f())
+}
+
 pub fn may_reuse(record: &Record, toplevel: &str, viewer: Option<&PaneInfo>) -> bool {
     let Some(viewer) = viewer else { return false };
     record.toplevel == toplevel
@@ -3215,9 +3355,9 @@ pub fn may_reuse(record: &Record, toplevel: &str, viewer: Option<&PaneInfo>) -> 
 `src/actions/mod.rs`: `open_params` builds the two shapes of spec 2.5 with `serde_json::json!`. `run_open(placement)`:
 
 1. Parse `$HERDR_PLUGIN_CONTEXT_JSON`; `opener = context["focused_pane_id"]`.
-2. `pane = client.pane_get(opener)` when an opener exists; `repo_cwd = pane.foreground_cwd`, else `pane.cwd`, else `context["focused_pane_cwd"]`, else `context["workspace_cwd"]`. With none of them, print `herdr-hunks: no working directory for the focused pane` and return 1.
-3. For `Placement::Split`: `toplevel` is the trimmed stdout of `git -C <repo_cwd> rev-parse --show-toplevel` (or `repo_cwd` when that fails); `records = reuse::load(state_dir)`; if a record exists under `reuse::key(socket, opener)` and `may_reuse(record, toplevel, client.pane_get(&record.viewer_pane_id).ok().as_ref())` and `client.plugin_pane_focus(..)` is `Ok`, return 0.
-4. `client.plugin_pane_open(open_params($HERDR_PLUGIN_ID or "winoooops.hunks", placement, opener, repo_cwd))`. For `Split`, store `Record { viewer_pane_id, repo_cwd, toplevel }` and `save`.
+2. `pane = client.pane_get(opener)` when an opener exists. If that pane's label is `VIEWER_TITLE`, the focused pane is already a viewer: print `herdr-hunks: already in the hunk viewer` and return 0 without opening anything. Otherwise `repo_cwd = pane.foreground_cwd`, else `pane.cwd`, else `context["focused_pane_cwd"]`, else `context["workspace_cwd"]`. With none of them, print `herdr-hunks: no working directory for the focused pane` and return 1.
+3. `Placement::Overlay` goes straight to step 4. For `Placement::Split`, steps 3 and 4 run inside one `reuse::with_lock(state_dir, ...)`, so two invocations cannot both miss the record and open two viewers, and two sessions cannot overwrite each other's records. `toplevel` is the trimmed stdout of `git -C <repo_cwd> rev-parse --show-toplevel` (or `repo_cwd` when that fails); `records = reuse::load(state_dir)`; if a record exists under `reuse::key(socket, opener)` and `may_reuse(record, toplevel, client.pane_get(&record.viewer_pane_id).ok().as_ref())` and `client.plugin_pane_focus(..)` is `Ok`, return 0.
+4. `client.plugin_pane_open(open_params($HERDR_PLUGIN_ID or "winoooops.hunks", placement, opener, repo_cwd))`. For `Split`, store `Record { viewer_pane_id, repo_cwd, toplevel }` and `save`, still under the lock.
 5. Any client error prints `herdr-hunks: <error>` to stderr and returns 1.
 
 `src/main.rs`: add arms `Some("open") => herdr_hunks::actions::run_open(Placement::Overlay)` and `Some("open-split") => herdr_hunks::actions::run_open(Placement::Split)`, and call `herdr_hunks::engine::init_process_env()` at the top of `main`.
@@ -3231,6 +3371,7 @@ Each test starts `support::FakeHerdr`, sets `HERDR_SOCKET_PATH`, `HERDR_PLUGIN_I
 3. The same record under a different `HERDR_SOCKET_PATH`: a second open, no focus.
 4. The recorded pane relabelled `zsh`: a second open.
 5. `fail_focus(true)`: a second open after the failed focus.
+5a. The focused pane is itself labelled `Hunks`: no `plugin.pane.open` and no `plugin.pane.focus` is sent, and the exit code is 0.
 6. Every recorded request's params validate against `tests/fixtures/herdr-0.8.0-schema.json`: assert each param key exists in the schema's definition for that method, and each `required` key is present.
 7. `rg -n '"herdr"' src/` finds nothing (run it through `std::process::Command` and assert an empty stdout): the host binary is never named literally.
 
@@ -3255,7 +3396,7 @@ Spec: 2.5 (manifest), 6.1, 6.2.
 
 **Interfaces:**
 - Consumes: `actions::run_open`.
-- Produces: `actions::update::{latest_tag(ls_remote_output: &str) -> Option<String>, run() -> i32}`.
+- Produces: `actions::update::{latest_tag(ls_remote_output: &str) -> Option<String>, run_with(host: &Path, git: &str, plugin_id: &str) -> i32, run() -> i32}`. `run()` is `run_with($HERDR_BIN_PATH, "git", $HERDR_PLUGIN_ID)`.
 
 - [ ] **Step 1: Write `herdr-plugin.toml`**
 
@@ -3321,6 +3462,44 @@ mod tests {
         assert_eq!(latest_tag(out).as_deref(), Some("v0.10.0"));
         assert_eq!(latest_tag("eee\trefs/tags/nightly\n"), None);
     }
+
+    /// Writes an executable shell script and returns its path.
+    fn script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn host(dir: &std::path::Path, kind: &str, install_exit: i32) -> std::path::PathBuf {
+        let log = dir.join("host.log");
+        script(dir, "host", &format!(
+            "echo \"$*\" >> '{}'\nif [ \"$1 $2\" = 'plugin list' ]; then echo '{{\"result\":{{\"plugins\":[{{\"plugin_id\":\"winoooops.hunks\",\"source\":{{\"kind\":\"{kind}\"}}}}]}}}}'; exit 0; fi\nexit {install_exit}",
+            log.display()
+        ))
+    }
+
+    #[test]
+    fn a_linked_install_is_refused_and_nothing_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path(), "local", 0);
+        let git = script(dir.path(), "git", "echo 'aaa\trefs/tags/v9.9.9'");
+        assert_ne!(super::run_with(&host, git.to_str().unwrap(), "winoooops.hunks"), 0);
+        assert!(!std::fs::read_to_string(dir.path().join("host.log")).unwrap().contains("plugin install"));
+    }
+
+    #[test]
+    fn a_github_install_installs_the_newest_tag_and_propagates_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = script(dir.path(), "git", "printf 'aaa\\trefs/tags/v9.9.9\\nbbb\\trefs/tags/v9.10.0\\n'");
+        let ok = host(dir.path(), "github", 0);
+        assert_eq!(super::run_with(&ok, git.to_str().unwrap(), "winoooops.hunks"), 0);
+        let log = std::fs::read_to_string(dir.path().join("host.log")).unwrap();
+        assert!(log.contains("plugin install winoooops/herdr-hunks --ref v9.10.0 --yes"), "{log}");
+        let failing = host(dir.path(), "github", 7);
+        assert_eq!(super::run_with(&failing, git.to_str().unwrap(), "winoooops.hunks"), 7);
+    }
 }
 ```
 
@@ -3347,7 +3526,7 @@ pub fn latest_tag(ls_remote_output: &str) -> Option<String> {
 }
 ```
 
-`run()`: read `$HERDR_BIN_PATH` (missing: print the reason, return 1). Run `<bin> plugin list --json`, find the entry whose `plugin_id` equals `$HERDR_PLUGIN_ID`, and refuse with a message unless its `source.kind` is `github`. Run `git ls-remote --tags https://github.com/winoooops/herdr-hunks`; `latest_tag`; if it equals `v` + `CARGO_PKG_VERSION` print `already up to date` and return 0; otherwise run `<bin> plugin install winoooops/herdr-hunks --ref <tag> --yes` and return its exit code. Add the `Some("update")` arm to `main`.
+`run_with(host, git, plugin_id)`: run `<host> plugin list --json`, find the entry whose `plugin_id` equals `plugin_id`, and refuse (print why, return 1) unless its `source.kind` is `github`. Run `<git> ls-remote --tags https://github.com/winoooops/herdr-hunks`; `latest_tag`; with no tag, print the reason and return 1; if the tag equals `v` + `CARGO_PKG_VERSION`, print `already up to date` and return 0; otherwise run `<host> plugin install winoooops/herdr-hunks --ref <tag> --yes` and return its exit code. `run()` reads `$HERDR_BIN_PATH` and `$HERDR_PLUGIN_ID` (missing: print the reason, return 1) and calls `run_with`. Add the `Some("update")` arm to `main`.
 
 - [ ] **Step 4: Distribution files**
 
@@ -3421,34 +3600,142 @@ Spec: 5.2 item 10, 5.3, 1.5.
 - Consumes: the built binary and a real `herdr` 0.8.0 on `PATH`.
 - Produces: nothing.
 
-- [ ] **Step 1: Write the ignored test**
+- [ ] **Step 1: Build the release binary the manifest points at**
 
-Model it on `$WATCHER/tests/e2e_real_herdr.rs` (isolated `HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`; a named session; the user's real `session.json` mtime asserted unchanged):
+`herdr plugin link` skips `[[build]]`, the manifest's commands point at `target/release/herdr-hunks`, and `cargo test` never rebuilds that file. The last release build was in Task 13, before the actions existed.
+
+Run: `cargo build --release && target/release/herdr-hunks --version`
+Expected: `herdr-hunks 0.1.0`.
+
+- [ ] **Step 2: Write the ignored test in `tests/e2e_real_herdr.rs`**
+
+The isolation pattern is the one in `$WATCHER/tests/e2e_real_herdr.rs` (a temp dir under `/tmp` because macOS caps Unix socket paths at 103 bytes; isolated `HOME`, `XDG_CONFIG_HOME` and `XDG_STATE_HOME`; a named session; the user's real `session.json` mtime asserted unchanged). That file builds its environment inline, so nothing is copied from it except the two small items marked below.
 
 ```rust
+use herdr_hunks::herdr::client::HerdrClient;
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant, SystemTime};
+
+struct ProcessGuard(Child); // as in the watcher's test
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn modified(path: &Path) -> Option<SystemTime> { // as in the watcher's test
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !check() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+struct Isolated { home: PathBuf, config: PathBuf, state: PathBuf, socket: PathBuf }
+
+impl Isolated {
+    /// Runs the herdr CLI against the isolated session and returns its JSON output.
+    fn herdr(&self, args: &[&str]) -> Value {
+        let out = Command::new("herdr")
+            .args(args)
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", &self.config)
+            .env("XDG_STATE_HOME", &self.state)
+            .env("HERDR_SOCKET_PATH", &self.socket)
+            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_SESSION")
+            .env_remove("HERDR_CLIENT_SOCKET_PATH")
+            .output()
+            .expect("run herdr");
+        assert!(out.status.success(), "herdr {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice(&out.stdout).unwrap_or(Value::Null)
+    }
+
+    fn viewers(&self) -> Vec<Value> {
+        let list = self.herdr(&["pane", "list"]);
+        list["result"]["panes"].as_array().cloned().unwrap_or_default().into_iter().filter(|p| p["label"] == "Hunks").collect()
+    }
+}
+
 #[test]
-#[ignore = "needs a real herdr 0.8.0 on PATH; run with: cargo test --test e2e_real_herdr -- --ignored"]
-fn open_split_creates_a_viewer_pane_in_the_repository() {
-    // 1. isolated dirs + `herdr --session hunks-e2e-<pid> server` in the background
-    // 2. `herdr plugin link <repo root>`
-    // 3. fixture repo with one modified file; `herdr workspace create --cwd <fixture>`
-    // 4. `herdr plugin action invoke open-split --plugin winoooops.hunks`
-    // 5. poll `herdr pane list` until a pane labelled "Hunks" appears (10 s)
-    // 6. assert its cwd is the fixture repo; assert split-panes.json holds one record
-    // 7. invoke again; assert still exactly one "Hunks" pane (reuse)
-    // 8. `herdr server stop`; assert the real session.json mtime is unchanged
+#[ignore = "needs a real herdr 0.8.0 on PATH: cargo build --release && cargo test --test e2e_real_herdr -- --ignored"]
+fn open_split_creates_one_viewer_and_reuses_it() {
+    let real_session = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/herdr/session.json"));
+    let real_mtime = real_session.as_deref().and_then(modified);
+
+    let tmp = tempfile::Builder::new().prefix("hh-e2e-").tempdir_in("/tmp").unwrap();
+    let session = format!("hh-e2e-{}", std::process::id());
+    let config = tmp.path().join("xdg-config");
+    let socket = config.join("herdr/sessions").join(&session).join("herdr.sock");
+    let iso = Isolated { home: tmp.path().join("home"), config, state: tmp.path().join("xdg-state"), socket };
+    std::fs::create_dir_all(&iso.home).unwrap();
+    let _server = ProcessGuard(
+        Command::new("herdr")
+            .args(["--session", &session, "server"])
+            .env("HOME", &iso.home)
+            .env("XDG_CONFIG_HOME", &iso.config)
+            .env("XDG_STATE_HOME", &iso.state)
+            .env("TERM", "xterm-256color")
+            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_SOCKET_PATH")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn isolated herdr server"),
+    );
+    wait_for("the session socket", || iso.socket.exists());
+
+    // a repository with one modified file
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@example.com"], &["config", "user.name", "t"]] {
+        assert!(Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+    }
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    assert!(Command::new("git").arg("-C").arg(&repo).args(["add", "-A"]).status().unwrap().success());
+    assert!(Command::new("git").arg("-C").arg(&repo).args(["commit", "-q", "-m", "init"]).status().unwrap().success());
+    std::fs::write(repo.join("a.txt"), "ONE\n").unwrap();
+
+    iso.herdr(&["plugin", "link", env!("CARGO_MANIFEST_DIR")]);
+    let created = iso.herdr(&["workspace", "create", "--cwd", repo.to_str().unwrap(), "--focus"]);
+    let opener = created["result"]["root_pane"]["pane_id"].as_str().expect("root pane id").to_string();
+
+    iso.herdr(&["plugin", "action", "invoke", "open-split", "--plugin", "winoooops.hunks"]);
+    wait_for("one viewer pane", || iso.viewers().len() == 1);
+    let viewer = &iso.viewers()[0];
+    assert_eq!(viewer["cwd"].as_str().map(PathBuf::from), Some(std::fs::canonicalize(&repo).unwrap()));
+
+    // The viewer took focus. Refocus the opener, or the second invoke would treat the viewer as the opener.
+    std::env::set_var("HERDR_SOCKET_PATH", &iso.socket);
+    HerdrClient::from_env().request("pane.focus", json!({ "pane_id": opener })).expect("refocus the opener");
+    iso.herdr(&["plugin", "action", "invoke", "open-split", "--plugin", "winoooops.hunks"]);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(iso.viewers().len(), 1, "the second invoke must reuse the viewer");
+
+    let state_file = iso.state.join("herdr/plugins/winoooops.hunks/split-panes.json");
+    let records: Value = serde_json::from_str(&std::fs::read_to_string(&state_file).expect("split-panes.json")).unwrap();
+    assert_eq!(records.as_object().map(|m| m.len()), Some(1));
+
+    iso.herdr(&["server", "stop"]);
+    assert_eq!(real_session.as_deref().and_then(modified), real_mtime, "the real herdr session was touched");
 }
 ```
 
-Copy the three helpers the watcher's test defines for this (the isolated-environment builder, the `herdr` command runner that sets `HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `--session`, and the server guard that stops the session on drop) into this file unchanged, and register the copy in `PORT-SURFACE.md`. Each numbered comment is then one call through that runner; parse its stdout with `serde_json` and assert on `result.panes[*].label`, `result.panes[*].cwd` and the contents of `split-panes.json`.
-
-- [ ] **Step 2: Write `docs/acceptance-p1.md`**
+- [ ] **Step 3: Write `docs/acceptance-p1.md`**
 
 A checklist with one line per success criterion of spec 1.5, each with the command to run and the expected observation: criterion 1 (`cargo test git_diff_response`), criterion 2 (open from an agent pane inside a linked worktree; the toolbar file list shows that worktree's changes), criterion 3 (an agent edits the same file twice; the view follows; repeat with `fs.inotify.max_user_watches` exhausted and confirm the degraded notice and convergence), criterion 4 (link the same build into upstream herdr 0.8.0 and into the fork with its `vimeflow` binary; `open` works in both), criterion 5 (`cargo test --test readonly_guarantee`).
 
-- [ ] **Step 3: Run and commit**
+- [ ] **Step 4: Run and commit**
 
-Run: `cargo test --test e2e_real_herdr -- --ignored` on a machine with herdr 0.8.0 — Expected: PASS.
+Run: `cargo build --release && cargo test --test e2e_real_herdr -- --ignored` on a machine with herdr 0.8.0 — Expected: PASS.
 
 ```bash
 git add -A
