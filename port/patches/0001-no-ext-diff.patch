@@ -1,0 +1,21 @@
+Reason: D4. diff.external / GIT_EXTERNAL_DIFF must not replace the unified diff.
+No environment variable disables external diffs, so this cannot be a D3 item.
+
+--- a/src/git/mod.rs
++++ b/src/git/mod.rs
+@@ -1343,6 +1343,7 @@
+         .arg("diff")
+         .arg("--no-index")
+         .arg("--no-color")
++        .arg("--no-ext-diff")
+         .arg("--")
+         .arg(NULL_DEVICE)
+         .arg(file)
+@@ -1499,6 +1500,7 @@
+         .arg(&canonical_toplevel)
+         .arg("diff")
+         .arg("--no-color")
++        .arg("--no-ext-diff")
+         .env("GIT_TERMINAL_PROMPT", "0");
+ 
+     if staged {

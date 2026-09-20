@@ -1,0 +1,87 @@
+Reason: D5. run_sync_with_timeout read the pipes only after exit, so output
+larger than the pipe buffer blocked the child until the timeout killed it.
+
+--- a/src/git/watcher.rs
++++ b/src/git/watcher.rs
+@@ -204,18 +204,29 @@
+         .spawn()
+         .map_err(|e| format!("spawn failed: {}", e))?;
+ 
++    let mut stdout = child.stdout.take();
++    let mut stderr = child.stderr.take();
++    let out_reader = std::thread::spawn(move || {
++        let mut buf = Vec::new();
++        if let Some(pipe) = stdout.as_mut() {
++            let _ = std::io::Read::read_to_end(pipe, &mut buf);
++        }
++        buf
++    });
++    let err_reader = std::thread::spawn(move || {
++        let mut buf = Vec::new();
++        if let Some(pipe) = stderr.as_mut() {
++            let _ = std::io::Read::read_to_end(pipe, &mut buf);
++        }
++        buf
++    });
++
+     let start = Instant::now();
+-    loop {
++    let status = loop {
+         match child.try_wait() {
+-            Ok(Some(_)) => {
+-                // Exited — drain stdio and return the full Output.
+-                return child
+-                    .wait_with_output()
+-                    .map_err(|e| format!("wait_with_output failed: {}", e));
+-            }
++            Ok(Some(status)) => break status,
+             Ok(None) => {
+                 if start.elapsed() > timeout {
+-                    // Kill and reap so we don't leak a zombie.
+                     let _ = child.kill();
+                     let _ = child.wait();
+                     return Err(format!("git command timed out after {:?}", timeout));
+@@ -223,18 +234,17 @@
+                 std::thread::sleep(Duration::from_millis(50));
+             }
+             Err(e) => {
+-                // Mirror the timeout-arm cleanup: a `try_wait` error can
+-                // leave the child running (EINTR) or as a zombie. Without
+-                // this the subprocess + its piped stdout/stderr fds leak
+-                // until process exit, which accumulates under rapid
+-                // repo-switch workloads where the polling thread hits
+-                // this path repeatedly.
+                 let _ = child.kill();
+                 let _ = child.wait();
+                 return Err(format!("try_wait failed: {}", e));
+             }
+         }
+-    }
++    };
++    Ok(std::process::Output {
++        status,
++        stdout: out_reader.join().unwrap_or_default(),
++        stderr: err_reader.join().unwrap_or_default(),
++    })
+ }
+ 
+ /// Handle to a running watcher for a git repository
+@@ -1501,6 +1511,18 @@
+     use std::sync::{mpsc, Arc};
+     use tempfile::TempDir;
+ 
++    #[test]
++    fn run_sync_with_timeout_drains_output_larger_than_the_pipe_buffer() {
++        let mut cmd = std::process::Command::new("sh");
++        cmd.arg("-c")
++            .arg("head -c 1048576 /dev/zero | tr '\\0' 'x'");
++        let started = std::time::Instant::now();
++        let output =
++            run_sync_with_timeout(cmd, Duration::from_secs(10)).expect("must not time out");
++        assert_eq!(output.stdout.len(), 1_048_576);
++        assert!(started.elapsed() < Duration::from_secs(5));
++    }
++
+     /// Create a temp git repo for testing
+     fn create_temp_repo() -> TempDir {
+         let temp = home_tempdir();

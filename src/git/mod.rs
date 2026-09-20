@@ -1343,6 +1343,7 @@ async fn get_untracked_diff(toplevel: &Path, file: &str) -> Result<String, Strin
         .arg("diff")
         .arg("--no-index")
         .arg("--no-color")
+        .arg("--no-ext-diff")
         .arg("--")
         .arg(NULL_DEVICE)
         .arg(file)
@@ -1499,6 +1500,7 @@ pub(crate) async fn get_git_diff_inner(
         .arg(&canonical_toplevel)
         .arg("diff")
         .arg("--no-color")
+        .arg("--no-ext-diff")
         .env("GIT_TERMINAL_PROMPT", "0");
 
     if staged {

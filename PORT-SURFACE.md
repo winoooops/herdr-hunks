@@ -3,14 +3,16 @@
 ## Pin
 
 vimeflow `91e45b1c` (`91e45b1c8f381385093813d0b4eb1d9daeb2d563`).
-The following files are copied byte-identically from `crates/backend/src/git/`:
+The following files are copied from `crates/backend/src/git/` at the pin,
+then changed only by the registered patches below:
 
 - `src/git/mod.rs`
 - `src/git/watcher.rs`
 - `src/git/test_helpers.rs`
 
 `scripts/port-check.sh <vimeflow-checkout>` verifies the pinned sources plus
-`port/patches/*.patch` in order against `src/git/`. No patches are registered yet.
+`port/patches/*.patch` in order against `src/git/`. Two patches are registered:
+`0001-no-ext-diff.patch` (D4) and `0002-drain-sync-output.patch` (D5).
 
 ## Port surface
 
@@ -100,6 +102,26 @@ the watcher's synchronous calls. The frozen tree is not edited.
   therefore best-effort hygiene, and G7 does not depend on it. A hard floor of 2.45
   was rejected: it would lock out every system that still ships an older git, for
   the sake of a partial-clone edge case.
+
+**D4 (Phase 1, patch): no external diff.** The two patch-producing diff calls
+(`vimeflow:crates/backend/src/git/mod.rs:1343,1500`) pass `--no-color` but not
+`--no-ext-diff`, so `diff.external`, `GIT_EXTERNAL_DIFF` or a per-path diff driver
+replaces the unified diff. With a tool such as difftastic configured globally,
+every file would parse to zero hunks. No environment variable turns external
+diffs off, so this cannot be a D3 item. `port/patches/0001-no-ext-diff.patch` adds
+`--no-ext-diff` to those two calls. The numstat and name-status calls never run
+an external diff and are untouched. Textconv filters are left on: their output is
+still a unified diff.
+
+**D5 (Phase 1, patch): drain child output.** The watcher's
+`run_sync_with_timeout` polls `try_wait` and reads the child's pipes only after it
+exits (`vimeflow:crates/backend/src/git/watcher.rs:195-214`). A `git status` whose
+output exceeds the pipe buffer (64 KiB on Linux; a few thousand untracked paths)
+blocks on write until the 10 s timeout kills it, so in such a repository the
+status-hash fallback never works and a git process is always hung.
+`port/patches/0002-drain-sync-output.patch` reads stdout and stderr on helper
+threads while waiting, and adds its test inside `watcher.rs`, because the function
+is private.
 
 ## Known defects
 

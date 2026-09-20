@@ -5,3 +5,6 @@ pub mod filesystem;
 #[allow(dead_code)]
 pub mod git;
 pub mod runtime;
+
+#[cfg(test)]
+mod git_patches_tests;
