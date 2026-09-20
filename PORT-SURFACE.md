@@ -51,8 +51,10 @@ still run.
 
 ## Registered divergences
 
-D1 is implemented by the filesystem shim. D2 and D3 are registered Phase 1
-policies; their engine and process startup implementations are still pending.
+D1 is implemented by the filesystem shim. D2's engine content poll is implemented
+in `src/engine/session.rs`. D3's process environment policy is implemented in
+`src/engine/mod.rs` and applied by the first statement of `main` in `src/main.rs`,
+before any runtime or thread is created.
 
 **D1 (Phase 1): cwd scope policy.** vimeflow's `validate_cwd` rejects any cwd
 outside `$HOME` (`vimeflow:crates/backend/src/git/mod.rs:81-89`), because there the
@@ -173,3 +175,4 @@ API in a separate process with one test, before starting its Tokio runtime.
 | `src/tui/dialog.rs` | `src/sidebar/dialog.rs` | All seven `crate::sidebar::` references changed to `crate::tui::`, including test references. |
 | `src/tui/guard.rs` | `src/sidebar/tui.rs:20-75,85-119,2173-2178` | Terminal guard, polling, and mouse-transition code with required imports and guard tests; `TerminalGuard`, `enter`, `set_mouse`, `poll_terminal`, and `mouse_transition` made public. |
 | `src/tui/layout.rs` | `src/sidebar/layout.rs` | Adapted scroll arithmetic: content offsets and row counts use `usize`, while viewport sizes remain `u16`, so diffs can scroll past row 65,535; reanchoring preserves the cursor's viewport row. |
+| `src/tui/shell.rs` | `src/sidebar/tui.rs:2180-2231,2265 onward` | Adapted terminal setup, mouse reconciliation, rendering and input loop for engine snapshots and handler outcomes; named ANSI colours only, with config notices, panic restoration and bounded runtime shutdown. |

@@ -1,3 +1,4 @@
+pub mod config;
 pub mod dialog;
 pub mod format;
 pub mod guard;
@@ -6,6 +7,7 @@ pub mod keys;
 pub mod layout;
 pub mod rows;
 pub mod sanitize;
+pub mod shell;
 pub mod state;
 pub mod style;
 pub mod view;

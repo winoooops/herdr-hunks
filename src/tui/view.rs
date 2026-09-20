@@ -227,6 +227,9 @@ fn toolbar(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> (Line, V
 }
 
 fn state_message(snapshot: &Snapshot) -> Option<String> {
+    if snapshot.revision == 0 {
+        return Some("loading…".into());
+    }
     match &snapshot.repo {
         RepoState::Unusable { reason } => return Some(sanitize(reason)),
         RepoState::NotARepo { .. } => return Some("not a git repository".into()),
@@ -341,6 +344,42 @@ fn fit_line(mut line: Line, cells: usize) -> Line {
     line
 }
 
+fn clip_line(line: &Line, start: usize, cells: usize) -> Line {
+    use unicode_width::UnicodeWidthChar;
+    let end = start.saturating_add(cells);
+    let (mut position, mut used, mut kept) = (0usize, 0usize, false);
+    let mut clipped = Vec::new();
+    for span in line {
+        let mut text = String::new();
+        for ch in span.text.chars() {
+            let size = ch.width().unwrap_or(0);
+            if size == 0 {
+                if kept {
+                    text.push(ch);
+                }
+                continue;
+            }
+            let next = position + size;
+            let visible = next.min(end).saturating_sub(position.max(start));
+            kept = visible == size;
+            if kept {
+                text.push(ch);
+            } else {
+                text.push_str(&" ".repeat(visible));
+            }
+            used += visible;
+            position = next;
+        }
+        if !text.is_empty() {
+            clipped.push(Span::new(text, span.style));
+        }
+    }
+    if used < cells {
+        clipped.push(Span::body(" ".repeat(cells - used)));
+    }
+    clipped
+}
+
 fn scroll_text(text: &str, cells: usize) -> String {
     use unicode_width::UnicodeWidthChar;
     if cells == 0 {
@@ -378,8 +417,14 @@ fn body_line(row: &Row, columns: u16, hscroll: usize, _mode: ViewMode, cursor: b
             scroll_text(text, hscroll),
             Style::semantic(Role::Label, Semantic::Accent),
         )],
-        Row::Gap { lines } => vec![Span::label(format!("··· {lines} unmodified lines ···"))],
-        Row::Truncated { lines } => vec![Span::label(format!("… {lines} more lines not shown"))],
+        Row::Gap { lines } => vec![Span::label(format!(
+            "··· {lines} unmodified line{} ···",
+            if *lines == 1 { "" } else { "s" }
+        ))],
+        Row::Truncated { lines } => vec![Span::label(format!(
+            "… {lines} more line{} not shown",
+            if *lines == 1 { "" } else { "s" }
+        ))],
         Row::Unified {
             old_no,
             new_no,
@@ -518,17 +563,11 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
             .enumerate()
         {
             let background = &lines[y + 1];
-            let mut line = fit_line(background.clone(), x);
+            let mut line = clip_line(background, 0, x);
             line.extend(overlay);
-            let mut skip = x + usize::from(panel_width);
-            for span in background {
-                let cells = width(&span.text);
-                if skip < cells {
-                    line.push(Span::new(scroll_text(&span.text, skip), span.style));
-                }
-                skip = skip.saturating_sub(cells);
-            }
-            lines[y + 1] = fit_line(line, columns.into());
+            let right = x + usize::from(panel_width);
+            line.extend(clip_line(background, right, usize::from(columns) - right));
+            lines[y + 1] = line;
         }
         hits.clear();
     }
@@ -542,6 +581,82 @@ mod tests {
     use crate::git::{ChangedFile, ChangedFileStatus};
     use crate::tui::state::tests::snapshot;
     use crate::tui::state::{FilesPanel, ViewState};
+
+    #[test]
+    fn the_first_frame_is_loading_until_a_snapshot_arrives() {
+        let mut snap = Snapshot::empty("/r");
+        let state = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        let text = render(&snap, &state, 80, 12).plain().join("\n");
+        assert!(text.contains("loading…"));
+        assert!(!text.contains("not a git repository"));
+        snap.revision = 1;
+        let text = render(&snap, &state, 80, 12).plain().join("\n");
+        assert!(text.contains("not a git repository"));
+        assert!(!text.contains("loading…"));
+    }
+
+    #[test]
+    fn gap_and_truncation_labels_use_singular_for_one_line() {
+        for (count, noun) in [(0, "lines"), (1, "line"), (2, "lines")] {
+            for (row, expected) in [
+                (
+                    Row::Gap { lines: count },
+                    format!("··· {count} unmodified {noun} ···"),
+                ),
+                (
+                    Row::Truncated {
+                        lines: count as usize,
+                    },
+                    format!("… {count} more {noun} not shown"),
+                ),
+            ] {
+                let line = body_line(&row, 80, 0, ViewMode::Unified, false);
+                let text: String = line.iter().map(|span| span.text.as_str()).collect();
+                assert_eq!(text.trim_end(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn help_does_not_add_ellipses_outside_the_panel() {
+        let mut snap = Snapshot::empty("/r");
+        snap.revision = 1;
+        let mut state = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        state.help_open = true;
+        for columns in [80, 120] {
+            let rendered = render(&snap, &state, columns, 12);
+            let left = usize::from((columns - 60) / 2);
+            for row in &rendered.plain()[1..11] {
+                let outside: String = row
+                    .chars()
+                    .take(left)
+                    .chain(row.chars().skip(left + 60))
+                    .collect();
+                assert!(!outside.contains('…'), "{row}");
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_clipping_pads_partial_wide_cells_and_preserves_styles() {
+        let line = vec![Span::emphasis("ab猫"), Span::label("cd")];
+        for (start, cells, expected) in [
+            (0, 3, "ab "),
+            (3, 3, " cd"),
+            (2, 3, "猫c"),
+            (5, 3, "d  "),
+            (0, 0, ""),
+        ] {
+            let clipped = clip_line(&line, start, cells);
+            let text: String = clipped.iter().map(|span| span.text.as_str()).collect();
+            assert_eq!(text, expected);
+            assert_eq!(width(&text), cells);
+        }
+        let clipped = clip_line(&line, 3, 3);
+        assert_eq!(clipped, vec![Span::emphasis(" "), Span::label("cd")]);
+        let combining = clip_line(&vec![Span::body("a\u{301}猫\u{301}b")], 0, 2);
+        assert_eq!(combining, vec![Span::body("a\u{301} ")]);
+    }
 
     fn files(mut s: Snapshot) -> Snapshot {
         s.files = vec![
