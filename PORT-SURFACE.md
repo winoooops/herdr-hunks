@@ -150,6 +150,19 @@ reimplementation where a patch would be large.
   accepted this limit (its VIM-327 spec puts extending the parser out of scope).
   Phase 1 inherits it because the parser is frozen.
 
+## Adapted tests
+
+`src/git_diff_response_tests.rs` ports all 15 synchronous cases from
+`crates/backend/tests/git_diff_response.rs` at the vimeflow pin. The
+`BackendState` and event-sink setup is removed, and `diff_value` calls
+`crate::git::get_git_diff` directly through its private Tokio runtime.
+The source fixtures, helpers and assertions are preserved.
+
+The same module adds a status fixture for staged and unstaged modifications,
+additions, deletion, rename and a nested untracked file. `tests/env_policy.rs`
+tests the D3 environment policy and literal pathspecs through the public engine
+API in a separate process with one test, before starting its Tokio runtime.
+
 ## Copied from herdr-agent-watcher
 
 | file | source | adaptation |

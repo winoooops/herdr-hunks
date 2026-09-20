@@ -8,4 +8,6 @@ pub mod git;
 pub mod runtime;
 
 #[cfg(test)]
+mod git_diff_response_tests;
+#[cfg(test)]
 mod git_patches_tests;
