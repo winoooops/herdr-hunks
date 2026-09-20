@@ -886,3 +886,5 @@ Phase 1 builds none of the following. It only avoids closing them off.
 
 Keybinding installer (port of `herdr-agent-watcher`'s); syntax highlighting;
 word-level intra-line diff; context expansion in gap rows.
+
+<!-- codex-reviewed: 2026-09-20T02:13:33Z -->
