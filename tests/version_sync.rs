@@ -40,3 +40,18 @@ fn update_requires_host_and_plugin_environment() {
         assert!(String::from_utf8_lossy(&result.stderr).contains(&format!("{missing} is not set")));
     }
 }
+
+#[test]
+fn manifest_viewer_is_a_popup_dialog() {
+    let manifest: toml::Table = std::fs::read_to_string("herdr-plugin.toml")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(manifest["panes"][0]["placement"].as_str(), Some("popup"));
+    assert_eq!(manifest["panes"][0]["width"].as_str(), Some("80%"));
+    assert_eq!(manifest["panes"][0]["height"].as_str(), Some("80%"));
+    assert_eq!(
+        manifest["actions"][0]["title"].as_str(),
+        Some("Open the hunk viewer in a dialog")
+    );
+}

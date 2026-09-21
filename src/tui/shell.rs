@@ -125,6 +125,7 @@ fn run_terminal(
     let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(TerminalOutput(io::stdout())))?;
     let mut width = terminal.size()?.width;
     let mut state = initial_state(config, width);
+    state.popup = std::env::var("HERDR_HUNKS_PLACEMENT").as_deref() == Ok("popup");
     state.notice = notice.or(state.notice);
     let mut snapshot = Arc::new(Snapshot::empty(&path.to_string_lossy()));
     let mut rendered = Rendered {

@@ -30,7 +30,7 @@ fn scroll(offset: &mut usize, delta: isize, total: usize, height: u16) -> Outcom
 }
 
 fn scroll_help(state: &mut ViewState, snapshot: &Snapshot, width: u16, delta: isize) -> Outcome {
-    let total = dialog::line_count(&keys::help_panel(), width.min(60));
+    let total = dialog::line_count(&keys::help_panel(state.popup), width.min(60));
     // The sheet covers the body and notice; four rows belong to its frame and footer.
     let height = state
         .body_height
@@ -66,6 +66,9 @@ pub fn handle_key(
             Some(KeyAction::LineUp) => scroll_help(state, snapshot, width, -1),
             _ => Outcome::Inert,
         };
+    }
+    if state.popup && key.code == KeyCode::Esc && key.modifiers.is_empty() {
+        return Outcome::Quit;
     }
     match action {
         Some(action) => apply_action(state, snapshot, action, width),
@@ -118,7 +121,12 @@ fn act(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction, width: u16
                 _ => FilesPanel::Pinned,
             };
         }
-        ToggleMouse => state.mouse_requested = !state.mouse_requested,
+        ToggleMouse => {
+            state.mouse_requested = !state.mouse_requested;
+            if !state.mouse_requested {
+                state.hover = None;
+            }
+        }
         Help => {
             state.help_open = true;
             state.help_offset = 0;
@@ -219,8 +227,22 @@ pub fn handle_mouse(
     rendered: &Rendered,
     ev: MouseEvent,
 ) -> Outcome {
-    if !ev.modifiers.is_empty() {
+    if !state.mouse_requested || !ev.modifiers.is_empty() {
         return Outcome::Inert;
+    }
+    if ev.kind == MouseEventKind::Moved {
+        let target = |point: Option<(u16, u16)>| {
+            point
+                .and_then(|(x, y)| rendered.hit(x, y))
+                .filter(|action| !matches!(action, Action::CursorToRow(_)))
+        };
+        let previous = target(state.hover);
+        state.hover = Some((ev.column, ev.row));
+        return if !state.help_open && previous != target(state.hover) {
+            Outcome::Redraw
+        } else {
+            Outcome::Inert
+        };
     }
     let width = rendered
         .lines
@@ -252,26 +274,21 @@ pub fn handle_mouse(
     if state.help_open || ev.kind != MouseEventKind::Down(MouseButton::Left) {
         return Outcome::Inert;
     }
-    let action = match rendered.hit(ev.column, ev.row) {
-        Some(Action::PrevFile) => KeyAction::FilePrev,
-        Some(Action::NextFile) => KeyAction::FileNext,
-        Some(Action::PrevHunk) => KeyAction::HunkPrev,
-        Some(Action::NextHunk) => KeyAction::HunkNext,
-        Some(Action::ToggleView) => KeyAction::ToggleView,
-        Some(Action::ToggleFiles) => KeyAction::ToggleFiles,
-        Some(Action::Refresh) => KeyAction::Refresh,
-        Some(Action::SelectFile(index)) => {
-            return snapshot
-                .files
-                .get(*index)
-                .map(|file| {
-                    Outcome::Engine(Command::Select(FileKey {
-                        path: file.path.clone(),
-                        staged: file.staged,
-                    }))
-                })
-                .unwrap_or(Outcome::Inert)
-        }
+    let hit = rendered.hit(ev.column, ev.row);
+    if let Some(action) = hit.and_then(Action::key_action) {
+        return apply_action(state, snapshot, action, width);
+    }
+    match hit {
+        Some(Action::SelectFile(index)) => snapshot
+            .files
+            .get(*index)
+            .map(|file| {
+                Outcome::Engine(Command::Select(FileKey {
+                    path: file.path.clone(),
+                    staged: file.staged,
+                }))
+            })
+            .unwrap_or(Outcome::Inert),
         Some(Action::CursorToRow(row)) => {
             if let (DiffState::Ready(diff), Some(rows)) = (&snapshot.diff, &state.rows) {
                 if let Some(target) = rows.row_of_target.iter().position(|r| r == row) {
@@ -281,11 +298,10 @@ pub fn handle_mouse(
                     }
                 }
             }
-            return Outcome::Inert;
+            Outcome::Inert
         }
-        None => return Outcome::Inert,
-    };
-    apply_action(state, snapshot, action, width)
+        _ => Outcome::Inert,
+    }
 }
 
 #[cfg(test)]
@@ -565,7 +581,17 @@ mod tests {
     #[test]
     fn a_toolbar_click_acts_like_its_key_and_the_wheel_scrolls_three_rows() {
         let kinds = "+".repeat(200);
-        let (snap, mut st) = setup(&[(1, kinds.as_str())]);
+        let (mut snap, mut st) = setup(&[(1, kinds.as_str())]);
+        snap.files = ["a.rs", "b.rs"]
+            .into_iter()
+            .map(|path| crate::git::ChangedFile {
+                path: path.into(),
+                status: crate::git::ChangedFileStatus::Modified,
+                staged: false,
+                insertions: Some(200),
+                deletions: Some(0),
+            })
+            .collect();
         let r = render(&snap, &st, 120, 24);
         let hit = r
             .hits
@@ -843,12 +869,35 @@ mod tests {
                 staged: true
             }))
         );
+        assert_eq!(
+            handle_mouse(
+                &mut st,
+                &snap,
+                &rendered,
+                MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    ..click
+                }
+            ),
+            Outcome::Redraw
+        );
+        assert_eq!(
+            handle_mouse(
+                &mut st,
+                &snap,
+                &rendered,
+                MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    ..click
+                }
+            ),
+            Outcome::Inert
+        );
         for kind in [
             MouseEventKind::Down(MouseButton::Right),
             MouseEventKind::Down(MouseButton::Middle),
             MouseEventKind::Up(MouseButton::Left),
             MouseEventKind::Drag(MouseButton::Left),
-            MouseEventKind::Moved,
             MouseEventKind::ScrollLeft,
             MouseEventKind::ScrollRight,
         ] {
@@ -942,5 +991,126 @@ mod tests {
             handle_mouse(&mut st, &snap, &rendered, wheel),
             Outcome::Inert
         );
+    }
+
+    #[test]
+    fn popup_escape_closes_only_the_topmost_view() {
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        for popup in [false, true] {
+            let (snap, mut st) = setup(&[(1, "+")]);
+            st.popup = popup;
+            assert_eq!(
+                handle_key(&mut st, &snap, escape, 120),
+                if popup { Outcome::Quit } else { Outcome::Inert }
+            );
+            assert_eq!(
+                handle_key(
+                    &mut st,
+                    &snap,
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::ALT),
+                    120
+                ),
+                Outcome::Inert
+            );
+            st.help_open = true;
+            assert_eq!(handle_key(&mut st, &snap, escape, 120), Outcome::Redraw);
+            assert!(!st.help_open);
+        }
+    }
+
+    #[test]
+    fn hover_redraws_only_between_targets_and_mouse_off_clears_it() {
+        let (snap, mut st) = setup(&[(1, " --+ "), (20, "+")]);
+        st.files_panel = FilesPanel::Shown;
+        let rendered = render(&snap, &st, 120, 24);
+        let hit = rendered
+            .hits
+            .iter()
+            .find(|h| h.action == Action::ToggleView)
+            .unwrap();
+        let moved = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: hit.x0,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            handle_mouse(&mut st, &snap, &rendered, moved),
+            Outcome::Redraw
+        );
+        assert_eq!(st.hover, Some((hit.x0, hit.y)));
+        assert_eq!(
+            handle_mouse(
+                &mut st,
+                &snap,
+                &rendered,
+                MouseEvent {
+                    column: hit.x1 - 1,
+                    ..moved
+                }
+            ),
+            Outcome::Inert
+        );
+        let other = rendered
+            .hits
+            .iter()
+            .find(|h| h.action == Action::Refresh)
+            .unwrap();
+        assert_eq!(
+            handle_mouse(
+                &mut st,
+                &snap,
+                &rendered,
+                MouseEvent {
+                    column: other.x0,
+                    ..moved
+                }
+            ),
+            Outcome::Redraw
+        );
+        assert_eq!(
+            handle_mouse(
+                &mut st,
+                &snap,
+                &rendered,
+                MouseEvent {
+                    column: 60,
+                    row: 2,
+                    ..moved
+                }
+            ),
+            Outcome::Redraw
+        );
+        for row in 2..10 {
+            assert_eq!(
+                handle_mouse(
+                    &mut st,
+                    &snap,
+                    &rendered,
+                    MouseEvent {
+                        column: 61,
+                        row,
+                        ..moved
+                    }
+                ),
+                Outcome::Inert
+            );
+        }
+        st.hover = Some((hit.x0, 0));
+        handle_key(&mut st, &snap, key("m"), 120);
+        assert_eq!(st.hover, None);
+        assert_eq!(
+            handle_mouse(&mut st, &snap, &rendered, moved),
+            Outcome::Inert
+        );
+        assert_eq!(st.hover, None);
+    }
+
+    #[test]
+    fn mouse_capture_off_clears_hover() {
+        let (snap, mut st) = setup(&[(1, "+")]);
+        st.hover = Some((1, 0));
+        assert_eq!(handle_key(&mut st, &snap, key("m"), 120), Outcome::Redraw);
+        assert_eq!(st.hover, None);
     }
 }

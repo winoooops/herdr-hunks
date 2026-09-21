@@ -25,11 +25,37 @@ pub enum Action {
     CursorToRow(usize),
 }
 
+impl Action {
+    pub fn key_action(&self) -> Option<keys::KeyAction> {
+        use keys::KeyAction;
+        Some(match self {
+            Self::PrevFile => KeyAction::FilePrev,
+            Self::NextFile => KeyAction::FileNext,
+            Self::PrevHunk => KeyAction::HunkPrev,
+            Self::NextHunk => KeyAction::HunkNext,
+            Self::ToggleView => KeyAction::ToggleView,
+            Self::ToggleFiles => KeyAction::ToggleFiles,
+            Self::Refresh => KeyAction::Refresh,
+            Self::SelectFile(_) | Self::CursorToRow(_) => return None,
+        })
+    }
+}
+
 pub struct Hit {
     pub y: u16,
     pub x0: u16,
     pub x1: u16,
     pub action: Action,
+}
+
+impl Hit {
+    fn hovered(&self, state: &ViewState) -> bool {
+        state.mouse_requested
+            && !state.help_open
+            && state
+                .hover
+                .is_some_and(|(x, y)| self.y == y && x >= self.x0 && x < self.x1)
+    }
 }
 
 pub struct Rendered {
@@ -107,7 +133,7 @@ fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Ve
     let position = format!(" {}/{} ", index.map(|i| i + 1).unwrap_or(0), total);
     let name = truncate(
         &name,
-        usize::from(total_width).saturating_sub(7 + width(&position)),
+        usize::from(total_width).saturating_sub(11 + width(&position)),
     );
     let (hunk_pos, hunk_total, stats, staged) = match &snapshot.diff {
         DiffState::Ready(d) => {
@@ -186,6 +212,13 @@ fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Ve
 
 fn toolbar(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> (Line, Vec<Hit>) {
     let mut items = toolbar_items(snapshot, state, total_width);
+    for (item, _) in &mut items {
+        for (text, action) in item {
+            if action.is_some() {
+                *text = format!(" {text} ");
+            }
+        }
+    }
     let item_width =
         |item: &Vec<(String, Option<Action>)>| item.iter().map(|(t, _)| width(t)).sum::<usize>();
     // drop from the right until it fits; steppers (drop order 0 and 1) go last
@@ -208,13 +241,39 @@ fn toolbar(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> (Line, V
         for (text, action) in item {
             let w = width(&text) as u16;
             if let Some(action) = action {
-                hits.push(Hit {
-                    y: 0,
-                    x0: x,
-                    x1: x + w,
-                    action,
-                });
-                line.push(Span::emphasis(text));
+                let enabled = match action {
+                    Action::PrevFile | Action::NextFile => snapshot.files.len() >= 2,
+                    Action::PrevHunk | Action::NextHunk => {
+                        matches!(&snapshot.diff, DiffState::Ready(d) if d.file_diff.hunks.len() >= 2)
+                    }
+                    Action::ToggleView => {
+                        total_width >= MIN_SPLIT_WIDTH || state.requested_mode == ViewMode::Split
+                    }
+                    _ => true,
+                };
+                if enabled {
+                    let hit = Hit {
+                        y: 0,
+                        x0: x,
+                        x1: x + w,
+                        action,
+                    };
+                    line.push(Span::new(
+                        text,
+                        Style {
+                            reverse: true,
+                            semantic: if hit.hovered(state) {
+                                None
+                            } else {
+                                Some(Semantic::Accent)
+                            },
+                            ..Style::role(Role::Emphasis)
+                        },
+                    ));
+                    hits.push(hit);
+                } else {
+                    line.push(Span::label(text));
+                }
             } else {
                 line.push(Span::body(text));
             }
@@ -259,7 +318,7 @@ fn state_message(snapshot: &Snapshot) -> Option<String> {
     }
 }
 
-fn files_lines(snapshot: &Snapshot, _state: &ViewState, height: u16) -> (Vec<Line>, Vec<Hit>) {
+fn files_lines(snapshot: &Snapshot, state: &ViewState, height: u16) -> (Vec<Line>, Vec<Hit>) {
     let mut lines = Vec::new();
     let mut hits = Vec::new();
     if height == 0 {
@@ -302,12 +361,18 @@ fn files_lines(snapshot: &Snapshot, _state: &ViewState, height: u16) -> (Vec<Lin
         }
         let mut line = fit_line(line, usize::from(FILES_WIDTH - 2));
         line.push(Span::body(if file.staged { "S " } else { "  " }));
-        hits.push(Hit {
+        let hit = Hit {
             y: lines.len() as u16 + 1,
             x0: 0,
             x1: FILES_WIDTH,
             action: Action::SelectFile(i),
-        });
+        };
+        if hit.hovered(state) {
+            for span in &mut line {
+                span.style.role = Role::Emphasis;
+            }
+        }
+        hits.push(hit);
         lines.push(line);
     }
     if height > 1 {
@@ -543,7 +608,14 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
         // Keep help and quit until the other hints have gone.
         hints.remove(hints.len().saturating_sub(3));
     }
-    lines.push(vec![Span::label(pad(&hints.join("  "), columns.into()))]);
+    let hint = hits
+        .iter()
+        .find(|hit| hit.hovered(state))
+        .and_then(|hit| hit.action.key_action())
+        .and_then(|action| keys::KEYS.iter().find(|binding| binding.action == action))
+        .map(|binding| format!("{} · {}", binding.label, binding.key))
+        .unwrap_or_else(|| hints.join("  "));
+    lines.push(vec![Span::label(pad(&hint, columns.into()))]);
     for hit in &mut hits {
         hit.x1 = hit.x1.min(columns);
     }
@@ -552,7 +624,7 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
         let panel_width = columns.min(60);
         let panel_height = height.saturating_sub(2);
         let x = usize::from((columns - panel_width) / 2);
-        let mut panel = keys::help_panel();
+        let mut panel = keys::help_panel(state.popup);
         panel.offset = layout::clamp_scroll(
             state.help_offset,
             dialog::line_count(&panel, panel_width),
@@ -679,7 +751,7 @@ mod tests {
     }
 
     fn rendered(width: u16, height: u16, panel: FilesPanel) -> (Rendered, ViewState) {
-        let snap = files(snapshot("a.rs", "r1", &[(10, " --+ ")]));
+        let snap = files(snapshot("a.rs", "r1", &[(10, " --+ "), (30, "+")]));
         let mut st = ViewState::new(ViewMode::Unified, panel, true);
         st.resize(width, body_height(&st, &snap, height));
         st.reconcile(&snap);
@@ -691,8 +763,8 @@ mod tests {
         let (r, _) = rendered(120, 20, FilesPanel::Hidden);
         let bar = &r.plain()[0];
         for piece in [
-            "‹ a.rs 2/2 ›",
-            "{} 1/1 ↑ ↓",
+            "‹  a.rs 2/2  ›",
+            "{} 1/2  ↑   ↓",
             "unified",
             "UNSTAGED",
             "+4 −3",
@@ -719,7 +791,7 @@ mod tests {
     fn a_narrow_toolbar_drops_items_from_the_right_and_keeps_the_steppers() {
         let (r, _) = rendered(50, 20, FilesPanel::Hidden);
         let bar = &r.plain()[0];
-        assert!(bar.contains("‹ a.rs 2/2 ›") && bar.contains("{} 1/1"));
+        assert!(bar.contains("‹  a.rs 2/2  ›") && bar.contains("{} 1/2"));
         assert!(!bar.contains("⟳") && !bar.contains("files"));
     }
 
@@ -952,5 +1024,217 @@ mod tests {
             .plain()
             .iter()
             .any(|s| s.contains("diff\u{241b} failed")));
+    }
+
+    #[test]
+    fn toolbar_chips_are_padded_reversed_accent_bold_and_plain_text_is_not() {
+        let mut snap = files(snapshot("a.rs", "chips", &[(1, "+"), (20, "+")]));
+        for (mode, busy) in [(ViewMode::Unified, false), (ViewMode::Split, true)] {
+            snap.refreshing = busy;
+            let mut st = ViewState::new(mode, FilesPanel::Hidden, true);
+            st.resize(160, 20);
+            st.reconcile(&snap);
+            let r = render(&snap, &st, 160, 22);
+            let mut x = 0;
+            let mut chips = 0;
+            for span in &r.lines[0] {
+                let end = x + width(&span.text) as u16;
+                if let Some(action) = r.hit(x, 0) {
+                    chips += 1;
+                    assert!(
+                        span.text.starts_with(' ') && span.text.ends_with(' '),
+                        "{}",
+                        span.text
+                    );
+                    assert_eq!(
+                        span.style,
+                        Style {
+                            reverse: true,
+                            ..Style::semantic(Role::Emphasis, Semantic::Accent)
+                        }
+                    );
+                    for cell in x..end {
+                        assert_eq!(r.hit(cell, 0), Some(action));
+                    }
+                } else {
+                    assert!(!span.style.reverse);
+                }
+                x = end;
+            }
+            assert_eq!(chips, 7);
+            assert!(r.lines[0]
+                .iter()
+                .any(|s| s.text == if busy { " … " } else { " ⟳ " }));
+            assert!(r.lines[0].iter().any(|s| s.text
+                == if mode == ViewMode::Split {
+                    " split "
+                } else {
+                    " unified "
+                }));
+        }
+    }
+
+    #[test]
+    fn disabled_chips_are_dim_without_reverse_or_hits() {
+        for (file_count, hunks, loaded, columns, requested) in [
+            (0, 0, false, 120, ViewMode::Unified),
+            (1, 1, true, 120, ViewMode::Unified),
+            (2, 0, true, 120, ViewMode::Unified),
+            (2, 2, true, 99, ViewMode::Unified),
+            (2, 2, true, 99, ViewMode::Split),
+        ] {
+            let mut snap = files(snapshot(
+                "a.rs",
+                "disabled",
+                &[(1, "+"), (20, "+")][..hunks],
+            ));
+            snap.files.truncate(file_count);
+            if !loaded {
+                snap.diff = DiffState::Loading;
+            }
+            let mut st = ViewState::new(requested, FilesPanel::Hidden, true);
+            st.resize(columns, 20);
+            st.reconcile(&snap);
+            let r = render(&snap, &st, columns, 22);
+            for (text, action, enabled) in [
+                (" ‹ ", Action::PrevFile, file_count >= 2),
+                (" › ", Action::NextFile, file_count >= 2),
+                (" ↑ ", Action::PrevHunk, loaded && hunks >= 2),
+                (" ↓ ", Action::NextHunk, loaded && hunks >= 2),
+                (
+                    " unified ",
+                    Action::ToggleView,
+                    columns >= MIN_SPLIT_WIDTH || requested == ViewMode::Split,
+                ),
+            ] {
+                let span = r.lines[0].iter().find(|s| s.text == text).unwrap();
+                assert_eq!(r.hits.iter().any(|h| h.action == action), enabled);
+                assert_eq!(span.style.reverse, enabled);
+                if !enabled {
+                    assert_eq!(span.style, Style::role(Role::Label));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hover_changes_exactly_one_chip_and_uses_key_table_footer() {
+        let snap = files(snapshot("a.rs", "hover", &[(1, "+"), (20, "+")]));
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Shown, true);
+        st.resize(160, 20);
+        st.reconcile(&snap);
+        let base = render(&snap, &st, 160, 22);
+        for (action, key_action) in [
+            (Action::PrevFile, keys::KeyAction::FilePrev),
+            (Action::NextFile, keys::KeyAction::FileNext),
+            (Action::PrevHunk, keys::KeyAction::HunkPrev),
+            (Action::NextHunk, keys::KeyAction::HunkNext),
+            (Action::ToggleView, keys::KeyAction::ToggleView),
+            (Action::ToggleFiles, keys::KeyAction::ToggleFiles),
+            (Action::Refresh, keys::KeyAction::Refresh),
+        ] {
+            let hit = base.hits.iter().find(|h| h.action == action).unwrap();
+            st.hover = Some((hit.x0, hit.y));
+            let hovered = render(&snap, &st, 160, 22);
+            let differences: Vec<_> = base.lines[0]
+                .iter()
+                .zip(&hovered.lines[0])
+                .filter(|(a, b)| a != b)
+                .collect();
+            assert_eq!(differences.len(), 1);
+            let (before, after) = differences[0];
+            assert_eq!(before.text, after.text);
+            assert_eq!(
+                after.style,
+                Style {
+                    semantic: None,
+                    ..before.style
+                }
+            );
+            let binding = keys::KEYS.iter().find(|b| b.action == key_action).unwrap();
+            assert_eq!(
+                hovered.plain().last().unwrap(),
+                &format!("{} · {}", binding.label, binding.key)
+            );
+        }
+        st.hover = Some((100, 5));
+        assert_eq!(render(&snap, &st, 160, 22).lines, base.lines);
+        st.hover = None;
+        assert_eq!(render(&snap, &st, 160, 22).lines, base.lines);
+    }
+
+    #[test]
+    fn hovered_file_row_is_bold_and_keeps_normal_footer() {
+        let snap = files(snapshot("a.rs", "row", &[(1, "+")]));
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Shown, true);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        let base = render(&snap, &st, 120, 22);
+        let hit = base
+            .hits
+            .iter()
+            .find(|h| h.action == Action::SelectFile(0))
+            .unwrap();
+        st.hover = Some((hit.x0, hit.y));
+        let hovered = render(&snap, &st, 120, 22);
+        let row = clip_line(
+            &hovered.lines[usize::from(hit.y)],
+            0,
+            usize::from(FILES_WIDTH),
+        );
+        assert!(row.iter().all(|s| s.style.role == Role::Emphasis));
+        for (y, (before, after)) in base.lines.iter().zip(&hovered.lines).enumerate() {
+            if y != usize::from(hit.y) {
+                assert_eq!(before, after);
+            }
+        }
+    }
+
+    #[test]
+    fn popup_key_sheet_has_the_conditional_escape_row() {
+        let snap = files(snapshot("a.rs", "sheet", &[(1, "+")]));
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.help_open = true;
+        for popup in [false, true] {
+            st.popup = popup;
+            let text = render(&snap, &st, 120, 40).plain().join("\n");
+            assert_eq!(
+                text.lines()
+                    .any(|l| l.contains("esc") && l.contains("close") && !l.contains("closes")),
+                popup
+            );
+        }
+    }
+
+    #[test]
+    fn chip_widths_keep_file_steps_at_forty_and_drop_whole_items_in_order() {
+        let snap = files(snapshot(
+            &"long".repeat(20),
+            "narrow",
+            &[(1, "+"), (20, "+")],
+        ));
+        let st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        let r = render(&snap, &st, 40, 12);
+        for action in [Action::PrevFile, Action::NextFile] {
+            let hit = r.hits.iter().find(|h| h.action == action).unwrap();
+            assert_eq!(hit.x1 - hit.x0, 3);
+            assert!(hit.x1 <= 40);
+        }
+        let snap = files(snapshot("a.rs", "narrow", &[(1, "+"), (20, "+")]));
+        for columns in 40..120 {
+            let r = render(&snap, &st, columns, 12);
+            let text = &r.plain()[0];
+            let visible = [
+                text.contains("‹"),
+                text.contains("{}"),
+                text.contains("unified"),
+                text.contains("UNSTAGED"),
+                text.contains("+4"),
+                text.contains("files"),
+                text.contains("⟳"),
+            ];
+            assert!(!visible.windows(2).any(|v| !v[0] && v[1]));
+            assert!(r.hits.iter().all(|h| h.x1 <= columns));
+        }
     }
 }

@@ -201,8 +201,8 @@ pub fn lookup(key: &KeyEvent) -> Option<KeyAction> {
         .map(|binding| binding.action)
 }
 
-pub fn help_panel() -> Panel {
-    Panel {
+pub fn help_panel(popup: bool) -> Panel {
+    let mut panel = Panel {
         title: "Keys".into(),
         rows: KEYS
             .iter()
@@ -215,7 +215,15 @@ pub fn help_panel() -> Panel {
         footer: "esc closes".into(),
         cursor: None,
         offset: 0,
+    };
+    if popup {
+        panel.rows.push(Row::Entry {
+            label: "esc".into(),
+            value: "close".into(),
+            enabled: false,
+        });
     }
+    panel
 }
 
 #[cfg(test)]
@@ -248,7 +256,7 @@ mod tests {
             }
         }
         assert_eq!(KEYS.len(), 21);
-        assert_eq!(help_panel().rows.len(), 21);
+        assert_eq!(help_panel(false).rows.len(), 21);
     }
 
     #[test]

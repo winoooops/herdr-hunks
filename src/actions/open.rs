@@ -3,13 +3,25 @@ use std::process::Command;
 use serde_json::Value;
 
 use super::{open_params, reuse, Placement, VIEWER_TITLE};
-use crate::herdr::client::HerdrClient;
+use crate::herdr::client::{HerdrClient, HerdrClientError};
 
 pub fn run_open(placement: Placement) -> i32 {
     match run(placement) {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("herdr-hunks: {error}");
+            let message = error
+                .downcast_ref::<HerdrClientError>()
+                .and_then(|error| {
+                    if let HerdrClientError::Api(body) = error {
+                        serde_json::from_str::<Value>(body).ok()?["message"]
+                            .as_str()
+                            .map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| error.to_string());
+            eprintln!("herdr-hunks: {message}");
             1
         }
     }
@@ -36,7 +48,17 @@ fn run(placement: Placement) -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| context["focused_pane_cwd"].as_str())
         .or_else(|| context["workspace_cwd"].as_str())
         .ok_or("no working directory for the focused pane")?;
-    let params = open_params(&plugin_id, placement, opener, repo_cwd);
+    let mut params = open_params(&plugin_id, placement, opener, repo_cwd);
+    if placement == Placement::Popup {
+        if let Some(dir) = crate::paths::config_dir(|key| std::env::var_os(key)) {
+            let ([width, height], problems) = super::popup::load(&dir);
+            params["width"] = width;
+            params["height"] = height;
+            for problem in problems {
+                eprintln!("herdr-hunks: {problem}");
+            }
+        }
+    }
     if placement == Placement::Split {
         let state_dir = crate::paths::state_dir(|key| std::env::var_os(key));
         let socket = std::env::var("HERDR_SOCKET_PATH").ok();

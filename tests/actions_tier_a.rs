@@ -25,6 +25,7 @@ fn setup() -> (tempfile::TempDir, FakeHerdr) {
     fake.set_panes(json!([opener(dir.path())]));
     std::env::set_var("HERDR_SOCKET_PATH", &fake.socket_path);
     std::env::set_var("HERDR_PLUGIN_ID", "test.hunks");
+    std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", dir.path().join("config"));
     std::env::set_var("HERDR_PLUGIN_STATE_DIR", dir.path().join("state"));
     std::env::set_var("HERDR_PLUGIN_CONTEXT_JSON", json!({
         "focused_pane_id": "w1:p1", "focused_pane_cwd": "/context", "workspace_cwd": "/workspace",
@@ -178,7 +179,7 @@ fn split_reuses_the_viewer_and_all_requests_match_the_schema() {
         json!({
             "plugin_id": "test.hunks", "entrypoint": "viewer", "placement": "split",
             "target_pane_id": "w1:p1", "direction": "right", "cwd": dir.path().join("repo/sub"),
-            "env": {"HERDR_HUNKS_OPENER_PANE": "w1:p1"}, "focus": true,
+            "env": {"HERDR_HUNKS_OPENER_PANE": "w1:p1", "HERDR_HUNKS_PLACEMENT": "split"}, "focus": true,
         })
     );
     with_viewer(dir.path(), &fake, "Hunks", &dir.path().join("repo/sub"));
@@ -290,7 +291,7 @@ fn the_focused_viewer_does_not_open_or_focus_itself() {
     let _lock = LOCK.lock().unwrap();
     let (_dir, fake) = setup();
     fake.set_panes(json!([{"pane_id": "w1:p1", "label": "Hunks"}]));
-    for placement in [Placement::Overlay, Placement::Split] {
+    for placement in [Placement::Overlay, Placement::Popup, Placement::Split] {
         assert_eq!(run_open(placement), 0);
     }
     assert!(fake.calls_named("plugin.pane.open").is_empty());
@@ -419,4 +420,93 @@ fn host_binary_is_not_named_literally_in_rust_sources() {
         }
     }
     walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+}
+
+#[test]
+fn popup_open_uses_foreground_cwd_default_and_configured_sizes() {
+    let _lock = LOCK.lock().unwrap();
+    for config in [None, Some("[popup]\nwidth=96\nheight=\"60%\"\n")] {
+        let (dir, fake) = setup();
+        if let Some(config) = config {
+            std::fs::create_dir(dir.path().join("config")).unwrap();
+            std::fs::write(dir.path().join("config/config.toml"), config).unwrap();
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_herdr-hunks"))
+            .arg("open")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        assert!(output.stderr.is_empty());
+        let calls = fake.calls_named("plugin.pane.open");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0]["params"],
+            json!({
+                "plugin_id": "test.hunks", "entrypoint": "viewer", "placement": "popup",
+                "cwd": dir.path().join("repo/sub"), "env": {"HERDR_HUNKS_OPENER_PANE": "w1:p1", "HERDR_HUNKS_PLACEMENT": "popup"}, "focus": true,
+                "width": if config.is_some() { json!(96) } else { json!("80%") },
+                "height": if config.is_some() { "60%" } else { "80%" },
+            })
+        );
+        assert_eq!(
+            fake.responses().last().unwrap()["result"],
+            json!({"type":"ok"})
+        );
+        assert!(!dir.path().join("state").exists());
+        finish(fake);
+    }
+}
+
+#[test]
+fn popup_invalid_size_reports_stderr_and_defaults_only_that_key() {
+    let _lock = LOCK.lock().unwrap();
+    let (dir, fake) = setup();
+    std::fs::create_dir(dir.path().join("config")).unwrap();
+    std::fs::write(
+        dir.path().join("config/config.toml"),
+        "[popup]\nwidth=12\nheight=25\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-hunks"))
+        .arg("open")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("herdr-hunks: popup.width:"));
+    let params = &fake.calls_named("plugin.pane.open")[0]["params"];
+    assert_eq!(params["width"], "80%");
+    assert_eq!(params["height"], 25);
+    finish(fake);
+}
+
+#[test]
+fn popup_host_errors_print_the_message_and_exit_one() {
+    let _lock = LOCK.lock().unwrap();
+    for message in [
+        "popup panes can only open from the normal workspace view",
+        "another host error",
+    ] {
+        let (_dir, fake) = setup();
+        fake.popup_error(message);
+        let output = Command::new(env!("CARGO_BIN_EXE_herdr-hunks"))
+            .arg("open")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!("herdr-hunks: {message}\n")
+        );
+        assert_eq!(fake.calls_named("plugin.pane.open").len(), 1);
+        finish(fake);
+    }
+}
+
+#[test]
+fn popup_ok_response_has_no_pane_id() {
+    let _lock = LOCK.lock().unwrap();
+    let (_dir, fake) = setup();
+    let client = herdr_hunks::herdr::client::HerdrClient::from_env();
+    assert_eq!(client.plugin_pane_open(json!({"plugin_id":"test.hunks", "entrypoint":"viewer", "placement":"popup", "width":"80%", "height":"80%", "cwd":"/repo", "env":{}, "focus":true})).unwrap(), None);
+    finish(fake);
 }

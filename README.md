@@ -33,7 +33,7 @@ herdr plugin action invoke update --plugin winoooops.hunks
 
 | Action | Behaviour |
 | --- | --- |
-| `open` | Opens a focused overlay for the opener's working directory; closing restores the previous view. |
+| `open` | Opens a focused popup dialog for the opener's working directory, 80% wide and 80% high by default. The host must be in its normal workspace view. |
 | `open-split` | Opens a split on the right, or focuses its existing viewer when the session, opener, repository, title, and cwd still match. |
 | `update` | For a GitHub install, installs the newest stable version tag. Refuses linked/unknown sources. The GitHub repository and releases do not exist yet, so this is for after publication. |
 
@@ -74,7 +74,7 @@ To bind the split action instead, change `command` to
 | `m` | Toggle mouse capture |
 | `?` | Open the key sheet; `j` / `k` or Down / Up scroll it |
 | `q` | Quit; closes the key sheet first if open |
-| Esc | Close the key sheet |
+| Esc | Close the key sheet; otherwise close a popup viewer |
 | Ctrl+C | Quit immediately, including from the key sheet |
 
 Arrow, page, Home, and End aliases require no modifiers. Phase 1 leaves
@@ -82,9 +82,16 @@ Arrow, page, Home, and End aliases require no modifiers. Phase 1 leaves
 
 ## Mouse
 
-Click toolbar controls, file rows, or diff rows. The wheel scrolls three rows.
+Toolbar controls are padded, bold, reverse-video chips. Disabled controls are dim
+and cannot be clicked: file steppers with fewer than two files, hunk steppers
+with fewer than two loaded hunks, and the view chip below 100 columns when the
+requested mode is unified.
+Hover lights up a chip and shows its description and key in the footer; hovering
+a file row makes it bold. Leaving restores the usual hints.
+Click chips, file rows, or diff rows. The wheel scrolls three rows.
 Press `m` to disable capture and restore native terminal text selection; press
-it again to enable capture. Help captures wheel scrolling while open.
+it again to enable capture. Disabling capture clears hover. Help captures wheel
+scrolling while open.
 
 ## Configuration
 
@@ -98,12 +105,22 @@ files = "auto"    # auto, pinned, hidden
 
 [input]
 mouse = true
+
+[popup]
+width = "80%"
+height = "80%"
 ```
+
+Popup sizes accept integers >= 20 (outer cells including borders) or percentages
+from "20%" through "100%". Invalid sizes fall back individually to "80%" and the
+`open` action reports them on stderr. Missing files use defaults; unreadable or
+malformed files report a problem and use defaults.
 
 At the initial width, auto mode selects split at 120 columns and auto files pins
 the panel at 100 columns. A requested split temporarily becomes unified below
 100 columns and returns when widened. Below 40×10, only a size notice is shown.
-Invalid settings fall back individually and show a notice; diagnostics go to
+Invalid view/input settings fall back individually and show a notice; diagnostics
+go to
 `config-problems.log` in `$HERDR_PLUGIN_STATE_DIR`, otherwise
 `${XDG_STATE_HOME:-$HOME/.local/state}/herdr-hunks`.
 

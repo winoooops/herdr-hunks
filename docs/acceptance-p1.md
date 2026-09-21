@@ -40,7 +40,7 @@ plugin linked into a live host, which is the user's decision.
   upstream `herdr 0.8.0` and against the fork's `vimeflow 0.8.0` with the same release binary:
   plugin link, `open-split`, one viewer at the repository, reuse with focus, one record. Each
   run used its own named session with isolated HOME and XDG directories. Still to do: invoke
-  `open` (the overlay) by hand in each live host.
+  `open` (the popup dialog) by hand in each live host.
 
 ## Automated Tier B check
 

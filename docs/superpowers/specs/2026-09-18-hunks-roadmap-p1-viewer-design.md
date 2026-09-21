@@ -306,7 +306,7 @@ reimplementation where a patch would be large.
 `min_herdr_version = "0.8.0"`,
 `platforms = ["macos", "linux"]`, a `[[build]]` step that runs
 `scripts/fetch-or-build.sh`, one `[[panes]]` entry `viewer` with
-`placement = "overlay"`, and three `[[actions]]`: `open`, `open-split`, `update`.
+`placement = "popup"`, `width = "80%"`, `height = "80%"`, and three `[[actions]]`: `open`, `open-split`, `update`.
 The id is owner-namespaced, which is the convention among herdr plugins and keeps
 it clear of the two unrelated plugins that already use the bare id `herdr-hunk`
 (1.6). The repository, crate and binary keep the name `herdr-hunks`. Code never
@@ -326,12 +326,14 @@ key  ->  [[keys.command]] type="plugin_action" command="winoooops.hunks.open"
      ->  `herdr-hunks open`:
            opener  = context.focused_pane_id
            pane    = pane.get {pane_id: opener}
-           repo_cwd = pane.foreground_cwd, else pane.cwd, else context.focused_pane_cwd
-           open:        plugin.pane.open {plugin_id, entrypoint:"viewer", placement:"overlay",
-                                          cwd: repo_cwd, env:{HERDR_HUNKS_OPENER_PANE: opener}, focus:true}
+           repo_cwd = pane.foreground_cwd, else pane.cwd, else context.focused_pane_cwd, else context.workspace_cwd
+           open:        plugin.pane.open {plugin_id, entrypoint:"viewer", placement:"popup",
+                                          width:"80%", height:"80%", cwd: repo_cwd,
+                                          env:{HERDR_HUNKS_OPENER_PANE: opener, HERDR_HUNKS_PLACEMENT:"popup"}, focus:true}
            open-split:  plugin.pane.open {plugin_id, entrypoint:"viewer", placement:"split",
                                           target_pane_id: opener, direction:"right",
-                                          cwd: repo_cwd, env:{HERDR_HUNKS_OPENER_PANE: opener}, focus:true}
+                                          cwd: repo_cwd,
+                                          env:{HERDR_HUNKS_OPENER_PANE: opener, HERDR_HUNKS_PLACEMENT:"split"}, focus:true}
      ->  herdr spawns the [[panes]] argv in a PTY:
            ["/bin/sh","-lc","exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-hunks\" tui"]
      ->  `herdr-hunks tui` uses its process cwd as the repository path
@@ -340,14 +342,18 @@ key  ->  [[keys.command]] type="plugin_action" command="winoooops.hunks.open"
 The pane command is an absolute path behind `sh -lc` for two reasons: herdr
 resolves a relative program against the pane's cwd, which `cwd:` has just changed,
 and a login shell gives `git` the same `PATH` the user's panes have.
-herdr rejects `target_pane_id` and `direction` for `overlay` with
-`invalid_params` and uses the focused pane instead, so only the `open-split`
-request carries them.
+Only `open-split` carries `target_pane_id` and `direction`; only `popup` carries
+`width` and `height`. The retained `Overlay` library variant keeps its former
+request shape, but no action uses it.
 
-**Placements.** `open` uses `overlay`: herdr splits the focused pane, zooms the
-new pane, and restores focus and zoom when the viewer exits. `open-split` uses
-`split` to the right of the opener, for watching the diff while the agent works.
-herdr opens splits at 50/50 and has no ratio parameter.
+**Placements.** `open` ("Open the hunk viewer in a dialog") opens a focused popup,
+80% wide and 80% high by default; `[popup]` config overrides either size (4.7).
+A popup is not a pane: it is absent from `pane.list`, has no pane ID, and its
+success response is `{"type":"ok"}`. The API returns `Ok(None)` and the action
+succeeds. The host has one popup slot and allows opening it only from the normal
+workspace view. A refusal prints `herdr-hunks: <host message>` and exits 1.
+`open-split` uses `split` to the right of the opener, for watching the diff while
+the agent works. herdr opens splits at 50/50 and has no ratio parameter.
 
 **Instances.** herdr neither dedupes nor lists plugin panes. `open-split` resolves
 the worktree toplevel of `repo_cwd` (`git rev-parse --show-toplevel`) and records
@@ -359,7 +365,7 @@ recorded viewer only when all of these hold: the recorded `toplevel` equals the
 one just resolved; `pane.get` on the recorded viewer id succeeds; that pane's
 label is the viewer's manifest title and its `cwd` is the recorded `repo_cwd`; and
 `plugin.pane.focus` succeeds. Otherwise it opens a new viewer and overwrites the
-record; an old viewer keeps running until the user quits it. `overlay` needs no
+record; an old viewer keeps running until the user quits it. `popup` needs no
 record.
 
 **Keybinding.** Phase 1 documents the `[[keys.command]]` snippet in the README with
@@ -584,7 +590,11 @@ The TUI follows `herdr-agent-watcher`'s sidebar: a pure view and a thin shell.
   (`vimeflow:src/features/diff/components/toolbar/DiffChipToolbar.tsx`); the slot
   between the two steppers is reserved for P2's stage / unstage / discard group.
   When the row is too narrow, items drop from the right in that order and the
-  steppers go last.
+  steppers go last; the file stepper survives at 40 columns. Each control is a
+  padded chip: ` ‹ `, ` › `, ` ↑ `, ` ↓ `, ` split ` or ` unified ` (current mode),
+  ` files `, and ` ⟳ ` (` … ` while busy). Enabled chips use bold accent colour
+  and reverse video. Filename, counters, staged badge and statistics stay plain.
+  Disabled chips are dim, not reversed, and have no hit region (4.4).
 - **Files panel.** One row per `ChangedFile`: status letter (`M A D R ?`),
   basename, a trailing `S` for staged rows, and the directory dimmed when two rows
   share a basename. Footer: totals and file count. `e` toggles it, `E` pins it.
@@ -600,7 +610,9 @@ The TUI follows `herdr-agent-watcher`'s sidebar: a pure view and a thin shell.
 - **Long lines.** No wrapping. `H` and `L` scroll the body horizontally by 8
   columns. Width uses `unicode-width`; a tab advances to the next multiple of 8.
 - **Footer.** Key hints for the focused area. Hints drop from the right when
-  narrow.
+  narrow. Hovering a toolbar chip replaces them with its description and key
+  from the same `KEYS` table as the key sheet, such as `next file · n` or
+  `unified / split · t`. Leaving the chip restores the normal hints.
 
 Split mode needs at least 100 columns. Requesting split below that width shows a
 one-line notice and stays unified. `view = "auto"` chooses split at 120 columns or more.
@@ -635,7 +647,10 @@ meanings: `s d D` (P2), `i I u U x v y Y @ c /` (P3-P5). herdr's prefix key
 (`ctrl+b` by default) never reaches the TUI.
 
 Routing has two layers, as in `herdr-agent-watcher`: an open dialog (the key
-sheet) takes every key and `Esc` closes it; otherwise keys go to the main view.
+sheet) takes every key and `Esc` closes only it; otherwise keys go to the main
+view. When `HERDR_HUNKS_PLACEMENT=popup`, modifier-free `Esc` closes the viewer,
+and the key sheet adds `esc  close`. With any other value or no variable, `Esc`
+is inert outside the sheet.
 The key sheet is generated from the same table the router uses, and a test fails
 if the two differ.
 
@@ -645,18 +660,29 @@ Mouse capture is on by default, because G5 requires a clickable toolbar. herdr
 forwards SGR mouse events with pane-local coordinates to applications that
 enable reporting. Actions: click a toolbar item (same effect as its key), click a
 file row to select it, click a diff row to move the cursor, wheel scrolls three
-rows. Only a modifier-free left press and the wheel act.
+rows. Click and wheel actions require no modifiers. Chip hit regions include
+both padding spaces. File steppers are disabled with fewer than two files;
+hunk steppers with fewer than two hunks or no loaded diff; the view chip below
+100 columns when the requested mode is unified (the key still shows its notice).
+
+Modifier-free mouse movement stores the pointer in `ViewState.hover`. A hovered
+chip stays reversed and bold but uses the default foreground instead of accent;
+a hovered file row becomes bold. Movement redraws only when the hovered action
+changes. Diff cursor-row hits do not count as hover targets, so moving across
+the diff body does not redraw every cell.
 
 Capture disables the terminal's own text selection, and Phase 1 has no yank. `m`
-turns capture off and on at runtime, and `[input] mouse = false` sets the
-default. The toggle reuses `herdr-agent-watcher`'s conservative capture lifecycle
+turns capture off and on at runtime, clearing hover when disabled, and
+`[input] mouse = false` sets the default. The toggle reuses `herdr-agent-watcher`'s conservative capture lifecycle
 (`TerminalGuard::set_mouse`).
 
 ### 4.5 Colour and untrusted text
 
 Colours are the terminal's named ANSI colours only: green for additions, red for
 deletions, cyan for hunk headers, dim for context numbers and gaps, bold for the
-file header, reverse for the cursor. There are no background tints and no RGB, so
+file header, reverse for the cursor and toolbar chips. Chips use bold cyan
+accent, or default foreground when hovered. There are no explicit background
+colours and no RGB, so
 light and dark themes both work without detection.
 
 Every string from git is untrusted. Before it reaches a cell the TUI replaces
@@ -693,15 +719,27 @@ files = "auto"     # "auto" | "pinned" | "hidden"
 
 [input]
 mouse = true
+
+[popup]
+width = "80%"
+height = "80%"
 ```
+
+Popup sizes are integers >= 20 (outer cells including borders) or strings `"N%"`
+with N in 20..=100. Each invalid size falls back to `"80%"` independently and the
+`open` action reports the problem on stderr. Missing keys or config files use
+the defaults; unreadable or malformed files report a problem and use defaults.
+The popup parser uses the shared absolute config directory resolver and is
+available without the `tui` feature.
 
 ### 4.8 View state and reconciliation
 
 `ViewState` is everything the TUI owns that is not in the snapshot: the cursor (an
 index into the current target sequence, or none), the vertical and horizontal
 offsets, the view mode, the files-panel state, the requested mouse-capture state,
-and the open dialog. The cursor's identity is `(side, line_number)`, not its
-index, so it can be found again after the rows change.
+the last pointer position, whether this is a popup viewer, and the open key sheet.
+The cursor's identity is `(side, line_number)`, not its index, so it can be found
+again after the rows change.
 
 | Event | Cursor | Offsets |
 | --- | --- | --- |
@@ -727,7 +765,7 @@ view slices rows itself, so ratatui's `u16` scroll limit never applies.
 | --- | --- |
 | stdout is not a terminal | exit 2 with a one-line message; nothing is drawn |
 | stdin is not a terminal | exit 2 with `herdr-hunks: stdin is not a terminal`; nothing is drawn |
-| `PATH` argument missing or not a directory | the TUI starts and shows the error state, so an overlay pane does not flash and vanish; `q` quits |
+| `PATH` argument missing or not a directory | the TUI starts and shows the error state, so a popup does not flash and vanish; `q` quits |
 | not a git repository | "not a git repository" state; the frozen watcher's pre-repo mode upgrades it when `.git/` appears |
 | `git` missing from `PATH` | status error carrying the spawn message; `r` retries |
 | git older than 2.31 | fatal start error shown as an error state; no repository command runs (3.3) |
@@ -815,7 +853,7 @@ view slices rows itself, so ratatui's `u16` scroll limit never applies.
    the worktree are identical before and after.
 9. **herdr integration, tier A.** A fake herdr socket that enforces object
    `params` and records requests (from `herdr-agent-watcher`'s `tests/support`):
-   `open` sends the overlay shape with no `target_pane_id`; `open-split` sends the
+   `open` sends the popup shape with sizes and no `target_pane_id`; `open-split` sends the
    split shape; reuse happens only when the recorded toplevel matches, the socket
    path matches, and `pane.get` reports the viewer's title and recorded cwd; a
    record made under another socket path, a relabelled pane or a failed focus each

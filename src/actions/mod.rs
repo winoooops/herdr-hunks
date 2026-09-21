@@ -1,4 +1,5 @@
 mod open;
+mod popup;
 pub mod reuse;
 pub mod update;
 
@@ -11,6 +12,7 @@ pub const VIEWER_TITLE: &str = "Hunks";
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
     Overlay,
+    Popup,
     Split,
 }
 
@@ -23,11 +25,18 @@ pub fn open_params(
     let mut params = json!({
         "plugin_id": plugin_id,
         "entrypoint": "viewer",
-        "placement": if placement == Placement::Overlay { "overlay" } else { "split" },
+        "placement": match placement { Placement::Overlay => "overlay", Placement::Popup => "popup", Placement::Split => "split" },
         "cwd": repo_cwd,
         "env": {},
         "focus": true,
     });
+    if placement != Placement::Overlay {
+        params["env"]["HERDR_HUNKS_PLACEMENT"] = params["placement"].clone();
+    }
+    if placement == Placement::Popup {
+        params["width"] = json!("80%");
+        params["height"] = json!("80%");
+    }
     if let Some(opener) = opener {
         params["env"]["HERDR_HUNKS_OPENER_PANE"] = json!(opener);
         if placement == Placement::Split {

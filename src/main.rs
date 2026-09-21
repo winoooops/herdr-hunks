@@ -24,7 +24,7 @@ fn main() {
                 .unwrap_or_else(|| PathBuf::from("."));
             run_tui(path)
         }
-        Some("open") => herdr_hunks::actions::run_open(Placement::Overlay),
+        Some("open") => herdr_hunks::actions::run_open(Placement::Popup),
         Some("open-split") => herdr_hunks::actions::run_open(Placement::Split),
         Some("update") => herdr_hunks::actions::update::run(),
         Some("--version") | Some("-V") => {

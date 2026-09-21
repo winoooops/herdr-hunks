@@ -24,6 +24,7 @@ pub struct FakeHerdr {
     responses: Arc<Mutex<Vec<serde_json::Value>>>,
     panes: Arc<Mutex<serde_json::Value>>,
     fail_focus: Arc<AtomicBool>,
+    popup_error: Arc<Mutex<Option<String>>>,
     listener_thread: Option<std::thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
 }
@@ -38,6 +39,8 @@ impl FakeHerdr {
         let sent = responses.clone();
         let panes = Arc::new(Mutex::new(serde_json::json!({ "panes": [] })));
         let fail_focus = Arc::new(AtomicBool::new(false));
+        let popup_error = Arc::new(Mutex::new(None::<String>));
+        let popup_failure = popup_error.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
         let (requests, pane_response, focus_failure, stop) = (
             recorded.clone(),
@@ -84,6 +87,12 @@ impl FakeHerdr {
                                     .find(|pane| pane["pane_id"] == request["params"]["pane_id"])
                                     .map(|pane| serde_json::json!({ "type": "pane_info", "pane": pane }))
                                     .ok_or_else(|| serde_json::json!({ "code": "pane_not_found", "message": "no such pane" })),
+                                "plugin.pane.open" if request["params"]["placement"] == "popup" => {
+                                    match popup_failure.lock().unwrap().as_ref() {
+                                        Some(message) => Err(serde_json::json!({"code": "invalid_params", "message": message})),
+                                        None => Ok(serde_json::json!({"type": "ok"})),
+                                    }
+                                }
                                 "plugin.pane.open" => Ok(serde_json::json!({
                                     "type": "plugin_pane_opened",
                                     "plugin_pane": {
@@ -131,6 +140,7 @@ impl FakeHerdr {
             responses,
             panes,
             fail_focus,
+            popup_error,
             listener_thread: Some(listener_thread),
             shutdown,
         }
@@ -149,6 +159,10 @@ impl FakeHerdr {
 
     pub fn fail_focus(&self, fail: bool) {
         self.fail_focus.store(fail, Ordering::Relaxed);
+    }
+
+    pub fn popup_error(&self, message: &str) {
+        *self.popup_error.lock().unwrap() = Some(message.into());
     }
 
     pub fn calls_named(&self, method: &str) -> Vec<serde_json::Value> {

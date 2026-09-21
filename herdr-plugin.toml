@@ -13,12 +13,14 @@ platforms = ["macos", "linux"]
 id = "viewer"
 title = "Hunks"
 description = "Git hunk viewer for the focused pane's worktree"
-placement = "overlay"
+placement = "popup"
+width = "80%"
+height = "80%"
 command = ["/bin/sh", "-lc", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-hunks\" tui"]
 
 [[actions]]
 id = "open"
-title = "Open the hunk viewer over the focused pane"
+title = "Open the hunk viewer in a dialog"
 command = ["target/release/herdr-hunks", "open"]
 
 [[actions]]
