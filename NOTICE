@@ -1,0 +1,13 @@
+herdr-hunks
+Copyright 2026 winoooops
+
+This product includes software ported from Vimeflow
+(https://github.com/winoooops/vimeflow): the frozen tree under src/git/ and the
+tests adapted from it. Vimeflow is distributed under the MIT License; its
+copyright and permission notice is reproduced in third-party/vimeflow-LICENSE.
+
+This product also includes source copied from Herdr Agent Watcher
+(https://github.com/winoooops/herdr-agent-watcher), Copyright 2026 winoooops,
+licensed under the Apache License, Version 2.0.
+
+PORT-SURFACE.md lists every copied file and every adaptation.

@@ -188,7 +188,7 @@ API in a separate process with one test, before starting its Tokio runtime.
 | `tests/fixtures/ping-response.json` | `tests/fixtures/ping-response.json` | Unchanged captured ping response used by the client tests. |
 | `scripts/fetch-or-build.sh` | `scripts/fetch-or-build.sh` | Replaces the repository/binary name with `herdr-hunks` and the override with `HERDR_HUNKS_RELEASE_BASE`; retains four targets, checksum verification, and source-build fallback. Initialises a private `workdir` before any fallback and deletes only that created directory: the inherited script could recursively delete the user's exported `TMP` directory on an early fallback. |
 | `.github/workflows/release.yml` | `.github/workflows/release.yml` | Replaces `herdr-agent-watcher` with `herdr-hunks`; retains the four-target matrix, tag/version guard, and two-space `SHA256SUMS` format; adds the Phase 1 manual acceptance gate and builds with `--locked`. |
-| `LICENSE` | `LICENSE` | Unchanged Apache-2.0 license and original attribution. |
+| `LICENSE` | `LICENSE` | The verbatim Apache-2.0 text; the attribution the watcher keeps at the top of its copy lives in `NOTICE` here, next to the MIT notice for the vimeflow port in `third-party/vimeflow-LICENSE`. |
 | `tests/e2e_real_herdr.rs` | `tests/e2e_real_herdr.rs` | Copies only `ProcessGuard` and `modified`; adapts isolation for a named server with cleared child environments and explicit CLI targeting, discovers the host's socket and plugin-state paths without assuming its directory name, then checks split creation/reuse and the real session mtime. |
 
 `tests/fixtures/herdr-0.8.0-schema.json` is the complete output of
