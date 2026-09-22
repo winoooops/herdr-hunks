@@ -15,11 +15,10 @@ herdr plugin install winoooops/herdr-hunks
 ```
 
 Fork users must run the same command with their `vimeflow` binary; the plugin
-registries are separate. No release is published yet, so installation currently
-builds from source with `cargo build --release` and requires Rust 1.88 or newer.
-Once a release is published, installation fetches a SHA256-verified binary for
-macOS or Linux, on x86_64 or arm64. A missing asset, failed download, or checksum
-mismatch falls back to the same source build.
+registries are separate. Installation fetches the SHA256-verified binary of the
+release that matches the checked-out version, for macOS or Linux on x86_64 or
+arm64. A missing asset, a failed download, or a checksum mismatch falls back to
+`cargo build --release`, which needs Rust 1.88 or newer.
 
 ## Commands
 
@@ -35,7 +34,7 @@ herdr plugin action invoke update --plugin winoooops.hunks
 | --- | --- |
 | `open` | Opens a focused popup dialog for the opener's working directory, 80% wide and 80% high by default. The host must be in its normal workspace view. |
 | `open-split` | Opens a split on the right, or focuses its existing viewer when the session, opener, repository, title, and cwd still match. |
-| `update` | For a GitHub install, installs the newest stable version tag. Refuses linked/unknown sources. Until a release tag exists, it reports that no release tags were found and installs nothing. |
+| `update` | For a GitHub install, installs the newest release tag when it is newer than the running version, and otherwise reports that it is up to date. Refuses linked/unknown sources. |
 
 Standalone: `herdr-hunks [PATH]` or `herdr-hunks tui [PATH]`; PATH defaults to the
 current directory. Both stdin and stdout must be terminals. `--version` prints
@@ -180,12 +179,14 @@ checks. CI tries that pin from `winoooops/vimeflow`; if private, configure the
 `VIMEFLOW_READ_TOKEN` Actions secret with read access. If checkout is unavailable,
 CI prints a notice and skips both port checks; the commands above remain usable.
 
-The future tag-triggered release workflow builds four targets and requires the
-tag to match Cargo.toml. Keep Cargo.toml, Cargo.lock, and herdr-plugin.toml versions
+Pushing a `v*` tag runs the release workflow, which builds the four targets and
+requires the tag to match Cargo.toml and `docs/acceptance-p1.md` to read PASS. Keep Cargo.toml, Cargo.lock, and herdr-plugin.toml versions
 in sync. `HERDR_HUNKS_RELEASE_BASE=file:///absolute/fixture` lets distribution
 checks use local assets without contacting GitHub.
 
 ## Licence
 
-[Apache-2.0](LICENSE). Includes code ported from vimeflow and herdr-agent-watcher;
-see [PORT-SURFACE.md](PORT-SURFACE.md) for attribution and adaptations.
+[Apache-2.0](LICENSE). Includes code ported from vimeflow (MIT; notice in
+[third-party/vimeflow-LICENSE](third-party/vimeflow-LICENSE)) and from
+herdr-agent-watcher (Apache-2.0); see [NOTICE](NOTICE) and
+[PORT-SURFACE.md](PORT-SURFACE.md) for attribution and adaptations.

@@ -16,11 +16,11 @@ herdr plugin install winoooops/herdr-hunks
 ```
 
 フォーク版のユーザーは、自分の `vimeflow` バイナリで同じコマンドを実行してください。
-プラグイン登録先は別々です。リリースはまだないため、現在は `cargo build --release` で
-ソースからビルドします。Rust 1.88 以降が必要です。
-リリース公開後は SHA256 検証済みの macOS または Linux 向けバイナリを取得します。
-x86_64 と arm64 に対応します。アセットがない場合、ダウンロードに失敗した場合、
-チェックサムが一致しない場合は、同じソースビルドに切り替わります。
+プラグイン登録先は別々です。インストール時は、チェックアウトしたバージョンに対応する
+リリースから SHA256 検証済みのバイナリを取得します。macOS と Linux の x86_64 および
+arm64 に対応します。アセットがない場合、ダウンロードに失敗した場合、チェックサムが
+一致しない場合は `cargo build --release` によるソースビルドに切り替わり、Rust 1.88
+以降が必要になります。
 
 ## コマンド
 
@@ -36,7 +36,7 @@ herdr plugin action invoke update --plugin winoooops.hunks
 | --- | --- |
 | `open` | 呼び出し元ペインの作業ディレクトリをポップアップダイアログで開き、フォーカスします。既定の幅と高さは80%です。ホストは通常のワークスペース表示である必要があります。 |
 | `open-split` | 右側の分割ペインで開きます。セッション、呼び出し元、リポジトリ、タイトル、cwd が一致する既存ビューアがあれば、そこにフォーカスします。 |
-| `update` | GitHub からのインストールでは最新の安定版タグをインストールします。ローカルリンクや不明な取得元は拒否します。リリースタグがない間は、タグが見つからない旨を表示し、何もインストールしません。 |
+| `update` | GitHub からのインストールでは、最新のリリースタグが実行中のバージョンより新しい場合にそれをインストールし、そうでなければ最新である旨を表示します。ローカルリンクや不明な取得元は拒否します。 |
 
 単独実行は `herdr-hunks [PATH]` または `herdr-hunks tui [PATH]` です。
 PATH の既定値はカレントディレクトリです。標準入力と標準出力の両方が端末である必要があります。
@@ -177,11 +177,13 @@ CI は `winoooops/vimeflow` からそのコミットの取得を試みます。�
 `VIMEFLOW_READ_TOKEN` Actions secret を設定してください。取得できない場合は案内を表示し、
 両方の移植検証をスキップします。上記のローカル検証コマンドは引き続き利用できます。
 
-今後タグで起動するリリースワークフローは4ターゲットをビルドし、タグと Cargo.toml のバージョンの一致を確認します。
+`v*` タグを push するとリリースワークフローが起動し、4ターゲットをビルドします。タグと Cargo.toml のバージョンの一致、および `docs/acceptance-p1.md` が PASS であることが必要です。
 Cargo.toml、Cargo.lock、herdr-plugin.toml のバージョンを揃えてください。
 `HERDR_HUNKS_RELEASE_BASE=file:///absolute/fixture` を指定すれば、GitHub に接続せずローカルアセットで配布処理を検証できます。
 
 ## ライセンス
 
-[Apache-2.0](LICENSE)。vimeflow と herdr-agent-watcher から移植したコードを含みます。
-出典と変更内容は [PORT-SURFACE.md](PORT-SURFACE.md) を参照してください。
+[Apache-2.0](LICENSE)。vimeflow（MIT。表示は
+[third-party/vimeflow-LICENSE](third-party/vimeflow-LICENSE)）と herdr-agent-watcher
+（Apache-2.0）から移植したコードを含みます。出典と変更内容は [NOTICE](NOTICE) と
+[PORT-SURFACE.md](PORT-SURFACE.md) を参照してください。

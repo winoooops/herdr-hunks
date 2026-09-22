@@ -15,9 +15,8 @@ herdr plugin install winoooops/herdr-hunks
 ```
 
 分支版本用户应使用自己的 `vimeflow` 可执行文件运行同样的命令，因为插件注册表相互独立。
-目前尚无发行版，因此安装会通过 `cargo build --release` 从源码构建，需要 Rust 1.88 或更新版本。
-发行版发布后，安装会下载经过 SHA256 校验的 macOS 或 Linux 二进制文件，支持 x86_64 和 arm64。
-资源缺失、下载失败或校验不匹配时，会回退到相同的源码构建流程。
+安装会下载与检出版本对应的发行版二进制文件并校验 SHA256，支持 macOS 和 Linux 的 x86_64 与 arm64。
+资源缺失、下载失败或校验不匹配时，会回退到 `cargo build --release` 从源码构建，这需要 Rust 1.88 或更新版本。
 
 ## 命令
 
@@ -33,7 +32,7 @@ herdr plugin action invoke update --plugin winoooops.hunks
 | --- | --- |
 | `open` | 为发起窗格的工作目录打开并聚焦弹出对话框，默认宽高均为 80%。宿主必须处于普通工作区视图。 |
 | `open-split` | 在右侧打开分割窗格；若会话、发起窗格、仓库、标题和 cwd 仍匹配，则聚焦已有查看器。 |
-| `update` | 对 GitHub 安装，安装最新稳定版本标签；拒绝本地链接或未知来源。在发行标签出现之前，会提示未找到发行标签，不会安装任何内容。 |
+| `update` | 对 GitHub 安装，当最新发行标签比当前运行版本更新时安装它，否则提示已是最新；拒绝本地链接或未知来源。 |
 
 独立运行：`herdr-hunks [PATH]` 或 `herdr-hunks tui [PATH]`；PATH 默认为当前目录。
 标准输入和标准输出都必须连接到终端。`--version` 输出 `herdr-hunks 0.0.1`。
@@ -170,11 +169,13 @@ CI 会尝试从 `winoooops/vimeflow` 检出该固定提交；若仓库为私有�
 `VIMEFLOW_READ_TOKEN` Actions secret。无法检出时，CI 会显示提示并跳过两项移植检查；
 仍可使用上面的命令在本地运行。
 
-未来由标签触发的发布工作流会构建四个目标，并要求标签与 Cargo.toml 的版本一致。
+推送 `v*` 标签会触发发布工作流：构建四个目标，并要求标签与 Cargo.toml 的版本一致、`docs/acceptance-p1.md` 为 PASS。
 请保持 Cargo.toml、Cargo.lock 和 herdr-plugin.toml 的版本同步。
 `HERDR_HUNKS_RELEASE_BASE=file:///absolute/fixture` 可让分发检查使用本地资源，不访问 GitHub。
 
 ## 许可证
 
-[Apache-2.0](LICENSE)。包含从 vimeflow 和 herdr-agent-watcher 移植的代码；
-来源和适配说明见 [PORT-SURFACE.md](PORT-SURFACE.md)。
+[Apache-2.0](LICENSE)。包含从 vimeflow（MIT，声明见
+[third-party/vimeflow-LICENSE](third-party/vimeflow-LICENSE)）和 herdr-agent-watcher
+（Apache-2.0）移植的代码；来源和适配说明见 [NOTICE](NOTICE) 与
+[PORT-SURFACE.md](PORT-SURFACE.md)。
