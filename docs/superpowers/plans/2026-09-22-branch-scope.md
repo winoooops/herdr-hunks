@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- The vimeflow pin stays `91e45b1c`. Nobody edits `src/git/` by hand: a change there is a new file in `port/patches/`, generated as Task 1 describes. `scripts/port-check.sh` must pass after every task.
+- The vimeflow pin stays `91e45b1c`. `$VIMEFLOW` is a read-only checkout of vimeflow at that pin (on the author's machine `~/projects/vimeflow`); both port scripts take it as their only argument. Nobody edits `src/git/` by hand: a change there is a new file in `port/patches/`, generated as Task 1 describes. `scripts/port-check.sh "$VIMEFLOW"` and `sh scripts/port-check-selftest.sh "$VIMEFLOW"` must pass after every task, as `AGENTS.md` requires.
 - Read-only guarantee G7 (spec 3.5 and 7.6): the engine spawns only `git --version rev-parse status diff ls-files show cat-file symbolic-ref merge-base for-each-ref`. Every base, ref or object id is one argv element, never interpolated into a shell, and every revision argument is followed by `--` before any path. A base that starts with `-` is refused before git is spawned.
 - The merge-base is computed once per refresh with `git merge-base HEAD <commit>` and given to every row and diff command of that refresh; no command uses `git diff --merge-base`.
 - The engine calls these frozen functions and no others: `git_status_inner`, `get_git_diff_inner`, `git_branch_inner`, `git_worktree_name_inner`, `start_git_watcher_backend`, `stop_git_watcher_backend`, and, after D6, `run_git_with_timeout`, `parse_git_diff`, `parse_numstat`, `decode_git_patch_path`, `validate_file_path`.
@@ -22,7 +22,7 @@
 - Phase 1 behaviour with `[view] scope` unset is unchanged: every existing test keeps passing without weakening.
 - Commits are conventional with a lowercase subject; inline comments are one short line and never reference a task or PR. The orchestrator makes every commit; the implementer leaves the tree uncommitted.
 - `cargo test` is run with a writable `HOME` outside any git repository (the frozen test helpers create fixtures under `$HOME`); the coder's instructions say how.
-- Run before every commit: `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo check --locked --no-default-features && scripts/port-check.sh`.
+- Run before every commit: `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo check --locked --no-default-features && scripts/port-check.sh "$VIMEFLOW" && sh scripts/port-check-selftest.sh "$VIMEFLOW"`.
 - The version becomes `0.1.0` in Task 6 only; no other task touches `Cargo.toml`, `Cargo.lock` or `herdr-plugin.toml`.
 
 ## File Structure
@@ -79,7 +79,7 @@ pub fn ref_label(requested: &str) -> &str
 pub enum Comparison { Worktree, Branch { merge_base: String } }   // PartialEq
 pub const NO_BASE_NOTICE: &str = "no base branch: set [base] ref or press B";
 // LoadedDiff gains `pub comparison: Comparison`; build(key, comparison, response), build_with_cap(key, comparison, response, cap)
-// Snapshot gains: scope, base, base_error, default_base, rename_sources, refs, refs_overflow, pick_seq, pick_error
+// Snapshot gains: scope, base, base_error, default_base, rename_sources, refs, refs_overflow, refs_seq, pick_seq, pick_error
 // Command gains: SetScope(Scope), SetBase(Option<String>), LoadRefs
 ```
 
@@ -136,7 +136,7 @@ Append to the `tests` module of `src/engine/types.rs` (keep the existing tests; 
         let empty = Snapshot::empty("/r");
         assert_eq!(empty.scope, Scope::Worktree);
         assert!(empty.base.is_none() && empty.refs.is_none() && !empty.refs_overflow);
-        assert_eq!(empty.pick_seq, 0);
+        assert_eq!((empty.pick_seq, empty.refs_seq), (0, 0));
         assert!(empty.rename_sources.is_empty());
     }
 ```
@@ -279,6 +279,8 @@ pub struct Snapshot {
     /// The picker's candidates, qualified, most recently created first; `None` until `LoadRefs`.
     pub refs: Option<Arc<Vec<String>>>,
     pub refs_overflow: bool,
+    /// Bumped once per answered `LoadRefs`, so a picker shows only the list loaded for its own opening.
+    pub refs_seq: u64,
     /// Bumped once per answered `SetBase`; `pick_error` is that answer.
     pub pick_seq: u64,
     pub pick_error: Option<String>,
@@ -304,6 +306,7 @@ impl Snapshot {
             refreshing: false,
             refs: None,
             refs_overflow: false,
+            refs_seq: 0,
             pick_seq: 0,
             pick_error: None,
         }
@@ -338,7 +341,7 @@ Update the existing tests in the same file: `key()` returns `FileKey { path: "f"
 
 ```rust
     format!(
-        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}",
+        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}",
         s.repo,
         serde_json::to_string(&s.files).unwrap_or_default(),
         s.selected,
@@ -353,6 +356,7 @@ Update the existing tests in the same file: `key()` returns `FileKey { path: "f"
         s.rename_sources,
         s.refs.as_ref().map(Arc::as_ptr),
         s.refs_overflow,
+        s.refs_seq,
         s.pick_seq,
         s.pick_error
     )
@@ -375,32 +379,9 @@ Search for any other `FileKey {` literal: `grep -rn "FileKey {" src tests` must 
 Run: `cargo test`
 Expected: PASS, including the three new tests.
 
-- [ ] **Step 6: Generate the D6 patch**
+- [ ] **Step 6: Register D6 and K7 in `PORT-SURFACE.md`**
 
-Edit `src/git/mod.rs` and nothing else in the frozen tree, changing exactly five signatures (line numbers as of the current tree):
-
-```
-25:   async fn run_git_with_timeout(       ->  pub(crate) async fn run_git_with_timeout(
-92:   fn validate_file_path(               ->  pub(crate) fn validate_file_path(
-521:  fn parse_numstat(                    ->  pub(crate) fn parse_numstat(
-909:  fn parse_git_diff(                   ->  pub(crate) fn parse_git_diff(
-1031: fn decode_git_patch_path(            ->  pub(crate) fn decode_git_patch_path(
-```
-
-Then produce the patch from that edit and give it the same header form as `0001-no-ext-diff.patch`:
-
-```bash
-{
-  printf '%s\n' 'Reason: D6. The engine builds the branch-scope commands itself (spec 7.2, 7.7) and needs the' \
-    'frozen runner, both parsers, the patch-path decoder and the path check. Visibility only:' \
-    'pub(crate) on five functions, no behaviour change, no frozen test affected.' ''
-  git diff --no-color -- src/git/mod.rs | sed -n '/^--- a\//,$p'
-} > port/patches/0003-engine-visibility.patch
-```
-
-The `sed` keeps the patch from its `--- a/src/git/mod.rs` line on, as the other two patches are written. Verify: `scripts/port-check.sh` must report `src/git matches 91e45b1c + 3 patch(es)` (it applies the patches to the pristine pin in name order, so 0003's hunk offsets are relative to the tree after 0001 and 0002, which is the tree you edited).
-
-- [ ] **Step 7: Register D6 and K7 in `PORT-SURFACE.md`**
+The registry check of `port-check` rejects an unregistered patch, so the registration comes before the patch is generated and checked.
 
 In the `## Pin` paragraph that lists the patches, extend the list to `` `0001-no-ext-diff.patch` (D4), `0002-drain-sync-output.patch` (D5) and `0003-engine-visibility.patch` (D6) ``. In `## Port surface`, add the five D6 functions to the list of frozen functions the engine calls, each marked `(D6, pub(crate))`. Under `## Registered divergences`, after D5:
 
@@ -426,9 +407,34 @@ Under `## Known defects`, retitle `**K1-K6: known defects.**` to `**K1-K7: known
   output into `diff --git` sections and keeps only the row's own (spec 7.2).
 ```
 
+- [ ] **Step 7: Generate the D6 patch**
+
+Edit `src/git/mod.rs` and nothing else in the frozen tree, changing exactly five signatures (line numbers as of the current tree):
+
+```
+25:   async fn run_git_with_timeout(       ->  pub(crate) async fn run_git_with_timeout(
+92:   fn validate_file_path(               ->  pub(crate) fn validate_file_path(
+521:  fn parse_numstat(                    ->  pub(crate) fn parse_numstat(
+909:  fn parse_git_diff(                   ->  pub(crate) fn parse_git_diff(
+1031: fn decode_git_patch_path(            ->  pub(crate) fn decode_git_patch_path(
+```
+
+Then produce the patch from that edit and give it the same header form as `0001-no-ext-diff.patch`:
+
+```bash
+{
+  printf '%s\n' 'Reason: D6. The engine builds the branch-scope commands itself (spec 7.2, 7.7) and needs the' \
+    'frozen runner, both parsers, the patch-path decoder and the path check. Visibility only:' \
+    'pub(crate) on five functions, no behaviour change, no frozen test affected.' ''
+  git diff --no-color -- src/git/mod.rs | sed -n '/^--- a\//,$p'
+} > port/patches/0003-engine-visibility.patch
+```
+
+The `sed` keeps the patch from its `--- a/src/git/mod.rs` line on, as the other two patches are written. Verify: `scripts/port-check.sh "$VIMEFLOW"` must report `src/git matches 91e45b1c + 3 patch(es)` (it applies the patches to the pristine pin in name order, so 0003's hunk offsets are relative to the tree after 0001 and 0002, which is the tree you edited).
+
 - [ ] **Step 8: Verify**
 
-Run: `scripts/port-check.sh && scripts/port-check-selftest.sh && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo check --locked --no-default-features`
+Run: `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo check --locked --no-default-features && scripts/port-check.sh "$VIMEFLOW" && sh scripts/port-check-selftest.sh "$VIMEFLOW"`
 Expected: all pass; `port-check` reports 3 patches.
 
 - [ ] **Step 9: Commit (orchestrator)**
@@ -472,7 +478,7 @@ pub(crate) async fn list_refs(toplevel: &str) -> Result<(Vec<String>, bool), Str
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `src/engine/base.rs` with only a `tests` module for now (the implementation follows in Step 3):
+Add `pub mod base;` to `src/engine/mod.rs` (after `pub mod gitver;`) and create `src/engine/base.rs` with only a `tests` module for now (the implementation follows in Step 3), so Step 2 fails to compile instead of running zero tests:
 
 ```rust
 //! Base resolution, validation, remembered picks and the picker's ref list (spec 7.3, 7.4).
@@ -913,8 +919,6 @@ pub(crate) async fn list_refs(toplevel: &str) -> Result<(Vec<String>, bool), Str
 }
 ```
 
-Add `pub mod base;` to `src/engine/mod.rs` (after `pub mod gitver;`).
-
 In `src/engine/session.rs`, add to `SessionConfig`:
 
 ```rust
@@ -935,7 +939,7 @@ Expected: PASS (6 tests).
 
 - [ ] **Step 5: Verify**
 
-Run: `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo check --locked --no-default-features && scripts/port-check.sh`
+Run: `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo check --locked --no-default-features && scripts/port-check.sh "$VIMEFLOW" && sh scripts/port-check-selftest.sh "$VIMEFLOW"`
 Expected: all pass. `clippy` may flag `dead_code` for the `pub(crate)` async functions until Task 3 uses them; if it does, add `#[allow(dead_code)]` on the module line in `mod.rs` with the comment `// used by the session loop from Task 3` and remove it in Task 3.
 
 - [ ] **Step 6: Commit (orchestrator)**
@@ -975,7 +979,7 @@ pub(crate) async fn diff(toplevel: &str, merge_base: &str, path: &str, old: Opti
 
 - [ ] **Step 1: Write the failing pure tests for `branch.rs`**
 
-Create `src/engine/branch.rs` with only this `tests` module (the implementation follows in Step 3):
+Add `pub mod branch;` to `src/engine/mod.rs` and create `src/engine/branch.rs` with only this `tests` module (the implementation follows in Step 3), so Step 2 fails to compile instead of running zero tests:
 
 ```rust
 //! Branch scope: rows and diffs against a merge-base pinned once per refresh (spec 7.2).
@@ -1307,8 +1311,6 @@ pub(crate) async fn untracked_diff(cwd: String, path: String) -> Result<GetGitDi
 }
 ```
 
-Add `pub mod branch;` to `src/engine/mod.rs`.
-
 - [ ] **Step 4: Run the pure tests**
 
 Run: `cargo test --lib engine::branch`
@@ -1598,6 +1600,30 @@ Append to the `tests` module of `src/engine/session.rs`. The existing helpers (`
     }
 
     #[test]
+    fn a_scope_switch_re_resolves_and_sees_another_viewers_pick() {
+        let dir = branch_fixture();
+        git(dir.path(), &["branch", "other", "main"]);
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(dir.path(), Scope::Worktree, Some(state.path().to_path_buf()), None);
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        assert_eq!(s.base.as_ref().unwrap().requested, "refs/heads/main");
+        // Another viewer on the same worktree saves a pick.
+        let toplevel = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+        crate::engine::base::save_pick(state.path(), &toplevel, Some("refs/heads/other")).unwrap();
+        h.commands.send(Command::SetScope(Scope::Branch)).unwrap();
+        let s = wait_for(&h, "branch", |s| s.scope == Scope::Branch);
+        assert_eq!(s.base.as_ref().map(|b| (b.requested.as_str(), b.source)), Some(("refs/heads/other", BaseSource::Picked)));
+        // A default that vanished is published as `None`, so the reset row reads `default (none)`.
+        crate::engine::base::save_pick(state.path(), &toplevel, None).unwrap();
+        git(dir.path(), &["branch", "-D", "main"]);
+        git(dir.path(), &["branch", "-D", "other"]);
+        h.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&h, "nothing resolves", |s| s.base.is_none());
+        assert_eq!(s.default_base, None);
+        assert_eq!(s.scope, Scope::Worktree);
+    }
+
+    #[test]
     fn load_refs_answers_on_the_snapshot_and_no_base_falls_back_to_worktree_with_the_notice() {
         let dir = branch_fixture();
         let (_rt, h) = start_with(dir.path(), Scope::Worktree, None, None);
@@ -1607,6 +1633,9 @@ Append to the `tests` module of `src/engine/session.rs`. The existing helpers (`
         let refs = s.refs.as_ref().unwrap();
         assert!(refs.contains(&"refs/heads/main".to_string()) && refs.contains(&"refs/heads/feat".to_string()));
         assert!(!s.refs_overflow);
+        assert_eq!(s.refs_seq, 1);
+        h.commands.send(Command::LoadRefs).unwrap();
+        wait_for(&h, "second answer", |s| s.refs_seq == 2);
 
         let dir = tempfile::tempdir().unwrap();
         git(dir.path(), &["init", "-q", "-b", "dev"]);
@@ -1832,11 +1861,12 @@ impl State {
             Some(Change::Base(_)) => Scope::Branch,
             None => self.requested_scope,
         };
-        // Resolution runs at start, on `r`, for a pick, and when `b` is pressed with nothing resolved yet.
-        let base = match (&change, std::mem::take(&mut self.resolve_pending), &self.snapshot.base) {
-            (Some(Change::Base(pick)), _, _) => BaseJob::Pick(pick.clone()),
-            (_, true, _) | (Some(Change::Scope(Scope::Branch)), _, None) => BaseJob::Resolve,
-            (_, _, base) => BaseJob::Keep(base.clone()),
+        // The preference is re-resolved at start, on `r`, for a pick and on every scope change
+        // (7.3, 7.5); a plain refresh keeps it and only re-verifies the ids.
+        let base = match (&change, std::mem::take(&mut self.resolve_pending)) {
+            (Some(Change::Base(pick)), _) => BaseJob::Pick(pick.clone()),
+            (Some(Change::Scope(_)), _) | (None, true) => BaseJob::Resolve,
+            (None, false) => BaseJob::Keep(self.snapshot.base.clone()),
         };
         let job = Job {
             cwd: cwd.to_string(),
@@ -1992,9 +2022,8 @@ Replace the `Done::Status` arm with:
                                         next.scope = loaded.scope;
                                         next.base = loaded.base;
                                         next.base_error = loaded.base_error;
-                                        if loaded.default_base.is_some() {
-                                            next.default_base = loaded.default_base;
-                                        }
+                                        // `Keep` echoes the previous default; a resolution publishes its own, `None` included.
+                                        next.default_base = loaded.default_base;
                                         next.files = loaded.files;
                                         next.rename_sources = Arc::new(loaded.rename_sources);
                                         next.selected = if switched {
@@ -2081,6 +2110,7 @@ Replace the `Done::Diff` arm's head and build call:
                         let (refs, overflow) = result.unwrap_or_default();
                         next.refs = Some(Arc::new(refs));
                         next.refs_overflow = overflow;
+                        next.refs_seq += 1;
                         publish(&mut state, next, &snapshots);
                     }
 ```
@@ -2094,7 +2124,7 @@ Expected: PASS every time. `a_stale_diff_from_the_previous_comparison_is_discard
 
 - [ ] **Step 9: Verify**
 
-Run: `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo check --locked --no-default-features && scripts/port-check.sh`
+Run: `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo check --locked --no-default-features && scripts/port-check.sh "$VIMEFLOW" && sh scripts/port-check-selftest.sh "$VIMEFLOW"`
 Expected: all pass.
 
 - [ ] **Step 10: Commit (orchestrator)**
@@ -2376,7 +2406,7 @@ Expected: compile errors (`ToggleScope`, `observe`, `Config.scope` unknown).
 
 Import `NO_BASE_NOTICE` from `crate::engine`. Note `apply_action` clears `state.notice` before `act` runs, so the notice set here survives and the next handled key clears it, as the test expects.
 
-- [ ] **Step 4: `observe` on the view state**
+- [ ] **Step 4: `observe` on the view state, and line reconciliation across a scope switch**
 
 `src/tui/state.rs`: add the field `seen_base_error: Option<String>,` (private, initialised to `None` in `new`) and:
 
@@ -2392,7 +2422,71 @@ Import `NO_BASE_NOTICE` from `crate::engine`. Note `apply_action` clears `state.
     }
 ```
 
-(Task 5 extends it for the picker.) `src/tui/shell.rs`, in `run_terminal`'s loop:
+(Task 5 extends it for the picker.)
+
+Spec 7.2: a scope switch keeps the `(side, line_number)` reconciliation of 4.8 when the selected path survives, and the engine publishes `Loading` between the two `Ready` states because the comparison changed. Today `reconcile` forgets everything on `Loading`. Change its head so the identity and the previous diff survive `Loading`, and so a path that survives a comparison change counts as the same file:
+
+```rust
+        let DiffState::Ready(diff) = &snapshot.diff else {
+            // Rows and cursor go; the identity and the previous diff stay for the next Ready.
+            self.rows = None;
+            self.cursor = None;
+            self.offset = 0;
+            self.hscroll = 0;
+            return;
+        };
+        // Runs before every frame, so the unchanged case must cost nothing: no clone, no compare of text.
+        if let Some((built, mode)) = &self.built_from {
+            if std::sync::Arc::ptr_eq(built, diff) && *mode == self.mode && self.rows.is_some() {
+                return;
+            }
+        }
+        // The same key, or the same path under a different comparison (a scope switch), is the same file.
+        let same_file = self
+            .built_from
+            .as_ref()
+            .map(|(built, _)| {
+                built.key == diff.key
+                    || (built.comparison != diff.comparison && built.key.path == diff.key.path)
+            })
+            .unwrap_or(false);
+```
+
+The rest of `reconcile` is unchanged: with `cursor == None` after `Loading`, the `same_file` branch lands on `cursor_id` and the other branch on the first changed row. Test, in `state.rs`:
+
+```rust
+    #[test]
+    fn a_scope_switch_keeps_the_line_and_a_new_path_starts_at_the_first_change() {
+        use crate::engine::Comparison;
+        let mut snap = snapshot("a.rs", "r1", &[(10, " --+ "), (40, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        let first_change = st.cursor.expect("first changed row");
+        let DiffState::Ready(diff) = &snap.diff else { unreachable!() };
+        st.set_cursor(diff, 3);
+        let id = st.cursor_id.expect("cursor identity");
+        snap.diff = DiffState::Loading;
+        st.reconcile(&snap);
+        assert!(st.cursor.is_none() && st.rows.is_none());
+        let mut branch = snapshot("a.rs", "r2", &[(10, " --+ "), (40, "+")]);
+        if let DiffState::Ready(d) = &mut branch.diff {
+            std::sync::Arc::make_mut(d).comparison = Comparison::Branch { merge_base: "1".repeat(40) };
+        }
+        snap.diff = branch.diff;
+        st.reconcile(&snap);
+        assert_eq!(st.cursor_id, Some(id), "the same path under the new comparison keeps its line");
+        assert_eq!(st.cursor, Some(3));
+        snap.diff = DiffState::Loading;
+        st.reconcile(&snap);
+        snap.diff = snapshot("b.rs", "r3", &[(10, " --+ "), (40, "+")]).diff;
+        st.reconcile(&snap);
+        assert_eq!(st.cursor, Some(first_change), "a new path starts at its first change");
+        assert_ne!(st.cursor, Some(3));
+    }
+```
+
+`src/tui/shell.rs`, in `run_terminal`'s loop:
 
 ```rust
         while let Ok(next) = handle.snapshots.try_recv() {
@@ -2443,7 +2537,7 @@ Expected: PASS, including `every_key_on_the_sheet_does_something_and_reserved_ke
 
 - [ ] **Step 7: Verify**
 
-Run: `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo check --locked --no-default-features && scripts/port-check.sh`
+Run: `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo check --locked --no-default-features && scripts/port-check.sh "$VIMEFLOW" && sh scripts/port-check-selftest.sh "$VIMEFLOW"`
 Expected: all pass.
 
 - [ ] **Step 8: Commit (orchestrator)**
@@ -2476,13 +2570,14 @@ Implements spec 7.4 (the picker: rows, filtering, markers, keys, mouse, errors, 
 pub const WIDTH: u16 = 60;
 pub enum PickerRow { Reset(String), Typed(String), Ref { qualified: String, markers: Vec<&'static str> } }
 impl PickerRow { pub fn submit(&self) -> Option<String> }          // None for the reset row
-pub struct Picker { pub input: String, pub cursor: usize, pub offset: usize, pub error: Option<String>, pub pending: Option<u64>, pub done: bool }
+pub struct Picker { pub input: String, pub cursor: usize, pub offset: usize, pub error: Option<String>, pub pending: Option<u64>, pub done: bool, pub refs_after: u64, pub seen_refs_seq: u64 }
 impl Picker {
-    pub fn new() -> Self;
+    pub fn open(refs_seq: u64) -> Self;                             // the list counts only once `snapshot.refs_seq` passes `refs_seq`
+    pub fn refs<'a>(&self, snapshot: &'a Snapshot) -> &'a [String];  // empty until this opening's `LoadRefs` is answered
     pub fn rows(&self, snapshot: &Snapshot) -> Vec<PickerRow>;
     pub fn visible(&self, height: u16) -> usize;                    // list rows that fit in a panel of `height` lines
     pub fn window(&self, visible: usize) -> usize;                  // first list row drawn, keeping the cursor inside
-    pub fn panel(&self, snapshot: &Snapshot, height: u16) -> Panel;
+    pub fn panel(&self, snapshot: &Snapshot, width: u16, height: u16) -> Panel;   // every row is exactly one line at `width`
     pub fn move_by(&mut self, delta: isize, len: usize, visible: usize) -> bool;
     pub fn retarget(&mut self, snapshot: &Snapshot);
     pub fn observe(&mut self, snapshot: &Snapshot);
@@ -2495,7 +2590,7 @@ impl Picker {
 
 `src/tui/keys.rs`: the two `22` assertions become `23`; add `assert_eq!(lookup(&KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT)), Some(KeyAction::PickBase));` next to the `E` assertion.
 
-Create `src/tui/picker.rs` with only this test module for now:
+Add `pub mod picker;` to `src/tui/mod.rs` and create `src/tui/picker.rs` with only this test module for now:
 
 ```rust
 //! The base picker (spec 7.4): one input line that filters the ref list and takes free text.
@@ -2506,9 +2601,11 @@ mod tests {
     use crate::engine::{Base, BaseSource, RepoState, Scope, Snapshot};
     use std::sync::Arc;
 
+    /// `refs_seq` is 1: a picker opened with `Picker::open(0)` sees the list at once.
     fn snap(refs: &[&str], base: Option<(&str, BaseSource)>) -> Snapshot {
         let mut s = Snapshot::empty("/r");
         s.revision = 1;
+        s.refs_seq = 1;
         s.repo = RepoState::Repo {
             toplevel: "/r".into(),
             branch: Some("main".into()),
@@ -2553,7 +2650,7 @@ mod tests {
     #[test]
     fn rows_start_with_reset_then_the_current_base_then_matches_with_markers() {
         let s = snap(&REFS, Some(("refs/tags/main", BaseSource::Picked)));
-        let p = Picker::new();
+        let p = Picker::open(0);
         assert_eq!(
             labels(&p.rows(&s)),
             [
@@ -2565,7 +2662,7 @@ mod tests {
                 "maint-2.1"
             ]
         );
-        let mut p = Picker::new();
+        let mut p = Picker::open(0);
         p.input = "main".into();
         assert_eq!(
             labels(&p.rows(&s)),
@@ -2583,18 +2680,18 @@ mod tests {
         assert_eq!(p.rows(&s)[1].submit().as_deref(), Some("HEAD~2"));
         assert_eq!(p.rows(&s)[0].submit(), None);
         let s = snap(&REFS, Some(("feat", BaseSource::Config)));
-        assert_eq!(labels(&Picker::new().rows(&s))[1], "feat");
+        assert_eq!(labels(&Picker::open(0).rows(&s))[1], "feat");
         let s = snap(&REFS, Some(("refs/heads/feat", BaseSource::Config)));
-        assert_eq!(labels(&Picker::new().rows(&s))[1], "feat [config]");
+        assert_eq!(labels(&Picker::open(0).rows(&s))[1], "feat [config]");
         let mut s = snap(&[], None);
         s.default_base = None;
-        assert_eq!(labels(&Picker::new().rows(&s)), ["default (none)"]);
+        assert_eq!(labels(&Picker::open(0).rows(&s)), ["default (none)"]);
     }
 
     #[test]
     fn the_cursor_follows_the_input_and_moves_within_bounds() {
         let s = snap(&REFS, None);
-        let mut p = Picker::new();
+        let mut p = Picker::open(0);
         assert_eq!(p.cursor, 0);
         p.input = "ma".into();
         p.retarget(&s);
@@ -2616,10 +2713,10 @@ mod tests {
     #[test]
     fn the_panel_shows_the_caret_error_markers_and_footers() {
         let s = snap(&REFS, Some(("refs/heads/main", BaseSource::Default)));
-        let mut p = Picker::new();
+        let mut p = Picker::open(0);
         p.input = "ma".into();
         p.retarget(&s);
-        let panel = p.panel(&s, 12);
+        let panel = p.panel(&s, WIDTH, 12);
         assert_eq!(panel.title, "Compare against");
         assert_eq!(panel.footer, "Enter pick · Esc cancel · type to filter");
         let lines: Vec<String> = crate::tui::dialog::render(&panel, WIDTH, 12)
@@ -2631,27 +2728,61 @@ mod tests {
         assert!(lines[3].contains("use \"ma\""), "{}", lines[3]);
         assert!(lines[4].contains("▸ main") && lines[4].contains("current"), "{}", lines[4]);
         p.error = Some("not a commit: ma\u{1b}".into());
-        let panel = p.panel(&s, 12);
+        let panel = p.panel(&s, WIDTH, 12);
         assert!(matches!(&panel.rows[1], crate::tui::dialog::Row::Warn(w) if w == "not a commit: ma\u{241b}"));
         let mut s = snap(&REFS, None);
         s.refs_overflow = true;
-        let mut p = Picker::new();
+        let mut p = Picker::open(0);
         p.input = "ma".into();
-        assert_eq!(p.panel(&s, 12).footer, "4 shown, more exist · type to filter");
+        assert_eq!(p.panel(&s, WIDTH, 12).footer, "4 shown, more exist · type to filter");
         let s = snap(&[], None);
-        assert_eq!(Picker::new().panel(&s, 12).footer, "no refs listed; type a revision");
+        assert_eq!(Picker::open(0).panel(&s, WIDTH, 12).footer, "no refs listed; type a revision");
         let mut s = snap(&REFS, None);
         s.refs = None;
-        assert_eq!(Picker::new().panel(&s, 12).footer, "no refs listed; type a revision");
-        let mut p = Picker::new();
+        assert_eq!(Picker::open(0).panel(&s, WIDTH, 12).footer, "no refs listed; type a revision");
+        let mut p = Picker::open(0);
         p.pending = Some(0);
-        assert_eq!(p.panel(&snap(&REFS, None), 12).footer, "picking…");
+        assert_eq!(p.panel(&snap(&REFS, None), WIDTH, 12).footer, "picking…");
+    }
+
+    #[test]
+    fn every_panel_row_is_one_line_at_any_width() {
+        let s = snap(&REFS, None);
+        let mut p = Picker::open(0);
+        p.input = "a".repeat(70);
+        p.error = Some("not a commit: ".to_string() + &"b".repeat(70));
+        for width in [40u16, 48, 60] {
+            let panel = p.panel(&s, width, 10);
+            assert_eq!(crate::tui::dialog::line_count(&panel, width), panel.rows.len(), "width {width}");
+            assert_eq!(panel.rows.len(), 2 + p.visible(10).min(p.rows(&s).len()));
+        }
+    }
+
+    #[test]
+    fn the_list_counts_only_once_this_opening_is_answered_and_the_cursor_follows_it() {
+        let mut s = snap(&REFS, None);
+        s.refs_seq = 3;
+        let mut p = Picker::open(3);
+        assert!(p.refs(&s).is_empty(), "the previous opening's list is not shown");
+        assert_eq!(labels(&p.rows(&s)), ["default (main)"]);
+        assert_eq!(p.panel(&s, WIDTH, 12).footer, "loading refs…");
+        p.input = "ma".into();
+        p.retarget(&s);
+        assert_eq!(p.cursor, 1, "the typed row while the list is empty");
+        s.refs_seq = 4;
+        p.observe(&s);
+        assert_eq!(p.refs(&s).len(), REFS.len());
+        assert_eq!(p.cursor, 2, "the first match once the list arrived");
+        p.error = Some("kept".into());
+        s.refs_seq = 5;
+        p.observe(&s);
+        assert_eq!(p.error.as_deref(), Some("kept"), "a new list does not clear an error");
     }
 
     #[test]
     fn the_reply_closes_the_picker_or_shows_the_error() {
         let mut s = snap(&REFS, None);
-        let mut p = Picker::new();
+        let mut p = Picker::open(0);
         p.pending = Some(s.pick_seq);
         p.observe(&s);
         assert!(p.pending.is_some() && !p.done, "no answer yet");
@@ -2686,6 +2817,10 @@ mod tests {
         snap.repo = RepoState::Repo { toplevel: "/r".into(), branch: Some("feat".into()), worktree: None };
         assert_eq!(handle_key(&mut st, &snap, key("B"), 120), Outcome::Engine(Command::LoadRefs));
         assert!(st.picker.is_some());
+        assert!(st.picker.as_ref().unwrap().refs(&snap).is_empty(), "a list from before this opening is not shown");
+        snap.refs_seq += 1; // the engine answers this opening's LoadRefs
+        st.observe(&snap);
+        assert_eq!(st.picker.as_ref().unwrap().refs(&snap).len(), 3);
         // Body keys are inert while the picker is open; `j` and `?` are text.
         assert_eq!(handle_key(&mut st, &snap, key("j"), 120), Outcome::Redraw);
         assert_eq!(st.picker.as_ref().unwrap().input, "j");
@@ -2720,8 +2855,10 @@ mod tests {
         snap.pick_seq += 1;
         snap.pick_error = None;
         snap.scope = Scope::Branch;
+        snap.base_error = Some("pick not remembered: no state directory".into());
         st.observe(&snap);
         assert!(st.picker.is_none());
+        assert_eq!(st.notice.as_deref(), Some("pick not remembered: no state directory"), "the warning survives the picker closing");
         // Esc closes without a change; Ctrl+C still quits; the popup's Esc stays with the picker.
         handle_key(&mut st, &snap, key("B"), 120);
         st.popup = true;
@@ -2740,6 +2877,8 @@ mod tests {
         snap.default_base = Some("refs/heads/b00".into());
         snap.repo = RepoState::Repo { toplevel: "/r".into(), branch: Some("b00".into()), worktree: None };
         handle_key(&mut st, &snap, key("B"), 120);
+        snap.refs_seq += 1;
+        st.observe(&snap);
         let rendered = render(&snap, &st, 120, 24);
         let hit = rendered.hits.iter().find(|h| matches!(h.action, Action::PickRow(2))).expect("row hit");
         let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: hit.x0, row: hit.y, modifiers: KeyModifiers::NONE };
@@ -2766,10 +2905,11 @@ mod tests {
         snap.refs = Some(std::sync::Arc::new(vec!["refs/heads/main".into()]));
         snap.default_base = Some("refs/heads/main".into());
         snap.repo = RepoState::Repo { toplevel: "/r".into(), branch: Some("main".into()), worktree: None };
+        snap.refs_seq = 1;
         let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
         st.resize(120, 20);
         st.reconcile(&snap);
-        st.picker = Some(crate::tui::picker::Picker::new());
+        st.picker = Some(crate::tui::picker::Picker::open(0));
         let r = render(&snap, &st, 120, 24);
         let text = r.plain();
         assert!(text[1].contains("Compare against"), "{}", text[1]);
@@ -2836,11 +2976,28 @@ pub struct Picker {
     pub pending: Option<u64>,
     /// Set when the answer was a success: the shell drops the picker.
     pub done: bool,
+    /// `refs_seq` at opening: the list is this opening's only once the engine answered its `LoadRefs`.
+    pub refs_after: u64,
+    /// The last `refs_seq` the cursor was placed for.
+    pub seen_refs_seq: u64,
 }
 
 impl Picker {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn open(refs_seq: u64) -> Self {
+        Self {
+            refs_after: refs_seq,
+            seen_refs_seq: refs_seq,
+            ..Self::default()
+        }
+    }
+
+    /// The candidates of this opening; empty until `LoadRefs` is answered, so a stale list is never shown.
+    pub fn refs<'a>(&self, snapshot: &'a Snapshot) -> &'a [String] {
+        if snapshot.refs_seq > self.refs_after {
+            snapshot.refs.as_deref().map(Vec::as_slice).unwrap_or(&[])
+        } else {
+            &[]
+        }
     }
 
     pub fn rows(&self, snapshot: &Snapshot) -> Vec<PickerRow> {
@@ -2850,7 +3007,7 @@ impl Picker {
             .map(ref_label)
             .unwrap_or("none");
         let mut rows = vec![PickerRow::Reset(format!("default ({default_label})"))];
-        let refs: &[String] = snapshot.refs.as_deref().map(Vec::as_slice).unwrap_or(&[]);
+        let refs = self.refs(snapshot);
         let listed = refs.iter().any(|r| ref_label(r) == self.input);
         if !self.input.is_empty() && !listed {
             rows.push(PickerRow::Typed(self.input.clone()));
@@ -2915,7 +3072,9 @@ impl Picker {
             .max(self.cursor.saturating_sub(visible - 1))
     }
 
-    pub fn panel(&self, snapshot: &Snapshot, height: u16) -> Panel {
+    /// `width` is the panel's drawn width: the input and error lines are cut to it so
+    /// `dialog::render` never wraps them, and every row is exactly one line.
+    pub fn panel(&self, snapshot: &Snapshot, width: u16, height: u16) -> Panel {
         let rows = self.rows(snapshot);
         let listed = rows
             .iter()
@@ -2923,19 +3082,20 @@ impl Picker {
             .count();
         let footer = if self.pending.is_some() {
             "picking…".to_string()
-        } else if snapshot.refs.as_ref().is_none_or(|r| r.is_empty()) {
+        } else if snapshot.refs_seq <= self.refs_after {
+            "loading refs…".to_string()
+        } else if self.refs(snapshot).is_empty() {
             "no refs listed; type a revision".to_string()
         } else if snapshot.refs_overflow {
             format!("{listed} shown, more exist · type to filter")
         } else {
             "Enter pick · Esc cancel · type to filter".to_string()
         };
-        let mut panel_rows = vec![Row::Text(truncate(
-            &format!("> {}_", self.input),
-            usize::from(WIDTH) - 6,
-        ))];
+        // Two frame columns and the two-space indent of a note row.
+        let line = usize::from(width).saturating_sub(4).max(1);
+        let mut panel_rows = vec![Row::Text(truncate(&format!("> {}_", self.input), line))];
         if let Some(error) = &self.error {
-            panel_rows.push(Row::Warn(sanitize(error)));
+            panel_rows.push(Row::Warn(truncate(&sanitize(error), line)));
         }
         let head = panel_rows.len();
         let visible = self.visible(height);
@@ -2977,20 +3137,31 @@ impl Picker {
         true
     }
 
-    /// After an edit: the first match, else the typed row.
+    /// After an edit: the reset row for an empty input, else the first match, else the typed row.
     pub fn retarget(&mut self, snapshot: &Snapshot) {
-        let rows = self.rows(snapshot);
-        self.cursor = rows
-            .iter()
-            .position(|r| matches!(r, PickerRow::Ref { .. }))
-            .or_else(|| rows.iter().position(|r| matches!(r, PickerRow::Typed(_))))
-            .unwrap_or(0);
-        self.offset = 0;
+        self.follow_input(snapshot);
         self.error = None;
     }
 
-    /// The engine's answer to the pending `SetBase`.
+    fn follow_input(&mut self, snapshot: &Snapshot) {
+        let rows = self.rows(snapshot);
+        self.cursor = if self.input.is_empty() {
+            0
+        } else {
+            rows.iter()
+                .position(|r| matches!(r, PickerRow::Ref { .. }))
+                .or_else(|| rows.iter().position(|r| matches!(r, PickerRow::Typed(_))))
+                .unwrap_or(0)
+        };
+        self.offset = 0;
+    }
+
+    /// The engine's answers: a new ref list re-places the cursor; the pending `SetBase` closes or errs.
     pub fn observe(&mut self, snapshot: &Snapshot) {
+        if snapshot.refs_seq != self.seen_refs_seq {
+            self.seen_refs_seq = snapshot.refs_seq;
+            self.follow_input(snapshot);
+        }
         if let Some(sent) = self.pending {
             if snapshot.pick_seq > sent {
                 self.pending = None;
@@ -3004,7 +3175,7 @@ impl Picker {
 }
 ```
 
-Add `pub mod picker;` to `src/tui/mod.rs`. (`Option::is_none_or` is stable since Rust 1.82; the toolchain is 1.88.)
+
 
 - [ ] **Step 4: Keys, state, view and input**
 
@@ -3023,16 +3194,18 @@ Add `pub mod picker;` to `src/tui/mod.rs`. (`Option::is_none_or` is stable since
 
 ```rust
     pub fn observe(&mut self, snapshot: &Snapshot) {
-        if snapshot.base_error != self.seen_base_error {
-            self.seen_base_error = snapshot.base_error.clone();
-            if let (Some(error), None) = (&snapshot.base_error, &self.picker) {
-                self.notice = Some(crate::tui::sanitize::sanitize(error));
-            }
-        }
+        // The picker first: a successful pick closes it, and the same snapshot may carry
+        // `pick not remembered`, which must then reach the notice line.
         if let Some(picker) = &mut self.picker {
             picker.observe(snapshot);
             if picker.done {
                 self.picker = None;
+            }
+        }
+        if snapshot.base_error != self.seen_base_error {
+            self.seen_base_error = snapshot.base_error.clone();
+            if let (Some(error), None) = (&snapshot.base_error, &self.picker) {
+                self.notice = Some(crate::tui::sanitize::sanitize(error));
             }
         }
     }
@@ -3048,7 +3221,7 @@ Add `pub mod picker;` to `src/tui/mod.rs`. (`Option::is_none_or` is stable since
         let panel_width = columns.min(picker::WIDTH);
         let panel_height = height.saturating_sub(2);
         let x = usize::from((columns - panel_width) / 2);
-        let panel = picker.panel(snapshot, panel_height);
+        let panel = picker.panel(snapshot, panel_width, panel_height);
         for (y, overlay) in dialog::render(&panel, panel_width, panel_height)
             .into_iter()
             .enumerate()
@@ -3061,7 +3234,7 @@ Add `pub mod picker;` to `src/tui/mod.rs`. (`Option::is_none_or` is stable since
             lines[y + 1] = line;
         }
         hits.clear();
-        // One hit per drawn list row: the first list row sits under the input (and error) line.
+        // One hit per drawn list row: every panel row is one line, so row i is overlay line i + 1.
         let head = panel.rows.iter().take_while(|r| !matches!(r, dialog::Row::Entry { .. })).count();
         let first = picker.window(picker.visible(panel_height));
         let listed = panel.rows.len() - head;
@@ -3087,7 +3260,7 @@ Import `picker` in the module's `use crate::tui::{dialog, keys, layout, picker};
     }
 ```
 
-- In `act`, add `PickBase => { state.picker = Some(crate::tui::picker::Picker::new()); return Outcome::Engine(Command::LoadRefs); }`.
+- In `act`, add `PickBase => { state.picker = Some(crate::tui::picker::Picker::open(snapshot.refs_seq)); return Outcome::Engine(Command::LoadRefs); }`.
 - Add:
 
 ```rust
@@ -3189,7 +3362,7 @@ Expected: PASS. `every_binding_is_reachable_on_the_key_sheet_in_a_short_terminal
 
 - [ ] **Step 6: Verify**
 
-Run: `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo check --locked --no-default-features && scripts/port-check.sh`
+Run: `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo check --locked --no-default-features && scripts/port-check.sh "$VIMEFLOW" && sh scripts/port-check-selftest.sh "$VIMEFLOW"`
 Expected: all pass.
 
 - [ ] **Step 7: Commit (orchestrator)**
@@ -3356,18 +3529,23 @@ In `tests/e2e_real_herdr.rs`, `open_split_creates_one_viewer_and_reuses_it`, rig
         git(&["commit", "-q", "-m", "c"]);
 ```
 
-After the viewer has opened and been asserted once (the `wait_for("one viewer pane", ..)` and the `viewer_id` binding), press `b` through the host and wait for the branch chip and the committed row:
+After the viewer has opened and been asserted once (the `wait_for("one viewer pane", ..)` and the `viewer_id` binding), wait until the first rows are on screen (the toolbar's file stepper names `a.txt`, which means the first refresh, base resolution included, has been published), press `b`, wait for the branch chip, then step to the committed row with `n` (the files panel is hidden in a narrow split, so the stepper is what shows the name):
 
 ```rust
+        iso.herdr(&[
+            "pane", "wait-output", &viewer_id, "--match", "a.txt", "--source", "visible", "--timeout", "15000",
+        ]);
         iso.herdr(&["pane", "send-text", &viewer_id, "b"]);
         iso.herdr(&[
             "pane", "wait-output", &viewer_id, "--match", "vs main", "--source", "visible", "--timeout", "15000",
         ]);
-        let screen = iso.herdr(&["pane", "read", &viewer_id, "--source", "visible"]).to_string();
-        assert!(screen.contains("c.txt"), "the committed row is missing in branch scope: {screen}");
+        iso.herdr(&["pane", "send-text", &viewer_id, "n"]);
+        iso.herdr(&[
+            "pane", "wait-output", &viewer_id, "--match", "c.txt", "--source", "visible", "--timeout", "15000",
+        ]);
 ```
 
-(`iso.herdr` asserts the command's success and returns its JSON, so a timed-out `wait-output` fails the test.) The rest of the test is unchanged; it still runs against both hosts as `docs/acceptance-p1.md` describes.
+(`iso.herdr` asserts the command's success and returns its JSON, so a timed-out `wait-output` fails the test. In branch scope the rows are `a.txt` and `c.txt`, so one `n` from `a.txt` selects the committed file.) The rest of the test is unchanged; it still runs against both hosts as `docs/acceptance-p1.md` describes.
 
 Run: `cargo build --release && HERDR_BIN_PATH=<host> cargo test --test e2e_real_herdr -- --ignored --nocapture` once for each host the acceptance document names (the orchestrator does this; the implementer runs `cargo test --test e2e_real_herdr` to confirm it still compiles and stays ignored).
 
@@ -3455,7 +3633,7 @@ Set `version = "0.1.0"` in `Cargo.toml` and `herdr-plugin.toml`, then run `cargo
 
 - [ ] **Step 7: Verify**
 
-Run: `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo check --locked --no-default-features && scripts/port-check.sh && cargo build --release --locked`
+Run: `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo check --locked --no-default-features && scripts/port-check.sh "$VIMEFLOW" && sh scripts/port-check-selftest.sh "$VIMEFLOW" && cargo build --release --locked`
 Expected: all pass; `cargo test --locked` accepts the refreshed `Cargo.lock`.
 
 - [ ] **Step 8: Commit (orchestrator)**
@@ -3472,7 +3650,7 @@ git commit -m "docs: branch scope, acceptance rows 6 and 7, version 0.1.0"
 - 7.1: two scopes, rows per scope, no staged half in branch scope: Tasks 3 (rows), 4 (label hidden).
 - 7.2: pinned merge-base (Task 3 `load_rows`), the three row commands and the mapping of status letters (`status_of`), `rename_sources`, numstat keyed by new path, untracked rows appended, deleted-and-recreated as two keys (Task 1 `FileKey.untracked`, Task 3 sort and test), per-row diff argv with `--src-prefix`/`--dst-prefix`, section isolation with decoded quoted headers, type changes concatenated (`sections` + `parse_git_diff` per section), untracked rows through `get_git_diff_inner` (`untracked_diff`), `Comparison` on every diff and result, generation bump, publication rule (`Loaded` published whole; failures keep the snapshot), selection on a scope switch (unstaged row preferred), corner cases (same branch as base: `merge-base` of `HEAD` and itself; detached `HEAD`: `HEAD` is a commit; unrelated histories: `merge_base` fails into `status_error`/`pick_error`).
 - 7.3: resolution order and validation (Task 2 `resolve`, `verify`, `check_text`), fully qualified defaults, free text as written, `bases.json` under `with_lock` with atomic rename, session override (`inputs.session_pick`, Task 3), reset row semantics (`Pick(None)`), ids re-verified every refresh in branch scope only, preference re-resolved at start, on `r`, on a pick and on a branch-name change (`branch_changed`).
-- 7.4: `b`, `B`, chip text and truncation, disabled chip, hover hint, drop order 2/3, hidden staged label (Task 4); the picker's rows, reset row, typed row, filtering, ordering, markers, keys, mouse, cap and overflow, `LoadRefs` on open, error under the input, pick on Enter with `SetBase`, modality (Task 5; `hits.clear()` under the overlay).
+- 7.4: `b`, `B`, chip text and truncation, disabled chip, hover hint, drop order 2/3, hidden staged label (Task 4); the picker's rows, reset row, typed row, filtering, ordering, markers, keys, mouse, cap and overflow, `LoadRefs` on open with the list discarded on close (`refs_seq`/`refs_after`), error under the input, pick on Enter with `SetBase`, modality (Task 5; `hits.clear()` under the overlay); line reconciliation across a scope switch (Task 4, `reconcile`).
 - 7.5: one spawned task per refresh (`run_job`), triggers unchanged, cost as stated.
 - 7.6: allow-list of ten (Task 1), G7 drive and state-directory assertion (Task 6).
 - 7.7: D6 patch and K7 (Task 1), Phase 2 keys stay unbound in both scopes (Task 4 test), version 0.1.0 (Task 6).
@@ -3481,4 +3659,4 @@ git commit -m "docs: branch scope, acceptance rows 6 and 7, version 0.1.0"
 
 Resolved ambiguity: 7.4's prose "dropped before the view chip" versus its numbers (scope 2, view 3, higher drops first). The plan follows the numbers; the prose should be corrected with the plan-review findings.
 
-Type consistency: `FileKey::of`, `ref_label`, `Comparison`, `NO_BASE_NOTICE`, `base::{check_text, verify, merge_base, resolve, ResolveInputs, load_picks, save_pick, note_problem, list_refs, REFS_CAP}`, `branch::{parse_name_status, rows, split_header, keep_sections, diff, untracked_diff}`, `Snapshot.{scope, base, base_error, default_base, rename_sources, refs, refs_overflow, pick_seq, pick_error}`, `Command::{SetScope, SetBase, LoadRefs}`, `KeyAction::{ToggleScope, PickBase}`, `Action::{ToggleScope, PickRow}`, `ViewState::{observe, picker}`, `Picker::{new, rows, visible, panel, move_by, retarget, observe}`, `Config.{scope, base}`, `SessionConfig.{scope, base_ref, state_dir}` are the names used throughout.
+Type consistency: `FileKey::of`, `ref_label`, `Comparison`, `NO_BASE_NOTICE`, `base::{check_text, verify, merge_base, resolve, ResolveInputs, load_picks, save_pick, note_problem, list_refs, REFS_CAP}`, `branch::{parse_name_status, rows, split_header, keep_sections, diff, untracked_diff}`, `Snapshot.{scope, base, base_error, default_base, rename_sources, refs, refs_overflow, refs_seq, pick_seq, pick_error}`, `Command::{SetScope, SetBase, LoadRefs}`, `KeyAction::{ToggleScope, PickBase}`, `Action::{ToggleScope, PickRow}`, `ViewState::{observe, picker}`, `Picker::{open, refs, rows, visible, window, panel, move_by, retarget, observe}`, `Config.{scope, base}`, `SessionConfig.{scope, base_ref, state_dir}` are the names used throughout.
