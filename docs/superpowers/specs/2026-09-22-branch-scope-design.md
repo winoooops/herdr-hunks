@@ -299,9 +299,9 @@ cells with the ellipsis of 4.2. Clicking it acts like `b`. It is drawn
 disabled (dim, no hit region, 4.4) when `base` is `None`, and its hover hint is
 `switch scope · b`. In branch scope the `STAGED`/`UNSTAGED` label is not
 drawn, because the rows have no such half; the file stepper, hunk stepper,
-stats, `files` and refresh chips are unchanged. The chip is dropped before the
-view chip when the toolbar is narrow (4.2's drop order: it takes drop order
-2, the view chip moves to 3).
+stats, `files` and refresh chips are unchanged. The chip sits left of the view
+chip and outlives it when the toolbar is narrow (4.2's drop order, where the
+highest number drops first: it takes drop order 2, the view chip moves to 3).
 
 The picker (`B`) is modelled on lazygit's diffing prompt (`W` / `ctrl+e`,
 "Enter ref to diff"): one input line that both filters a list and accepts
