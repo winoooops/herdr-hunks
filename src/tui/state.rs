@@ -23,6 +23,9 @@ pub struct ViewState {
     pub hover: Option<(u16, u16)>,
     pub popup: bool,
     pub help_open: bool,
+    pub picker: Option<crate::tui::picker::Picker>,
+    /// Last submitted pick's reply sequence, retained when the picker closes.
+    pub submitted_pick_seq: u64,
     pub notice: Option<String>,
     pub rows: Option<Rows>,
     pub body_height: u16,
@@ -48,6 +51,8 @@ impl ViewState {
             hover: None,
             popup: false,
             help_open: false,
+            picker: None,
+            submitted_pick_seq: 0,
             notice: None,
             rows: None,
             body_height: 0,
@@ -123,9 +128,16 @@ impl ViewState {
 
     /// Called once per snapshot the shell receives, before the next frame.
     pub fn observe(&mut self, snapshot: &Snapshot) {
+        // Close the picker before showing any warning from the same reply.
+        if let Some(picker) = &mut self.picker {
+            picker.observe(snapshot);
+            if picker.done {
+                self.picker = None;
+            }
+        }
         if snapshot.base_error != self.seen_base_error {
             self.seen_base_error = snapshot.base_error.clone();
-            if let Some(error) = &snapshot.base_error {
+            if let (Some(error), None) = (&snapshot.base_error, &self.picker) {
                 self.notice = Some(crate::tui::sanitize::sanitize(error));
             }
         }

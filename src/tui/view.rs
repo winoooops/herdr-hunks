@@ -7,7 +7,7 @@ use crate::tui::rows::Row;
 use crate::tui::sanitize::sanitize;
 use crate::tui::state::{FilesPanel, ViewState};
 use crate::tui::style::{Line, Role, Semantic, Span, Style};
-use crate::tui::{dialog, keys, layout};
+use crate::tui::{dialog, keys, layout, picker};
 
 pub const FILES_WIDTH: u16 = 18;
 pub const MIN_SPLIT_WIDTH: u16 = 100;
@@ -24,6 +24,7 @@ pub enum Action {
     Refresh,
     SelectFile(usize),
     CursorToRow(usize),
+    PickRow(usize),
 }
 
 impl Action {
@@ -38,7 +39,7 @@ impl Action {
             Self::ToggleView => KeyAction::ToggleView,
             Self::ToggleFiles => KeyAction::ToggleFiles,
             Self::Refresh => KeyAction::Refresh,
-            Self::SelectFile(_) | Self::CursorToRow(_) => return None,
+            Self::SelectFile(_) | Self::CursorToRow(_) | Self::PickRow(_) => return None,
         })
     }
 }
@@ -54,6 +55,7 @@ impl Hit {
     fn hovered(&self, state: &ViewState) -> bool {
         state.mouse_requested
             && !state.help_open
+            && state.picker.is_none()
             && state
                 .hover
                 .is_some_and(|(x, y)| self.y == y && x >= self.x0 && x < self.x1)
@@ -656,6 +658,40 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
             lines[y + 1] = line;
         }
         hits.clear();
+    }
+    if let Some(picker) = &state.picker {
+        let panel_width = columns.min(picker::WIDTH);
+        let panel_height = height.saturating_sub(2);
+        let x = usize::from((columns - panel_width) / 2);
+        let panel = picker.panel(snapshot, panel_width, panel_height);
+        for (y, overlay) in dialog::render(&panel, panel_width, panel_height)
+            .into_iter()
+            .enumerate()
+        {
+            let background = &lines[y + 1];
+            let mut line = clip_line(background, 0, x);
+            line.extend(overlay);
+            let right = x + usize::from(panel_width);
+            line.extend(clip_line(background, right, usize::from(columns) - right));
+            lines[y + 1] = line;
+        }
+        hits.clear();
+        // One hit per drawn list row: every panel row is one line, so row i is overlay line i + 1.
+        let head = panel
+            .rows
+            .iter()
+            .take_while(|r| !matches!(r, dialog::Row::Entry { .. }))
+            .count();
+        let first = picker.window(picker.visible(panel_height));
+        let listed = panel.rows.len() - head;
+        for i in 0..listed {
+            hits.push(Hit {
+                y: (2 + head + i) as u16,
+                x0: x as u16,
+                x1: (x + usize::from(panel_width)) as u16,
+                action: Action::PickRow(first + i),
+            });
+        }
     }
     Rendered { lines, hits }
 }
@@ -1366,5 +1402,40 @@ mod tests {
             width -= 4;
         }
         assert!(saw_scope_without_view);
+    }
+
+    #[test]
+    fn the_picker_overlays_the_body_and_clears_other_hits() {
+        use crate::engine::RepoState;
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        snap.refs = Some(std::sync::Arc::new(vec!["refs/heads/main".into()]));
+        snap.default_base = Some("refs/heads/main".into());
+        snap.repo = RepoState::Repo {
+            toplevel: "/r".into(),
+            branch: Some("main".into()),
+            worktree: None,
+        };
+        snap.refs_seq = 1;
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        st.picker = Some(crate::tui::picker::Picker::open(0));
+        let r = render(&snap, &st, 120, 24);
+        let text = r.plain();
+        assert!(text[1].contains("Compare against"), "{}", text[1]);
+        assert!(text[2].contains("> _"), "{}", text[2]);
+        assert!(text[3].contains("default (main)"), "{}", text[3]);
+        assert!(
+            text[4].contains("main") && text[4].contains("current"),
+            "{}",
+            text[4]
+        );
+        assert!(r
+            .hits
+            .iter()
+            .all(|h| matches!(h.action, Action::PickRow(_))));
+        assert_eq!(r.hits.len(), 2);
+        assert_eq!(r.hits[0].y, 3);
+        assert_eq!(text.len(), 24);
     }
 }

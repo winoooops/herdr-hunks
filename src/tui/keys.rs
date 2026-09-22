@@ -20,6 +20,7 @@ pub enum KeyAction {
     PinFiles,
     Refresh,
     ToggleScope,
+    PickBase,
     First,
     Last,
     ScrollLeft,
@@ -129,6 +130,12 @@ pub const KEYS: &[Binding] = &[
         key: "b",
         label: "switch scope",
         action: KeyAction::ToggleScope,
+        vimeflow: None,
+    },
+    Binding {
+        key: "B",
+        label: "compare against",
+        action: KeyAction::PickBase,
         vimeflow: None,
     },
     Binding {
@@ -262,12 +269,16 @@ mod tests {
                 assert_eq!(lookup(&KeyEvent::new(code, modifiers)), None);
             }
         }
-        assert_eq!(KEYS.len(), 22);
-        assert_eq!(help_panel(false).rows.len(), 22);
+        assert_eq!(KEYS.len(), 23);
+        assert_eq!(help_panel(false).rows.len(), 23);
     }
 
     #[test]
     fn modifiers_preserve_uppercase_and_keep_unbound_combinations_inert() {
+        assert_eq!(
+            lookup(&KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT)),
+            Some(KeyAction::PickBase)
+        );
         assert_eq!(
             lookup(&KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
             Some(KeyAction::ToggleScope)

@@ -67,6 +67,9 @@ pub fn handle_key(
             _ => Outcome::Inert,
         };
     }
+    if state.picker.is_some() {
+        return picker_key(state, snapshot, key);
+    }
     if state.popup && key.code == KeyCode::Esc && key.modifiers.is_empty() {
         return Outcome::Quit;
     }
@@ -74,6 +77,80 @@ pub fn handle_key(
         Some(action) => apply_action(state, snapshot, action, width),
         None => Outcome::Inert,
     }
+}
+
+fn picker_key(state: &mut ViewState, snapshot: &Snapshot, key: KeyEvent) -> Outcome {
+    let visible = state
+        .picker
+        .as_ref()
+        .map(|p| {
+            p.visible(
+                state
+                    .body_height
+                    .saturating_add(u16::from(view::notice(state, snapshot).is_some())),
+            )
+        })
+        .unwrap_or(1);
+    let Some(picker) = state.picker.as_mut() else {
+        return Outcome::Inert;
+    };
+    let rows = picker.rows(snapshot);
+    let moved = |picker: &mut crate::tui::picker::Picker, delta: isize| {
+        if picker.move_by(delta, rows.len(), visible) {
+            Outcome::Redraw
+        } else {
+            Outcome::Inert
+        }
+    };
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, KeyModifiers::NONE) => {
+            state.picker = None;
+            Outcome::Redraw
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => {
+            let index = picker.cursor;
+            pick_row(state, snapshot, index)
+        }
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            moved(picker, 1)
+        }
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            moved(picker, -1)
+        }
+        (KeyCode::Backspace, KeyModifiers::NONE) => {
+            if picker.input.pop().is_some() {
+                picker.retarget(snapshot);
+                Outcome::Redraw
+            } else {
+                Outcome::Inert
+            }
+        }
+        (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) if !ch.is_control() => {
+            picker.input.push(ch);
+            picker.retarget(snapshot);
+            Outcome::Redraw
+        }
+        _ => Outcome::Inert,
+    }
+}
+
+fn pick_row(state: &mut ViewState, snapshot: &Snapshot, index: usize) -> Outcome {
+    let Some(picker) = state.picker.as_mut() else {
+        return Outcome::Inert;
+    };
+    if picker.pending.is_some() {
+        return Outcome::Inert;
+    }
+    let rows = picker.rows(snapshot);
+    let Some(row) = rows.get(index) else {
+        return Outcome::Inert;
+    };
+    let sent = snapshot.pick_seq.max(state.submitted_pick_seq);
+    state.submitted_pick_seq = sent + 1;
+    picker.cursor = index;
+    picker.pending = Some(sent);
+    picker.error = None;
+    Outcome::Engine(Command::SetBase(row.submit()))
 }
 
 fn apply_action(
@@ -104,6 +181,10 @@ fn act(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction, width: u16
                 }
                 Some(_) => Outcome::Engine(Command::SetScope(snapshot.scope.other())),
             };
+        }
+        PickBase => {
+            state.picker = Some(crate::tui::picker::Picker::open(snapshot.refs_seq));
+            return Outcome::Engine(Command::LoadRefs);
         }
         FileNext => return Outcome::Engine(Command::SelectNext),
         FilePrev => return Outcome::Engine(Command::SelectPrev),
@@ -272,6 +353,18 @@ pub fn handle_mouse(
         } else {
             -3
         };
+        let overlay = state
+            .body_height
+            .saturating_add(u16::from(view::notice(state, snapshot).is_some()));
+        if let Some(picker) = state.picker.as_mut() {
+            let visible = picker.visible(overlay);
+            let len = picker.rows(snapshot).len();
+            return if picker.move_by(delta, len, visible) {
+                Outcome::Redraw
+            } else {
+                Outcome::Inert
+            };
+        }
         if state.help_open {
             return scroll_help(state, snapshot, width, delta);
         }
@@ -282,6 +375,12 @@ pub fn handle_mouse(
     }
     if state.help_open || ev.kind != MouseEventKind::Down(MouseButton::Left) {
         return Outcome::Inert;
+    }
+    if state.picker.is_some() {
+        return match rendered.hit(ev.column, ev.row) {
+            Some(Action::PickRow(index)) => pick_row(state, snapshot, *index),
+            _ => Outcome::Inert,
+        };
     }
     let hit = rendered.hit(ev.column, ev.row);
     if let Some(action) = hit.and_then(Action::key_action) {
@@ -1150,5 +1249,358 @@ mod tests {
                 "{reserved} in branch scope"
             );
         }
+    }
+
+    #[test]
+    fn reopening_the_picker_does_not_mistake_an_earlier_pick_reply_for_its_own() {
+        for mouse in [false, true] {
+            let (mut snap, mut st) = setup(&[(1, "+")]);
+            handle_key(&mut st, &snap, key("B"), 120);
+            let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(
+                handle_key(&mut st, &snap, enter, 120),
+                Outcome::Engine(Command::SetBase(None))
+            );
+            handle_key(
+                &mut st,
+                &snap,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                120,
+            );
+            handle_key(&mut st, &snap, key("B"), 120);
+            let picker = st.picker.as_mut().unwrap();
+            picker.input = "second".into();
+            picker.retarget(&snap);
+            let outcome = if mouse {
+                let rendered = render(&snap, &st, 120, 24);
+                let hit = rendered
+                    .hits
+                    .iter()
+                    .find(|hit| hit.action == Action::PickRow(1))
+                    .unwrap();
+                handle_mouse(
+                    &mut st,
+                    &snap,
+                    &rendered,
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: hit.x0,
+                        row: hit.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                )
+            } else {
+                handle_key(&mut st, &snap, enter, 120)
+            };
+            assert_eq!(
+                outcome,
+                Outcome::Engine(Command::SetBase(Some("second".into())))
+            );
+            snap.pick_seq = 1;
+            st.observe(&snap);
+            assert!(
+                st.picker.as_ref().is_some_and(|p| p.pending.is_some()),
+                "the first pick's success must not close the second picker"
+            );
+            snap.pick_seq = 2;
+            snap.pick_error = Some("not a commit: second".into());
+            st.observe(&snap);
+            let picker = st.picker.as_ref().unwrap();
+            assert!(picker.pending.is_none());
+            assert_eq!(picker.error.as_deref(), Some("not a commit: second"));
+            assert_eq!(
+                handle_key(&mut st, &snap, enter, 120),
+                Outcome::Engine(Command::SetBase(Some("second".into())))
+            );
+            snap.pick_seq = 3;
+            snap.pick_error = None;
+            st.observe(&snap);
+            assert!(st.picker.is_none());
+        }
+    }
+
+    #[test]
+    fn unbound_modifiers_do_not_edit_submit_or_close_the_picker() {
+        let (snap, mut st) = setup(&[(1, "+")]);
+        handle_key(&mut st, &snap, key("B"), 120);
+        st.picker.as_mut().unwrap().input = "kept".into();
+        for modifiers in [
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::HYPER,
+            KeyModifiers::META,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            for code in [
+                KeyCode::Char('n'),
+                KeyCode::Char('p'),
+                KeyCode::Enter,
+                KeyCode::Esc,
+                KeyCode::Backspace,
+            ] {
+                assert_eq!(
+                    handle_key(&mut st, &snap, KeyEvent::new(code, modifiers), 120),
+                    Outcome::Inert,
+                    "{code:?} {modifiers:?}"
+                );
+            }
+        }
+        for code in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Backspace,
+        ] {
+            assert_eq!(
+                handle_key(
+                    &mut st,
+                    &snap,
+                    KeyEvent::new(code, KeyModifiers::SHIFT),
+                    120
+                ),
+                Outcome::Inert,
+                "shift {code:?}"
+            );
+        }
+        assert_eq!(st.picker.as_ref().unwrap().input, "kept");
+        assert!(st.picker.as_ref().unwrap().pending.is_none());
+        assert_eq!(
+            handle_key(
+                &mut st,
+                &snap,
+                KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT),
+                120
+            ),
+            Outcome::Redraw
+        );
+        assert_eq!(st.picker.as_ref().unwrap().input, "keptZ");
+    }
+
+    #[test]
+    fn capital_b_opens_the_picker_and_picker_keys_edit_move_pick_and_close() {
+        use crate::engine::{RepoState, Scope};
+        use crate::tui::picker::PickerRow;
+        let (mut snap, mut st) = setup(&[(1, "+")]);
+        snap.refs = Some(std::sync::Arc::new(vec![
+            "refs/heads/main".into(),
+            "refs/heads/feat".into(),
+            "refs/tags/v1".into(),
+        ]));
+        snap.default_base = Some("refs/heads/main".into());
+        snap.repo = RepoState::Repo {
+            toplevel: "/r".into(),
+            branch: Some("feat".into()),
+            worktree: None,
+        };
+        assert_eq!(
+            handle_key(&mut st, &snap, key("B"), 120),
+            Outcome::Engine(Command::LoadRefs)
+        );
+        assert!(st.picker.is_some());
+        assert!(
+            st.picker.as_ref().unwrap().refs(&snap).is_empty(),
+            "a list from before this opening is not shown"
+        );
+        snap.refs_seq += 1; // the engine answers this opening's LoadRefs
+        st.observe(&snap);
+        assert_eq!(st.picker.as_ref().unwrap().refs(&snap).len(), 3);
+        // Body keys are inert while the picker is open; `j` and `?` are text.
+        assert_eq!(handle_key(&mut st, &snap, key("j"), 120), Outcome::Redraw);
+        assert_eq!(st.picker.as_ref().unwrap().input, "j");
+        assert_eq!(
+            handle_key(
+                &mut st,
+                &snap,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                120
+            ),
+            Outcome::Redraw
+        );
+        assert_eq!(
+            handle_key(
+                &mut st,
+                &snap,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                120
+            ),
+            Outcome::Inert
+        );
+        assert_eq!(handle_key(&mut st, &snap, key("?"), 120), Outcome::Redraw);
+        assert!(!st.help_open);
+        assert_eq!(
+            handle_key(
+                &mut st,
+                &snap,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                120
+            ),
+            Outcome::Redraw
+        );
+        assert_eq!(
+            handle_key(
+                &mut st,
+                &snap,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                120
+            ),
+            Outcome::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut st, &snap, key("ctrl+n"), 120),
+            Outcome::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut st, &snap, key("ctrl+p"), 120),
+            Outcome::Redraw
+        );
+        assert_eq!(st.picker.as_ref().unwrap().cursor, 1);
+        let rows = st.picker.as_ref().unwrap().rows(&snap);
+        assert!(
+            matches!(&rows[1], PickerRow::Ref { qualified, .. } if qualified == "refs/heads/main")
+        );
+        assert_eq!(
+            handle_key(
+                &mut st,
+                &snap,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                120
+            ),
+            Outcome::Engine(Command::SetBase(Some("refs/heads/main".into())))
+        );
+        assert_eq!(st.picker.as_ref().unwrap().pending, Some(snap.pick_seq));
+        assert_eq!(
+            handle_key(
+                &mut st,
+                &snap,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                120
+            ),
+            Outcome::Inert,
+            "one pick at a time"
+        );
+        // The engine answers: a failure keeps the picker open with the error; a success closes it.
+        snap.pick_seq += 1;
+        snap.pick_error = Some("not a commit: refs/heads/main".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.picker.as_ref().unwrap().error.as_deref(),
+            Some("not a commit: refs/heads/main")
+        );
+        assert_eq!(
+            handle_key(
+                &mut st,
+                &snap,
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                120
+            ),
+            Outcome::Redraw
+        );
+        assert_eq!(
+            handle_key(
+                &mut st,
+                &snap,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                120
+            ),
+            Outcome::Engine(Command::SetBase(None)),
+            "the reset row"
+        );
+        snap.pick_seq += 1;
+        snap.pick_error = None;
+        snap.scope = Scope::Branch;
+        snap.base_error = Some("pick not remembered: no state directory".into());
+        st.observe(&snap);
+        assert!(st.picker.is_none());
+        assert_eq!(
+            st.notice.as_deref(),
+            Some("pick not remembered: no state directory"),
+            "the warning survives the picker closing"
+        );
+        // Esc closes without a change; Ctrl+C still quits; the popup's Esc stays with the picker.
+        handle_key(&mut st, &snap, key("B"), 120);
+        st.popup = true;
+        assert_eq!(
+            handle_key(
+                &mut st,
+                &snap,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                120
+            ),
+            Outcome::Redraw
+        );
+        assert!(st.picker.is_none());
+        assert_eq!(
+            handle_key(
+                &mut st,
+                &snap,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                120
+            ),
+            Outcome::Quit
+        );
+        handle_key(&mut st, &snap, key("B"), 120);
+        assert_eq!(
+            handle_key(&mut st, &snap, key("ctrl+c"), 120),
+            Outcome::Quit
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_picker_row_picks_it_and_the_wheel_moves_the_cursor() {
+        use crate::engine::RepoState;
+        let (mut snap, mut st) = setup(&[(1, "+")]);
+        snap.refs = Some(std::sync::Arc::new(
+            (0..30).map(|i| format!("refs/heads/b{i:02}")).collect(),
+        ));
+        snap.default_base = Some("refs/heads/b00".into());
+        snap.repo = RepoState::Repo {
+            toplevel: "/r".into(),
+            branch: Some("b00".into()),
+            worktree: None,
+        };
+        handle_key(&mut st, &snap, key("B"), 120);
+        snap.refs_seq += 1;
+        st.observe(&snap);
+        let rendered = render(&snap, &st, 120, 24);
+        let hit = rendered
+            .hits
+            .iter()
+            .find(|h| matches!(h.action, Action::PickRow(2)))
+            .expect("row hit");
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x0,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            handle_mouse(&mut st, &snap, &rendered, click),
+            Outcome::Engine(Command::SetBase(Some("refs/heads/b01".into())))
+        );
+        st.picker.as_mut().unwrap().pending = None;
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            handle_mouse(&mut st, &snap, &rendered, wheel),
+            Outcome::Redraw
+        );
+        assert_eq!(st.picker.as_ref().unwrap().cursor, 5);
+        let toolbar = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            handle_mouse(&mut st, &snap, &rendered, toolbar),
+            Outcome::Inert,
+            "toolbar hits are inert under the picker"
+        );
     }
 }
