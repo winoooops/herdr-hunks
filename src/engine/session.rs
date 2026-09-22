@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Semaphore;
 
-use super::{gitver, Command, Comparison, DiffState, FileKey, LoadedDiff, RepoState, Snapshot};
+use super::{
+    gitver, Command, Comparison, DiffState, FileKey, LoadedDiff, RepoState, Scope, Snapshot,
+};
 use crate::git::{self, ChangedFile, GetGitDiffResponse, GitStatusResponse};
 use crate::runtime::EventSink;
 
@@ -19,6 +21,12 @@ pub trait WatcherControl: Send + Sync + 'static {
 }
 
 pub struct SessionConfig {
+    /// `[view] scope`: the scope loaded first; branch falls back to worktree when no base resolves.
+    pub scope: Scope,
+    /// `[base] ref`, step 2 of the resolution order.
+    pub base_ref: Option<String>,
+    /// Where `bases.json` lives; `None` keeps picks for the session only.
+    pub state_dir: Option<PathBuf>,
     pub path: PathBuf,
     pub poll_interval: Duration,
     pub watcher: Arc<dyn WatcherControl>,
@@ -60,6 +68,9 @@ impl WatcherControl for FrozenWatcher {
 impl SessionConfig {
     pub fn production(path: PathBuf) -> Self {
         Self {
+            scope: Scope::Worktree,
+            base_ref: None,
+            state_dir: None,
             path,
             poll_interval: Duration::from_secs(5),
             watcher: Arc::new(FrozenWatcher {
@@ -643,6 +654,9 @@ mod tests {
         let handle = spawn(
             rt.handle(),
             SessionConfig {
+                scope: Scope::Worktree,
+                base_ref: None,
+                state_dir: None,
                 path: dir.to_path_buf(),
                 poll_interval: Duration::from_millis(50),
                 watcher: Arc::new(FlakyWatcher { allow }),
@@ -709,6 +723,9 @@ mod tests {
         let h = spawn(
             rt.handle(),
             SessionConfig {
+                scope: Scope::Worktree,
+                base_ref: None,
+                state_dir: None,
                 path: dir.path().to_path_buf(),
                 poll_interval: Duration::from_secs(3600),
                 watcher: Arc::new(SlowWatcher {
@@ -851,6 +868,9 @@ mod tests {
         let h = spawn(
             rt.handle(),
             SessionConfig {
+                scope: Scope::Worktree,
+                base_ref: None,
+                state_dir: None,
                 path: dir.path().to_path_buf(),
                 poll_interval: Duration::from_secs(3600),
                 watcher: Arc::new(EmittingWatcher { sink: slot.clone() }),
@@ -886,6 +906,9 @@ mod tests {
         let h = spawn(
             rt.handle(),
             SessionConfig {
+                scope: Scope::Worktree,
+                base_ref: None,
+                state_dir: None,
                 path: dir.path().to_path_buf(),
                 poll_interval: Duration::from_millis(50),
                 watcher: Arc::new(FlakyWatcher {
@@ -913,6 +936,9 @@ mod tests {
         let h = spawn(
             rt.handle(),
             SessionConfig {
+                scope: Scope::Worktree,
+                base_ref: None,
+                state_dir: None,
                 path: dir.path().to_path_buf(),
                 poll_interval: Duration::from_secs(3600),
                 watcher: Arc::new(FlakyWatcher {
@@ -1011,6 +1037,9 @@ mod tests {
         let h = spawn(
             rt.handle(),
             SessionConfig {
+                scope: Scope::Worktree,
+                base_ref: None,
+                state_dir: None,
                 path: dir.path().to_path_buf(),
                 poll_interval: Duration::from_secs(3600),
                 watcher: Arc::new(SlowWatcher {
@@ -1055,6 +1084,9 @@ mod tests {
         let h = spawn(
             rt.handle(),
             SessionConfig {
+                scope: Scope::Worktree,
+                base_ref: None,
+                state_dir: None,
                 path: dir.path().to_path_buf(),
                 poll_interval: Duration::from_secs(3600),
                 watcher: Arc::new(SlowWatcher {
@@ -1096,6 +1128,9 @@ mod tests {
         let h = spawn(
             rt.handle(),
             SessionConfig {
+                scope: Scope::Worktree,
+                base_ref: None,
+                state_dir: None,
                 path: dir.path().to_path_buf(),
                 poll_interval: Duration::from_millis(50),
                 watcher: Arc::new(FlakyWatcher {
@@ -1131,6 +1166,9 @@ mod tests {
         let old = spawn(
             rt.handle(),
             SessionConfig {
+                scope: Scope::Worktree,
+                base_ref: None,
+                state_dir: None,
                 path: dir.path().to_path_buf(),
                 poll_interval: Duration::from_millis(50),
                 watcher: Arc::new(FlakyWatcher {
@@ -1161,6 +1199,9 @@ mod tests {
         let h = spawn(
             rt.handle(),
             SessionConfig {
+                scope: Scope::Worktree,
+                base_ref: None,
+                state_dir: None,
                 path: dir.path().to_path_buf(),
                 poll_interval: Duration::from_secs(3600),
                 watcher: Arc::new(FlakyWatcher {
