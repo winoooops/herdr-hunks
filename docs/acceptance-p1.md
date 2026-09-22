@@ -1,4 +1,4 @@
-Status: PENDING
+Status: PASS
 
 # Phase 1 release acceptance
 
@@ -24,9 +24,9 @@ the inotify exhaustion check specifically requires a Linux test host.
 
 ## Evidence
 
-All five rows pass. The first line stays `Status: PENDING` until the owner has tried the dialog
-and the toolbar buttons added after the field test (commit `063982b`) and flips it; that line is
-what lets the release workflow build a tag.
+All five rows pass. The owner confirmed the dialog and the toolbar buttons added after the
+field test (commit `063982b`) on 2026-09-21, which completed the acceptance; the status line
+above is what lets the release workflow build a tag.
 
 - **Row 1.** `cargo test --locked git_diff_response` (16 tests) on 2026-09-20. By hand on
   2026-09-21 the owner staged part of a file with `git add -p`: two rows, one marked `S`, each
@@ -43,7 +43,7 @@ what lets the release workflow build a tag.
   polling in 1.8 s and 5.0 s; `r` retried and kept the notice. The host limit stayed at 384.
 - **Row 4.** One release build, linked into both hosts. Upstream herdr 0.8.0: the owner opened
   it by action and by `prefix+d` in a live session (2026-09-21). Fork `vimeflow 0.8.0`: linked
-  into the live session `pr17-play`, the viewer pane rendered and the `open` action exited 0.
+  into the fork's live session, the viewer pane rendered and the `open` action exited 0.
   After `063982b` the popup `open` was re-run in an isolated session of each host: exit 0, the
   viewer started in the repository with `HERDR_HUNKS_PLACEMENT=popup`, sized 80% of the host,
   and no pane was listed. The ignored Tier B test (`open-split`) passes on both hosts.
