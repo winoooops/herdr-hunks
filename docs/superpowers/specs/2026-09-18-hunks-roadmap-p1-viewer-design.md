@@ -75,7 +75,9 @@ The spec for phase N+1 starts after phase N ships.
 - Visual selection and yank (`v`/`y`) and in-diff search (`/`): scheduled with P3,
   where range selection is first required.
 - Syntax highlighting and word-level intra-line diff: unscheduled enhancements.
-- Base-branch comparison, commit log, branch operations: outside this roadmap.
+- Commit log and branch operations: outside this roadmap. Base-branch
+  comparison was listed here until 0.0.1 shipped; it is now section 7,
+  `2026-09-22-branch-scope-design.md`.
 - Windows. A daemon or any background process.
 
 ### 1.5 Phase 1 success criteria
