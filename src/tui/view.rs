@@ -286,6 +286,11 @@ fn toolbar(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> (Line, V
 }
 
 fn state_message(snapshot: &Snapshot) -> Option<String> {
+    if snapshot.revision == 0 || matches!(snapshot.repo, RepoState::NotARepo { .. }) {
+        if let Some(error) = &snapshot.status_error {
+            return Some(sanitize(error));
+        }
+    }
     if snapshot.revision == 0 {
         return Some("loading…".into());
     }
@@ -1236,5 +1241,33 @@ mod tests {
             assert!(!visible.windows(2).any(|v| !v[0] && v[1]));
             assert!(r.hits.iter().all(|h| h.x1 <= columns));
         }
+    }
+
+    #[test]
+    fn startup_status_errors_replace_loading_and_not_a_repository() {
+        let state = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        for revision in [0, 1] {
+            let mut snap = Snapshot::empty("/repo");
+            snap.revision = revision;
+            snap.status_error = Some("cannot spawn git: missing\x1b[31m".into());
+            let rendered = render(&snap, &state, 80, 12);
+            let lines = rendered.plain();
+            let expected = "cannot spawn git: missing\u{241b}[31m";
+            assert_eq!(lines[6].trim(), expected);
+            assert_eq!(lines[6].find(expected), Some((80 - width(expected)) / 2));
+            assert!(!lines.join("\n").contains("not a git repository"));
+            assert!(!lines.join("\n").contains('\x1b'));
+        }
+    }
+
+    #[test]
+    fn a_successful_status_outside_a_repository_keeps_its_message() {
+        let mut snap = Snapshot::empty("/not-a-repo");
+        snap.revision = 1;
+        let state = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        assert_eq!(
+            render(&snap, &state, 80, 12).plain()[6].trim(),
+            "not a git repository"
+        );
     }
 }

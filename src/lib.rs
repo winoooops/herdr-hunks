@@ -10,6 +10,7 @@ pub mod git;
 pub mod herdr;
 pub mod paths;
 pub mod runtime;
+mod text;
 #[cfg(feature = "tui")]
 pub mod tui;
 

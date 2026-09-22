@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use super::{open_params, reuse, Placement, VIEWER_TITLE};
 use crate::herdr::client::{HerdrClient, HerdrClientError};
+use crate::text::sanitize;
 
 pub fn run_open(placement: Placement) -> i32 {
     match run(placement) {
@@ -21,7 +22,7 @@ pub fn run_open(placement: Placement) -> i32 {
                     }
                 })
                 .unwrap_or_else(|| error.to_string());
-            eprintln!("herdr-hunks: {message}");
+            eprintln!("herdr-hunks: {}", sanitize(&message));
             1
         }
     }
@@ -55,7 +56,7 @@ fn run(placement: Placement) -> Result<(), Box<dyn std::error::Error>> {
             params["width"] = width;
             params["height"] = height;
             for problem in problems {
-                eprintln!("herdr-hunks: {problem}");
+                eprintln!("herdr-hunks: {}", sanitize(&problem));
             }
         }
     }
@@ -96,13 +97,17 @@ fn run(placement: Placement) -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 if let Err(error) = reuse::save(&state_dir, &records) {
-                    eprintln!("herdr-hunks: could not save split reuse record: {error}");
+                    eprintln!(
+                        "herdr-hunks: could not save split reuse record: {}",
+                        sanitize(&error.to_string())
+                    );
                 }
                 Ok(())
             }) {
                 Ok(result) => return result,
                 Err(error) => eprintln!(
-                    "herdr-hunks: split reuse unavailable: {error}; opening without reuse"
+                    "herdr-hunks: split reuse unavailable: {}; opening without reuse",
+                    sanitize(&error.to_string())
                 ),
             }
         } else {

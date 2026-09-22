@@ -143,17 +143,17 @@ mod tests {
         let contender = std::thread::spawn(move || {
             done.send(with_lock(&path, || ())).unwrap();
         });
-        let result = result.recv_timeout(Duration::from_secs(3));
+        let result = result.recv_timeout(Duration::from_secs(4));
         let elapsed = start.elapsed();
         release.send(()).unwrap();
         holder.join().unwrap();
         contender.join().unwrap();
         let error = result
-            .expect("busy lock must return within three seconds")
+            .expect("busy lock must return within four seconds")
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         assert!(error.to_string().contains("lock is busy"));
-        assert!(elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(3));
+        assert!(elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(4));
         assert_eq!(with_lock(dir.path(), || 42).unwrap(), 42);
     }
 

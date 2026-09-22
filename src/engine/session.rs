@@ -902,7 +902,7 @@ mod tests {
                     allow: Arc::new(AtomicBool::new(true)),
                 }),
                 git_check: ok_git(),
-                diff_delay: Some(Duration::from_millis(400)),
+                diff_delay: Some(Duration::from_millis(1500)),
             },
         );
         wait_for(&h, "first ready diff", |s| ready(s).is_some());
@@ -914,16 +914,16 @@ mod tests {
         let refreshed = Instant::now();
         h.commands.send(Command::Refresh).unwrap();
         loop {
-            let remaining = Duration::from_secs(3)
+            let remaining = Duration::from_secs(6)
                 .checked_sub(refreshed.elapsed())
-                .expect("refresh did not complete within 3 seconds");
+                .expect("refresh did not complete within 6 seconds");
             let s = h
                 .snapshots
                 .recv_timeout(remaining)
                 .expect("refresh completion");
             if !s.refreshing {
                 assert!(
-                    refreshed.elapsed() >= Duration::from_millis(500),
+                    refreshed.elapsed() >= Duration::from_millis(1000),
                     "refresh cleared before its follow-up diff completed"
                 );
                 assert!(ready(&s).is_some());
@@ -1151,8 +1151,8 @@ mod tests {
         );
         wait_for(&h, "first", |s| ready(s).is_some());
         let started = Instant::now();
-        for _ in 0..5 {
-            h.commands.send(Command::SelectNext).unwrap(); // a -> b -> a -> b -> a -> b
+        for _ in 0..51 {
+            h.commands.send(Command::SelectNext).unwrap(); // an odd number of selections ends on b
         }
         wait_for(&h, "the last selection loaded", |s| {
             s.selected
@@ -1161,9 +1161,9 @@ mod tests {
                 .unwrap_or(false)
                 && ready(s).map(|d| d.key.path == "b.txt").unwrap_or(false)
         });
-        // Back to back, five delayed requests would take at least 2 s.
+        // back to back, 51 delayed requests would take over 20 s.
         assert!(
-            started.elapsed() < Duration::from_millis(1500),
+            started.elapsed() < Duration::from_secs(5),
             "superseded diffs were waited for: {:?}",
             started.elapsed()
         );

@@ -12,9 +12,9 @@ fn run_tui(_path: PathBuf) -> i32 {
 
 fn main() {
     herdr_hunks::engine::init_process_env();
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args_os().skip(1);
     let first = args.next();
-    let code = match first.as_deref() {
+    let code = match first.as_ref().map(|arg| arg.to_string_lossy()).as_deref() {
         None => run_tui(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         Some("tui") => {
             let path = args
@@ -36,7 +36,7 @@ fn main() {
             2
         }
         // Any other word is a path. The engine validates it, so a missing path shows the error state.
-        Some(path) => run_tui(PathBuf::from(path)),
+        Some(_) => run_tui(PathBuf::from(first.unwrap())),
     };
     std::process::exit(code);
 }

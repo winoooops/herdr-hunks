@@ -173,7 +173,13 @@ fn run_terminal(
             })?;
             dirty = false;
         }
-        match guard::poll_terminal(Duration::from_millis(100)) {
+        match guard::poll_terminal(Duration::ZERO).and_then(|pending| {
+            if pending {
+                Ok(true)
+            } else {
+                guard::poll_terminal(Duration::from_millis(100))
+            }
+        }) {
             Ok(false) => continue,
             Err(_) => break,
             Ok(true) => {}

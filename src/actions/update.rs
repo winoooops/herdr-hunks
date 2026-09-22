@@ -28,7 +28,7 @@ pub fn run_with(host: &Path, git: &str, plugin_id: &str) -> i32 {
     match update(host, git, plugin_id) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("herdr-hunks: {error}");
+            eprintln!("herdr-hunks: {}", crate::text::sanitize(&error.to_string()));
             1
         }
     }

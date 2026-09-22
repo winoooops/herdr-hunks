@@ -510,3 +510,43 @@ fn popup_ok_response_has_no_pane_id() {
     assert_eq!(client.plugin_pane_open(json!({"plugin_id":"test.hunks", "entrypoint":"viewer", "placement":"popup", "width":"80%", "height":"80%", "cwd":"/repo", "env":{}, "focus":true})).unwrap(), None);
     finish(fake);
 }
+
+#[test]
+fn host_error_diagnostics_replace_decoded_escape_sequences() {
+    let _lock = LOCK.lock().unwrap();
+    let (_dir, fake) = setup();
+    let message: String = serde_json::from_str(r#""host \u001b[31mfailure\nnext\tfield""#).unwrap();
+    fake.popup_error(&message);
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-hunks"))
+        .arg("open")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "herdr-hunks: host \u{fffd}[31mfailure\u{fffd}next\tfield\n"
+    );
+    finish(fake);
+}
+
+#[test]
+fn update_host_failure_diagnostics_replace_controls() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("plugin"),
+        "#!/bin/sh\nprintf 'host\\033[31m\\007failure\\n' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-hunks"))
+        .arg("update")
+        .current_dir(dir.path())
+        .env("HERDR_BIN_PATH", "/bin/sh")
+        .env("HERDR_PLUGIN_ID", "test.hunks")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "herdr-hunks: plugin list failed: host\u{fffd}[31m\u{fffd}failure\n"
+    );
+}
