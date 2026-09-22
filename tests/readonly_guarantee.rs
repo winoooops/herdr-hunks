@@ -74,6 +74,23 @@ fn tree_hash(dir: &Path) -> String {
 
 #[test]
 fn the_engine_never_mutates_the_repository() {
+    let original_cwd = std::env::current_dir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    std::env::set_current_dir(scratch.path()).unwrap();
+    let home = PathBuf::from(std::env::var_os("HOME").expect("test HOME"));
+    let home_before: Vec<_> = [
+        "bases.json",
+        "split-panes.json",
+        "split-panes.lock",
+        "config-problems.log",
+    ]
+    .into_iter()
+    .map(|name| {
+        let path = home.join(name);
+        let existed = path.symlink_metadata().is_ok();
+        (path, existed)
+    })
+    .collect();
     let real = real_git();
     let repo = tempfile::tempdir().unwrap();
     let p = repo.path();
@@ -187,7 +204,7 @@ fn the_engine_never_mutates_the_repository() {
         branch_rows,
         "not every branch row was loaded: {branch_loaded:?}"
     );
-    handle.commands.send(Command::LoadRefs).unwrap();
+    handle.commands.send(Command::LoadRefs(1)).unwrap();
     handle
         .commands
         .send(Command::SetBase(Some("refs/heads/other".into())))
@@ -335,4 +352,18 @@ fn the_engine_never_mutates_the_repository() {
         "refs changed"
     );
     assert_eq!(tree_hash(p), tree_before, "worktree changed");
+    // Writes to arbitrary absolute paths are outside what this test can see.
+    assert!(
+        std::fs::read_dir(scratch.path()).unwrap().next().is_none(),
+        "the viewer wrote to cwd"
+    );
+    for (path, existed) in home_before {
+        assert_eq!(
+            path.symlink_metadata().is_ok(),
+            existed,
+            "unexpected HOME entry: {}",
+            path.display()
+        );
+    }
+    std::env::set_current_dir(original_cwd).unwrap();
 }

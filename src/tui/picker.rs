@@ -46,24 +46,23 @@ pub struct Picker {
     pub pending: Option<u64>,
     /// Set when the answer was a success: the shell drops the picker.
     pub done: bool,
-    /// `refs_seq` at opening: the list is this opening's only once the engine answered its `LoadRefs`.
-    pub refs_after: u64,
+    /// The token sent with this opening's `LoadRefs`.
+    pub token: u64,
     /// The last `refs_seq` the cursor was placed for.
     pub seen_refs_seq: u64,
 }
 
 impl Picker {
-    pub fn open(refs_seq: u64) -> Self {
+    pub fn open(token: u64) -> Self {
         Self {
-            refs_after: refs_seq,
-            seen_refs_seq: refs_seq,
+            token,
             ..Self::default()
         }
     }
 
     /// The candidates of this opening; empty until `LoadRefs` is answered, so a stale list is never shown.
     pub fn refs<'a>(&self, snapshot: &'a Snapshot) -> &'a [String] {
-        if snapshot.refs_seq > self.refs_after {
+        if snapshot.refs_seq == self.token {
             snapshot.refs.as_deref().map(Vec::as_slice).unwrap_or(&[])
         } else {
             &[]
@@ -152,7 +151,7 @@ impl Picker {
             .count();
         let footer = if self.pending.is_some() {
             "picking…".to_string()
-        } else if snapshot.refs_seq <= self.refs_after {
+        } else if snapshot.refs_seq != self.token {
             "loading refs…".to_string()
         } else if self.refs(snapshot).is_empty() {
             "no refs listed; type a revision".to_string()
@@ -231,7 +230,7 @@ impl Picker {
 
     /// The engine's answers: a new ref list re-places the cursor; the pending `SetBase` closes or errs.
     pub fn observe(&mut self, snapshot: &Snapshot) {
-        if snapshot.refs_seq != self.seen_refs_seq {
+        if snapshot.refs_seq == self.token && self.seen_refs_seq != self.token {
             self.seen_refs_seq = snapshot.refs_seq;
             self.follow_input(snapshot);
         }
@@ -253,7 +252,7 @@ mod tests {
     use crate::engine::{Base, BaseSource, RepoState, Scope, Snapshot};
     use std::sync::Arc;
 
-    /// `refs_seq` is 1: a picker opened with `Picker::open(0)` sees the list at once.
+    /// `refs_seq` is 1: a picker opened with `Picker::open(1)` sees the list at once.
     fn snap(refs: &[&str], base: Option<(&str, BaseSource)>) -> Snapshot {
         let mut s = Snapshot::empty("/r");
         s.revision = 1;
@@ -302,7 +301,7 @@ mod tests {
     #[test]
     fn rows_start_with_reset_then_the_current_base_then_matches_with_markers() {
         let s = snap(&REFS, Some(("refs/tags/main", BaseSource::Picked)));
-        let p = Picker::open(0);
+        let p = Picker::open(1);
         assert_eq!(
             labels(&p.rows(&s)),
             [
@@ -314,7 +313,7 @@ mod tests {
                 "maint-2.1"
             ]
         );
-        let mut p = Picker::open(0);
+        let mut p = Picker::open(1);
         p.input = "main".into();
         assert_eq!(
             labels(&p.rows(&s)),
@@ -345,18 +344,18 @@ mod tests {
         assert_eq!(p.rows(&s)[1].submit().as_deref(), Some("HEAD~2"));
         assert_eq!(p.rows(&s)[0].submit(), None);
         let s = snap(&REFS, Some(("feat", BaseSource::Config)));
-        assert_eq!(labels(&Picker::open(0).rows(&s))[1], "feat");
+        assert_eq!(labels(&Picker::open(1).rows(&s))[1], "feat");
         let s = snap(&REFS, Some(("refs/heads/feat", BaseSource::Config)));
-        assert_eq!(labels(&Picker::open(0).rows(&s))[1], "feat [config]");
+        assert_eq!(labels(&Picker::open(1).rows(&s))[1], "feat [config]");
         let mut s = snap(&[], None);
         s.default_base = None;
-        assert_eq!(labels(&Picker::open(0).rows(&s)), ["default (none)"]);
+        assert_eq!(labels(&Picker::open(1).rows(&s)), ["default (none)"]);
     }
 
     #[test]
     fn the_cursor_follows_the_input_and_moves_within_bounds() {
         let s = snap(&REFS, None);
-        let mut p = Picker::open(0);
+        let mut p = Picker::open(1);
         assert_eq!(p.cursor, 0);
         p.input = "ma".into();
         p.retarget(&s);
@@ -381,7 +380,7 @@ mod tests {
     #[test]
     fn the_panel_shows_the_caret_error_markers_and_footers() {
         let s = snap(&REFS, Some(("refs/heads/main", BaseSource::Default)));
-        let mut p = Picker::open(0);
+        let mut p = Picker::open(1);
         p.input = "ma".into();
         p.retarget(&s);
         let panel = p.panel(&s, WIDTH, 12);
@@ -406,7 +405,7 @@ mod tests {
         );
         let mut s = snap(&REFS, None);
         s.refs_overflow = true;
-        let mut p = Picker::open(0);
+        let mut p = Picker::open(1);
         p.input = "ma".into();
         assert_eq!(
             p.panel(&s, WIDTH, 12).footer,
@@ -414,16 +413,16 @@ mod tests {
         );
         let s = snap(&[], None);
         assert_eq!(
-            Picker::open(0).panel(&s, WIDTH, 12).footer,
+            Picker::open(1).panel(&s, WIDTH, 12).footer,
             "no refs listed; type a revision"
         );
         let mut s = snap(&REFS, None);
         s.refs = None;
         assert_eq!(
-            Picker::open(0).panel(&s, WIDTH, 12).footer,
+            Picker::open(1).panel(&s, WIDTH, 12).footer,
             "no refs listed; type a revision"
         );
-        let mut p = Picker::open(0);
+        let mut p = Picker::open(1);
         p.pending = Some(0);
         assert_eq!(p.panel(&snap(&REFS, None), WIDTH, 12).footer, "picking…");
     }
@@ -431,7 +430,7 @@ mod tests {
     #[test]
     fn every_panel_row_is_one_line_at_any_width() {
         let s = snap(&REFS, None);
-        let mut p = Picker::open(0);
+        let mut p = Picker::open(1);
         p.input = "a".repeat(70);
         p.error = Some("not a commit: ".to_string() + &"b".repeat(70));
         for width in [40u16, 48, 60] {
@@ -448,8 +447,8 @@ mod tests {
     #[test]
     fn the_list_counts_only_once_this_opening_is_answered_and_the_cursor_follows_it() {
         let mut s = snap(&REFS, None);
-        s.refs_seq = 3;
-        let mut p = Picker::open(3);
+        s.refs_seq = 0;
+        let mut p = Picker::open(2);
         assert!(
             p.refs(&s).is_empty(),
             "the previous opening's list is not shown"
@@ -459,13 +458,27 @@ mod tests {
         p.input = "ma".into();
         p.retarget(&s);
         assert_eq!(p.cursor, 1, "the typed row while the list is empty");
-        s.refs_seq = 4;
+        p.error = Some("kept".into());
+        s.refs_seq = 1;
+        p.observe(&s);
+        assert!(
+            p.refs(&s).is_empty(),
+            "an earlier opening's reply stays hidden"
+        );
+        assert_eq!(p.panel(&s, WIDTH, 12).footer, "loading refs…");
+        assert_eq!(p.cursor, 1, "a stale reply must not move the cursor");
+        s.refs_seq = 2;
         p.observe(&s);
         assert_eq!(p.refs(&s).len(), REFS.len());
         assert_eq!(p.cursor, 2, "the first match once the list arrived");
-        p.error = Some("kept".into());
-        s.refs_seq = 5;
+        assert_eq!(
+            p.error.as_deref(),
+            Some("kept"),
+            "the matching reply keeps the error"
+        );
+        p.cursor = 3;
         p.observe(&s);
+        assert_eq!(p.cursor, 3, "the same reply only places the cursor once");
         assert_eq!(
             p.error.as_deref(),
             Some("kept"),
@@ -477,7 +490,7 @@ mod tests {
     fn display_text_is_sanitized_without_changing_submitted_revisions() {
         let mut s = snap(&["refs/heads/a\u{202e}"], None);
         s.default_base = Some("refs/heads/a\u{202e}".into());
-        let mut p = Picker::open(0);
+        let mut p = Picker::open(1);
         for input in ["", "x\u{202e}\n"] {
             p.input = input.into();
             p.retarget(&s);
@@ -509,7 +522,7 @@ mod tests {
     #[test]
     fn the_reply_closes_the_picker_or_shows_the_error() {
         let mut s = snap(&REFS, None);
-        let mut p = Picker::open(0);
+        let mut p = Picker::open(1);
         p.pending = Some(s.pick_seq);
         p.observe(&s);
         assert!(p.pending.is_some() && !p.done, "no answer yet");

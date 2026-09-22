@@ -183,8 +183,9 @@ fn act(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction, width: u16
             };
         }
         PickBase => {
-            state.picker = Some(crate::tui::picker::Picker::open(snapshot.refs_seq));
-            return Outcome::Engine(Command::LoadRefs);
+            state.refs_token += 1;
+            state.picker = Some(crate::tui::picker::Picker::open(state.refs_token));
+            return Outcome::Engine(Command::LoadRefs(state.refs_token));
         }
         FileNext => return Outcome::Engine(Command::SelectNext),
         FilePrev => return Outcome::Engine(Command::SelectPrev),
@@ -1379,6 +1380,36 @@ mod tests {
     }
 
     #[test]
+    fn each_picker_opening_requests_its_own_ref_token() {
+        let (mut snap, mut st) = setup(&[(1, "+")]);
+        assert_eq!(
+            handle_key(&mut st, &snap, key("B"), 120),
+            Outcome::Engine(Command::LoadRefs(1))
+        );
+        handle_key(
+            &mut st,
+            &snap,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            120,
+        );
+        assert_eq!(
+            handle_key(&mut st, &snap, key("B"), 120),
+            Outcome::Engine(Command::LoadRefs(2))
+        );
+        snap.refs = Some(std::sync::Arc::new(vec!["refs/heads/main".into()]));
+        snap.refs_seq = 1;
+        st.observe(&snap);
+        assert!(st.picker.as_ref().unwrap().refs(&snap).is_empty());
+        assert_eq!(
+            st.picker.as_ref().unwrap().panel(&snap, 60, 12).footer,
+            "loading refs…"
+        );
+        snap.refs_seq = 2;
+        st.observe(&snap);
+        assert_eq!(st.picker.as_ref().unwrap().refs(&snap), ["refs/heads/main"]);
+    }
+
+    #[test]
     fn capital_b_opens_the_picker_and_picker_keys_edit_move_pick_and_close() {
         use crate::engine::{RepoState, Scope};
         use crate::tui::picker::PickerRow;
@@ -1396,7 +1427,7 @@ mod tests {
         };
         assert_eq!(
             handle_key(&mut st, &snap, key("B"), 120),
-            Outcome::Engine(Command::LoadRefs)
+            Outcome::Engine(Command::LoadRefs(1))
         );
         assert!(st.picker.is_some());
         assert!(

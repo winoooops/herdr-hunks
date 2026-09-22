@@ -204,7 +204,10 @@ enum Done {
         comparison: Comparison,
         result: Result<GetGitDiffResponse, String>,
     },
-    Refs(Result<(Vec<String>, bool), String>),
+    Refs {
+        token: u64,
+        result: Result<(Vec<String>, bool), String>,
+    },
 }
 
 /// The rows of one refresh. `Err` means the requested comparison could not be loaded; the
@@ -647,18 +650,18 @@ async fn run(
                         publish(&mut state, next, &snapshots);
                         state.request_status(&cwd, false, &results_tx, &refreshes);
                     }
-                    Command::LoadRefs => {
+                    Command::LoadRefs(token) => {
                         let toplevel = match &state.snapshot.repo {
                             RepoState::Repo { toplevel, .. } => Some(toplevel.clone()),
                             _ => None,
                         };
                         let results = results_tx.clone();
                         tokio::spawn(async move {
-                            let refs = match toplevel {
+                            let result = match toplevel {
                                 Some(toplevel) => base::list_refs(&toplevel).await,
                                 None => Ok((Vec::new(), false)),
                             };
-                            let _ = results.send(Done::Refs(refs));
+                            let _ = results.send(Done::Refs { token, result });
                         });
                     }
                     selection => {
@@ -728,11 +731,14 @@ async fn run(
                         }
                         publish(&mut state, next, &snapshots);
                     }
-                    Done::Refs(result) => {
+                    Done::Refs { token, result } => {
+                        if token <= next.refs_seq {
+                            continue;
+                        }
                         let (refs, overflow) = result.unwrap_or_default();
                         next.refs = Some(Arc::new(refs));
                         next.refs_overflow = overflow;
-                        next.refs_seq += 1;
+                        next.refs_seq = token;
                         publish(&mut state, next, &snapshots);
                     }
                     Done::Watcher(result) => {
@@ -765,6 +771,9 @@ async fn run(
                                     }
                                 };
                                 match loaded {
+                                    None if matches!(change, Some(Change::Base(_))) => {
+                                        change_error = Some("not a git repository".into());
+                                    }
                                     Some(Err(e)) => match &change {
                                         // Failed picks and switches report notices; refresh errors keep the rows.
                                         Some(Change::Base(_)) => change_error = Some(e),
@@ -838,7 +847,7 @@ async fn run(
                         }
                         let selected = next.selected.clone().filter(|_| succeeded);
                         if selected.is_none() {
-                            next.refreshing = !state.changes.is_empty();
+                            next.refreshing = !state.changes.is_empty() || state.status_dirty;
                         }
                         publish(&mut state, next, &snapshots);
                         if let Some(key) = selected {
@@ -2120,7 +2129,7 @@ mod tests {
         let dir = branch_fixture();
         let (_rt, h) = start_with(dir.path(), Scope::Worktree, None, None);
         wait_for(&h, "first", |s| ready(s).is_some());
-        h.commands.send(Command::LoadRefs).unwrap();
+        h.commands.send(Command::LoadRefs(1)).unwrap();
         let s = wait_for(&h, "refs", |s| s.refs.is_some());
         let refs = s.refs.as_ref().unwrap();
         assert!(
@@ -2129,7 +2138,7 @@ mod tests {
         );
         assert!(!s.refs_overflow);
         assert_eq!(s.refs_seq, 1);
-        h.commands.send(Command::LoadRefs).unwrap();
+        h.commands.send(Command::LoadRefs(2)).unwrap();
         wait_for(&h, "second answer", |s| s.refs_seq == 2);
 
         let dir = tempfile::tempdir().unwrap();
@@ -2145,5 +2154,89 @@ mod tests {
         assert_eq!(s.scope, Scope::Worktree);
         assert!(s.base.is_none());
         assert_eq!(s.base_error.as_deref(), Some(NO_BASE_NOTICE));
+    }
+
+    #[test]
+    fn an_older_ref_reply_cannot_replace_a_newer_openings_list() {
+        let dir = branch_fixture();
+        let (_rt, h) = start_with(dir.path(), Scope::Worktree, None, None);
+        wait_for(&h, "first", |s| ready(s).is_some());
+        h.commands.send(Command::LoadRefs(2)).unwrap();
+        let newest = wait_for(&h, "newer ref reply", |s| s.refs_seq == 2);
+        h.commands.send(Command::LoadRefs(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            if let Ok(s) = h.snapshots.recv_timeout(Duration::from_millis(20)) {
+                assert_eq!(s.refs_seq, 2, "an older ref reply replaced the token");
+                assert!(Arc::ptr_eq(
+                    s.refs.as_ref().unwrap(),
+                    newest.refs.as_ref().unwrap()
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn a_queued_plain_refresh_keeps_empty_rows_refreshing() {
+        let dir = fixture();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-q", "-m", "clean"]);
+        let state = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = spawn(
+            rt.handle(),
+            SessionConfig {
+                poll_interval: Duration::from_secs(60),
+                state_dir: Some(state.path().to_path_buf()),
+                watcher: Arc::new(FlakyWatcher {
+                    allow: Arc::new(AtomicBool::new(true)),
+                }),
+                git_check: ok_git(),
+                ..SessionConfig::production(dir.path().to_path_buf())
+            },
+        );
+        wait_for(&h, "clean repository", |s| {
+            matches!(s.repo, RepoState::Repo { .. }) && !s.refreshing
+        });
+        let before = h.refreshes.load(Ordering::SeqCst);
+        // Hold persistence until the FIFO command queue has consumed the plain refresh.
+        crate::actions::reuse::with_lock(state.path(), || {
+            h.commands
+                .send(Command::SetBase(Some("refs/heads/main".into())))
+                .unwrap();
+            h.commands.send(Command::Refresh).unwrap();
+            h.commands.send(Command::LoadRefs(1)).unwrap();
+            wait_for(&h, "commands consumed", |s| s.refs_seq == 1);
+        })
+        .unwrap();
+        let picked = wait_for(&h, "pick reply", |s| s.pick_seq == 1);
+        assert!(picked.pick_error.is_none());
+        assert!(picked.selected.is_none() && picked.files.is_empty());
+        assert!(
+            picked.refreshing,
+            "the queued plain refresh still has work to do"
+        );
+        wait_for(&h, "plain refresh finished", |s| {
+            s.pick_seq == 1 && !s.refreshing
+        });
+        assert_eq!(h.refreshes.load(Ordering::SeqCst), before + 2);
+    }
+
+    #[test]
+    fn a_base_pick_outside_a_repository_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(dir.path(), Scope::Worktree, None, None);
+        h.commands
+            .send(Command::SetBase(Some("HEAD".into())))
+            .unwrap();
+        let s = wait_for(&h, "failed pick", |s| s.pick_seq == 1);
+        assert_eq!(s.pick_error.as_deref(), Some("not a git repository"));
+        assert_eq!(s.scope, Scope::Worktree);
+        assert!(s.base.is_none() && s.files.is_empty() && s.selected.is_none());
+        assert!(matches!(s.repo, RepoState::NotARepo { .. }));
     }
 }

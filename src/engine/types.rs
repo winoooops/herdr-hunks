@@ -183,7 +183,7 @@ pub struct Snapshot {
     /// The picker's candidates, qualified, most recently created first; `None` until `LoadRefs`.
     pub refs: Option<Arc<Vec<String>>>,
     pub refs_overflow: bool,
-    /// Bumped once per answered `LoadRefs`, so a picker shows only the list loaded for its own opening.
+    /// The token of the opening whose `LoadRefs` was answered last.
     pub refs_seq: u64,
     /// Bumped once per answered `SetBase`; `pick_error` is that answer.
     pub pick_seq: u64,
@@ -227,8 +227,8 @@ pub enum Command {
     SetScope(Scope),
     /// `Some`: validate, load branch rows under it, persist, publish. `None`: forget the pick and re-resolve.
     SetBase(Option<String>),
-    /// Answer with `refs` on the snapshot.
-    LoadRefs,
+    /// Answer with `refs` and this opening's token on the snapshot.
+    LoadRefs(u64),
     Shutdown,
 }
 

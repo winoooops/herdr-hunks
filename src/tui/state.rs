@@ -24,6 +24,7 @@ pub struct ViewState {
     pub popup: bool,
     pub help_open: bool,
     pub picker: Option<crate::tui::picker::Picker>,
+    pub refs_token: u64,
     /// Last submitted pick's reply sequence, retained when the picker closes.
     pub submitted_pick_seq: u64,
     pub notice: Option<String>,
@@ -52,6 +53,7 @@ impl ViewState {
             popup: false,
             help_open: false,
             picker: None,
+            refs_token: 0,
             submitted_pick_seq: 0,
             notice: None,
             rows: None,

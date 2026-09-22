@@ -629,7 +629,20 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
         .find(|hit| hit.hovered(state))
         .and_then(|hit| hit.action.key_action())
         .and_then(|action| keys::KEYS.iter().find(|binding| binding.action == action))
-        .map(|binding| format!("{} · {}", binding.label, binding.key))
+        .map(|binding| {
+            let hint = format!("{} · {}", binding.label, binding.key);
+            if binding.action == keys::KeyAction::ToggleScope {
+                if let Some(base) = &snapshot.base {
+                    let commit: String = base.commit.chars().take(7).collect();
+                    return format!(
+                        "{hint} · {} @ {}",
+                        sanitize(base.label()),
+                        sanitize(&commit)
+                    );
+                }
+            }
+            hint
+        })
         .unwrap_or_else(|| hints.join("  "));
     lines.push(vec![Span::label(pad(&hint, columns.into()))]);
     for hit in &mut hits {
@@ -1353,7 +1366,23 @@ mod tests {
         assert_eq!(hit.y, 0);
         st.hover = Some((hit.x0, 0));
         let r = render(&snap, &st, 120, 24);
-        assert_eq!(r.plain().last().unwrap(), "switch scope · b");
+        assert_eq!(
+            r.plain().last().unwrap(),
+            "switch scope · b · main @ 0000000"
+        );
+        snap.base.as_mut().unwrap().commit = "123456789abcdef".into();
+        let r = render(&snap, &st, 120, 24);
+        assert_eq!(
+            r.plain().last().unwrap(),
+            "switch scope · b · main @ 1234567"
+        );
+        snap.base.as_mut().unwrap().requested = "refs/heads/main\u{1b}".into();
+        let r = render(&snap, &st, 120, 24);
+        assert_eq!(
+            r.plain().last().unwrap(),
+            "switch scope · b · main\u{241b} @ 1234567"
+        );
+        snap.base.as_mut().unwrap().requested = "refs/heads/main".into();
         // Branch scope: `vs main`, and the staged label is gone.
         snap.scope = Scope::Branch;
         snap.base.as_mut().unwrap().merge_base = Some("1".repeat(40));
@@ -1419,7 +1448,7 @@ mod tests {
         let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
         st.resize(120, 20);
         st.reconcile(&snap);
-        st.picker = Some(crate::tui::picker::Picker::open(0));
+        st.picker = Some(crate::tui::picker::Picker::open(1));
         let r = render(&snap, &st, 120, 24);
         let text = r.plain();
         assert!(text[1].contains("Compare against"), "{}", text[1]);
