@@ -5,6 +5,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::Semaphore;
 
 use super::{gitver, Command, DiffState, FileKey, LoadedDiff, RepoState, Snapshot};
 use crate::git::{self, ChangedFile, ChangedFileStatus, GetGitDiffResponse, GitStatusResponse};
@@ -24,6 +25,8 @@ pub struct SessionConfig {
     /// Injected so tests never change the process PATH.
     pub git_check: Arc<dyn Fn() -> Result<gitver::GitVersion, gitver::GitCheckError> + Send + Sync>,
     pub diff_delay: Option<Duration>,
+    /// Test hook: each diff consumes one permit before running git.
+    pub diff_gate: Option<Arc<Semaphore>>,
 }
 
 pub struct EngineHandle {
@@ -64,6 +67,7 @@ impl SessionConfig {
             }),
             git_check: Arc::new(gitver::check),
             diff_delay: None,
+            diff_gate: None,
         }
     }
 }
@@ -188,6 +192,7 @@ impl State {
         key: FileKey,
         cwd: &str,
         delay: Option<Duration>,
+        gate: Option<Arc<Semaphore>>,
         results: &UnboundedSender<Done>,
     ) {
         if matches!(&self.diff_in_flight, Some((_, pending)) if pending == &key) {
@@ -208,6 +213,9 @@ impl State {
         tokio::spawn(async move {
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
+            }
+            if let Some(gate) = gate {
+                gate.acquire().await.expect("diff gate closed").forget();
             }
             let result =
                 git::get_git_diff_inner(cwd, key.path.clone(), key.staged, Some(untracked)).await;
@@ -405,7 +413,7 @@ async fn run(
                             next.selected = Some(key.clone());
                             next.diff = DiffState::Loading;
                             publish(&mut state, next, &snapshots);
-                            state.request_diff(key, &cwd, config.diff_delay, &results_tx);
+                            state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx);
                         }
                     }
                 }
@@ -496,7 +504,7 @@ async fn run(
                         }
                         publish(&mut state, next, &snapshots);
                         if let Some(key) = selected {
-                            state.request_diff(key, &cwd, config.diff_delay, &results_tx);
+                            state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx);
                         }
                         if state.status_dirty {
                             state.status_dirty = false;
@@ -526,7 +534,7 @@ async fn run(
                         }
                         if std::mem::take(&mut state.diff_dirty) {
                             if let Some(key) = state.snapshot.selected.clone() {
-                                state.request_diff(key, &cwd, config.diff_delay, &results_tx);
+                                state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx);
                             }
                         }
                     }
@@ -637,6 +645,7 @@ mod tests {
                 watcher: Arc::new(FlakyWatcher { allow }),
                 git_check: ok_git(),
                 diff_delay: None,
+                diff_gate: None,
             },
         );
         (rt, handle)
@@ -706,6 +715,7 @@ mod tests {
                 }),
                 git_check: ok_git(),
                 diff_delay: None,
+                diff_gate: None,
             },
         );
         wait_for(&h, "first ready diff", |s| ready(s).is_some());
@@ -842,6 +852,7 @@ mod tests {
                 watcher: Arc::new(EmittingWatcher { sink: slot.clone() }),
                 git_check: ok_git(),
                 diff_delay: None,
+                diff_gate: None,
             },
         );
         wait_for(&h, "first", |s| ready(s).is_some());
@@ -878,6 +889,7 @@ mod tests {
                 }),
                 git_check: ok_git(),
                 diff_delay: Some(Duration::from_millis(400)),
+                diff_gate: None,
             },
         );
         wait_for(&h, "a diff despite constant polling", |s| {
@@ -888,6 +900,7 @@ mod tests {
     #[test]
     fn a_refresh_stays_busy_until_a_diff_started_after_it_completes() {
         let dir = fixture();
+        let gate = Arc::new(Semaphore::new(0));
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -902,34 +915,34 @@ mod tests {
                     allow: Arc::new(AtomicBool::new(true)),
                 }),
                 git_check: ok_git(),
-                diff_delay: Some(Duration::from_millis(1500)),
+                diff_delay: None,
+                diff_gate: Some(gate.clone()),
             },
         );
+        // release the initial load, then hold the selected diff (D1).
+        gate.add_permits(1);
         wait_for(&h, "first ready diff", |s| ready(s).is_some());
         h.commands.send(Command::SelectNext).unwrap();
-        wait_for(&h, "next selection loading", |s| {
+        let loading = wait_for(&h, "next selection loading", |s| {
             matches!(s.diff, DiffState::Loading)
         });
-        std::thread::sleep(Duration::from_millis(50));
-        let refreshed = Instant::now();
+        let key = loading.selected.clone().unwrap();
+        // refresh starts while D1 is still blocked.
         h.commands.send(Command::Refresh).unwrap();
-        loop {
-            let remaining = Duration::from_secs(6)
-                .checked_sub(refreshed.elapsed())
-                .expect("refresh did not complete within 6 seconds");
-            let s = h
-                .snapshots
-                .recv_timeout(remaining)
-                .expect("refresh completion");
-            if !s.refreshing {
-                assert!(
-                    refreshed.elapsed() >= Duration::from_millis(1000),
-                    "refresh cleared before its follow-up diff completed"
-                );
-                assert!(ready(&s).is_some());
-                break;
-            }
-        }
+        wait_for(&h, "refresh busy", |s| s.refreshing);
+        // D1's own snapshot must stay busy while the follow-up (D2) is gated.
+        gate.add_permits(1);
+        let first = wait_for(&h, "pre-refresh diff ready", |s| {
+            ready(s).is_some_and(|d| d.key == key)
+        });
+        assert!(
+            first.refreshing,
+            "refresh cleared when the pre-refresh diff completed"
+        );
+        // release D2 to finish the refresh.
+        gate.add_permits(1);
+        let refreshed = wait_for(&h, "refresh completion", |s| !s.refreshing);
+        assert_eq!(ready(&refreshed).map(|d| &d.key), Some(&key));
     }
 
     #[test]
@@ -1004,6 +1017,7 @@ mod tests {
                 }),
                 git_check: ok_git(),
                 diff_delay: None,
+                diff_gate: None,
             },
         );
         for _ in 0..3 {
@@ -1047,6 +1061,7 @@ mod tests {
                 }),
                 git_check: ok_git(),
                 diff_delay: None,
+                diff_gate: None,
             },
         );
         h.commands.send(Command::Shutdown).unwrap();
@@ -1095,6 +1110,7 @@ mod tests {
                     }
                 }),
                 diff_delay: None,
+                diff_gate: None,
             },
         );
         let s = wait_for(&h, "missing git reported", |s| s.status_error.is_some());
@@ -1120,6 +1136,7 @@ mod tests {
                     Err(gitver::GitCheckError::TooOld("git 2.20 is too old".into()))
                 }),
                 diff_delay: None,
+                diff_gate: None,
             },
         );
         wait_for(
@@ -1147,6 +1164,7 @@ mod tests {
                 }),
                 git_check: ok_git(),
                 diff_delay: Some(Duration::from_millis(400)),
+                diff_gate: None,
             },
         );
         wait_for(&h, "first", |s| ready(s).is_some());
