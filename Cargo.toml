@@ -1,10 +1,14 @@
 [package]
 name = "herdr-hunks"
-version = "0.1.0"
+version = "0.0.1"
 description = "Read-only git hunk viewer plugin for herdr, ported from vimeflow."
 license = "Apache-2.0"
 edition = "2021"
 rust-version = "1.88"
+repository = "https://github.com/winoooops/herdr-hunks"
+readme = "README.md"
+keywords = ["herdr", "git", "diff", "tui", "plugin"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "herdr_hunks"

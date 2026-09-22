@@ -26,7 +26,7 @@ failed=0
 for scenario in no-curl unknown-platform empty-version; do
   mkdir -p sentinel
   printf 'keep me\n' > sentinel/keep
-  printf 'version = "0.1.0"\n' > Cargo.toml
+  printf 'version = "0.0.0"\n' > Cargo.toml
   system=Linux
   case "$scenario" in
     unknown-platform) system=Unknown ;;

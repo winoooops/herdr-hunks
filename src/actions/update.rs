@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn picks_the_highest_semver_tag() {
-        let out = "aaa\trefs/tags/v0.1.0\nbbb\trefs/tags/v0.10.0\nccc\trefs/tags/v0.9.3\nddd\trefs/tags/v0.10.0^{}\neee\trefs/tags/nightly\n";
+        let out = "aaa\trefs/tags/v0.2.0\nbbb\trefs/tags/v0.10.0\nccc\trefs/tags/v0.9.3\nddd\trefs/tags/v0.10.0^{}\neee\trefs/tags/nightly\n";
         assert_eq!(latest_tag(out).as_deref(), Some("v0.10.0"));
         assert_eq!(latest_tag("eee\trefs/tags/nightly\n"), None);
     }
@@ -155,16 +155,21 @@ mod tests {
     #[test]
     fn a_github_install_installs_the_newest_tag_and_propagates_failure() {
         let dir = tempfile::tempdir().unwrap();
+        let current = env!("CARGO_PKG_VERSION");
+        let (major, minor, patch) = super::version(current).unwrap();
+        let newer = format!("v{major}.{minor}.{}", patch + 1);
         let git = script(
             dir.path(),
             "git",
-            "printf 'aaa\\trefs/tags/v9.9.9\\nbbb\\trefs/tags/v9.10.0\\n'",
+            &format!("printf 'aaa\\trefs/tags/v{current}\\nbbb\\trefs/tags/{newer}\\n'"),
         );
         let ok = host(dir.path(), "github", 0);
         assert_eq!(super::run_with(&ok, git.to_str().unwrap(), "test.hunks"), 0);
         let log = std::fs::read_to_string(dir.path().join("host.log")).unwrap();
         assert!(
-            log.contains("plugin install winoooops/herdr-hunks --ref v9.10.0 --yes"),
+            log.contains(&format!(
+                "plugin install winoooops/herdr-hunks --ref {newer} --yes"
+            )),
             "{log}"
         );
         let failing = host(dir.path(), "github", 7);
@@ -176,11 +181,19 @@ mod tests {
 
     #[test]
     fn missing_tags_and_current_or_older_versions_never_install() {
-        for (tags, expected) in [
-            ("nightly".to_string(), 1),
-            (format!("v{}", env!("CARGO_PKG_VERSION")), 0),
-            ("v0.0.9".to_string(), 0),
-        ] {
+        let current = env!("CARGO_PKG_VERSION");
+        let (major, minor, patch) = super::version(current).unwrap();
+        let older = match (major, minor, patch) {
+            (_, _, 1..) => Some((major, minor, patch - 1)),
+            (_, 1.., 0) => Some((major, minor - 1, 0)),
+            (1.., 0, 0) => Some((major - 1, 0, 0)),
+            _ => None, // no stable version precedes 0.0.0
+        };
+        let mut cases = vec![("nightly".to_string(), 1), (format!("v{current}"), 0)];
+        if let Some((major, minor, patch)) = older {
+            cases.push((format!("v{major}.{minor}.{patch}"), 0));
+        }
+        for (tags, expected) in cases {
             let dir = tempfile::tempdir().unwrap();
             let host = host(dir.path(), "github", 0);
             let git = script(
