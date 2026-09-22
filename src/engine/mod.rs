@@ -1,6 +1,6 @@
 //! UI-agnostic engine. No ratatui or crossterm types appear here.
-#[allow(dead_code)] // Used when the session loop resolves bases.
 pub mod base;
+pub mod branch;
 pub mod gitver;
 pub mod nav;
 pub mod session;
