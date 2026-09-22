@@ -36,7 +36,9 @@ committed edit, rename, addition and deletion, plus an uncommitted edit, an untr
 deleted-then-recreated path) listed the six rows `git diff <M> --name-status -M --` and the `??`
 rows give, with `app.rs` showing the committed and uncommitted change in one hunk equal to
 `git diff <M> -- app.rs`, the untracked row equal to `git diff --no-index -- /dev/null u.txt`,
-and the rename row carrying its old path; the base was `main` with no configuration, a pick of
+and the rename row carrying its old path and, after editing the renamed file, the hunk
+`@@ -1,3 +1,4 @@` / `+plus a line` with `+1 −0` equal to `git diff <M> -M -- old.txt new.txt`;
+the base was `main` with no configuration, a pick of
 `refs/tags/v0.1` was written to `bases.json` and survived quitting and reopening the viewer.
 
 - **Row 1.** `cargo test --locked git_diff_response` (16 tests) on 2026-09-20. By hand on
