@@ -192,8 +192,7 @@ API in a separate process with one test, before starting its Tokio runtime.
 | `tests/e2e_real_herdr.rs` | `tests/e2e_real_herdr.rs` | Copies only `ProcessGuard` and `modified`; adapts isolation for a named server with cleared child environments and explicit CLI targeting, discovers the host's socket and plugin-state paths without assuming its directory name, then checks split creation/reuse and the real session mtime. |
 
 `tests/fixtures/herdr-0.8.0-schema.json` is the complete output of
-`$HERDR_BIN_PATH api schema --json`, captured from the installed Herdr 0.8.0
-binary at `/home/will/.local/bin/herdr` (protocol 19, schema version 1).
+`herdr api schema --json`, captured from Herdr 0.8.0 (protocol 19, schema version 1).
 Tier A tests resolve each method's parameter definition in this fixture and
 check allowed and required keys for every recorded request. Every fake response
 is checked against the captured success/error definition for required keys and

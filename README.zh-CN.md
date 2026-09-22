@@ -8,16 +8,16 @@
 
 ## 安装
 
-**GitHub 仓库和发行版尚不存在。** 请使用当前检出目录，按照下方本地开发说明运行。
-仓库及首个发行版发布后，计划使用以下命令安装：
+从 [GitHub](https://github.com/winoooops/herdr-hunks) 安装：
 
 ```sh
 herdr plugin install winoooops/herdr-hunks
 ```
 
 分支版本用户应使用自己的 `vimeflow` 可执行文件运行同样的命令，因为插件注册表相互独立。
-安装时将下载经过 SHA256 校验的 macOS 或 Linux 二进制文件，支持 x86_64 和 arm64。
-资源缺失、下载失败或校验不匹配时，会回退到 `cargo build --release`，需要 Rust 1.88 或更新版本。
+目前尚无发行版，因此安装会通过 `cargo build --release` 从源码构建，需要 Rust 1.88 或更新版本。
+发行版发布后，安装会下载经过 SHA256 校验的 macOS 或 Linux 二进制文件，支持 x86_64 和 arm64。
+资源缺失、下载失败或校验不匹配时，会回退到相同的源码构建流程。
 
 ## 命令
 
@@ -33,10 +33,10 @@ herdr plugin action invoke update --plugin winoooops.hunks
 | --- | --- |
 | `open` | 为发起窗格的工作目录打开并聚焦弹出对话框，默认宽高均为 80%。宿主必须处于普通工作区视图。 |
 | `open-split` | 在右侧打开分割窗格；若会话、发起窗格、仓库、标题和 cwd 仍匹配，则聚焦已有查看器。 |
-| `update` | 对 GitHub 安装，安装最新稳定版本标签；拒绝本地链接或未知来源。GitHub 仓库和发行版尚不存在，此操作须待发布后使用。 |
+| `update` | 对 GitHub 安装，安装最新稳定版本标签；拒绝本地链接或未知来源。在发行标签出现之前，会提示未找到发行标签，不会安装任何内容。 |
 
 独立运行：`herdr-hunks [PATH]` 或 `herdr-hunks tui [PATH]`；PATH 默认为当前目录。
-标准输入和标准输出都必须连接到终端。`--version` 输出版本。
+标准输入和标准输出都必须连接到终端。`--version` 输出 `herdr-hunks 0.0.1`。
 可通过 `herdr plugin log list --plugin winoooops.hunks --limit 1` 查看操作诊断信息。
 
 ## 快捷键绑定

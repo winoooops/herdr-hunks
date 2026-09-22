@@ -8,18 +8,18 @@ Phase 1 does not stage, unstage, discard, add comments, or dispatch to agents.
 
 ## Install
 
-**The GitHub repository and releases do not exist yet.** Use the local development
-instructions below with this checkout. After the repository and first release
-are published, the planned installation command is:
+Install from [GitHub](https://github.com/winoooops/herdr-hunks):
 
 ```sh
 herdr plugin install winoooops/herdr-hunks
 ```
 
 Fork users must run the same command with their `vimeflow` binary; the plugin
-registries are separate. Installation will fetch a SHA256-verified binary for
+registries are separate. No release is published yet, so installation currently
+builds from source with `cargo build --release` and requires Rust 1.88 or newer.
+Once a release is published, installation fetches a SHA256-verified binary for
 macOS or Linux, on x86_64 or arm64. A missing asset, failed download, or checksum
-mismatch falls back to `cargo build --release`, requiring Rust 1.88 or newer.
+mismatch falls back to the same source build.
 
 ## Commands
 
@@ -35,11 +35,11 @@ herdr plugin action invoke update --plugin winoooops.hunks
 | --- | --- |
 | `open` | Opens a focused popup dialog for the opener's working directory, 80% wide and 80% high by default. The host must be in its normal workspace view. |
 | `open-split` | Opens a split on the right, or focuses its existing viewer when the session, opener, repository, title, and cwd still match. |
-| `update` | For a GitHub install, installs the newest stable version tag. Refuses linked/unknown sources. The GitHub repository and releases do not exist yet, so this is for after publication. |
+| `update` | For a GitHub install, installs the newest stable version tag. Refuses linked/unknown sources. Until a release tag exists, it reports that no release tags were found and installs nothing. |
 
 Standalone: `herdr-hunks [PATH]` or `herdr-hunks tui [PATH]`; PATH defaults to the
 current directory. Both stdin and stdout must be terminals. `--version` prints
-the version. Action diagnostics are available through
+`herdr-hunks 0.0.1`. Action diagnostics are available through
 `herdr plugin log list --plugin winoooops.hunks --limit 1`.
 
 ## Keybinding
