@@ -91,7 +91,7 @@ refreshes.
 A row's diff. For a tracked row:
 
 ```
-git -C <toplevel> diff <M> --no-color --no-ext-diff [-M] -- [<old>] <path>
+git -C <toplevel> diff <M> --no-color --no-ext-diff --src-prefix=a/ --dst-prefix=b/ [-M] -- [<old>] <path>
 ```
 
 `<M>` is the merge-base pinned by this refresh. `-M` and `<old>` (looked up
@@ -103,11 +103,17 @@ A pathspec matches its descendants too, so when the branch replaced the file
 `tools` with the directory `tools/run`, `git diff <M> -- tools` prints both
 patches, and the frozen `parse_git_diff` would read the second file's headers
 as content of the first. The engine therefore cuts the output into its
-`diff --git` sections and keeps the one whose `b/` path is the row's `path`
-(`a/` path for a deletion, `a/<old>` and `b/<path>` for a rename) before
-parsing; the other sections are dropped. The kept section is parsed by the
-frozen `parse_git_diff` and becomes a `LoadedDiff` through the Phase 1 size
-cap (3.2). An untracked row uses the Phase 1 path unchanged:
+`diff --git` sections and keeps every section whose header names the row:
+`b/<path>` (`a/<path>` for a deletion; `a/<old>` and `b/<path>` for a
+rename). The prefixes are forced with `--src-prefix=a/ --dst-prefix=b/`, so
+`diff.noprefix` and `diff.mnemonicPrefix` in the user's config cannot change
+them, and a header path that git quoted (spaces, non-ASCII, quotes) is
+decoded with the frozen `decode_git_patch_path` (D6, 7.7) before comparison.
+A type change (a file replaced by a symlink, or the reverse) is printed as
+two sections for one path, a deletion and a creation; both are kept, each is
+parsed on its own by the frozen `parse_git_diff`, and their hunks are
+concatenated in order into one `LoadedDiff` through the Phase 1 size cap
+(3.2). Sections naming other paths are dropped. An untracked row uses the Phase 1 path unchanged:
 `get_git_diff_inner(cwd, path, false, Some(true))`, which diffs against
 `/dev/null` with `--no-index`. (The frozen worktree-scope diff has the same
 exposure for a staged row whose path became a directory; it is registered as
@@ -246,11 +252,16 @@ worktree of every repository that uses this state directory, and two viewers
 picking at once must not lose each other's entry. The file is then replaced
 atomically (temp file and rename, as `reuse::save` does). It is written only on
 a pick; resolution never writes. When the lock is busy for its whole retry
-window the pick holds for the session and the picker's footer says it was not
-remembered. Picking the picker's first row, the reset row of 7.4, removes the
+window, or the state directory is unusable, the pick is kept in memory as a
+session override, `session_pick: Option<Option<String>>` (`Some(Some(ref))`
+for a pick, `Some(None)` for a reset), which resolution consults before step
+1 for the rest of the session, so `r` and scope switches cannot restore the
+stale entry in `bases.json`; the picker's footer says the pick was not
+remembered. A later pick that does persist clears the override. Another
+viewer's saved update is seen only by a viewer without an override, at its
+next resolution. Picking the picker's first row, the reset row of 7.4, removes the
 entry, so the worktree returns to steps 2-5. Without a usable
-state directory the pick holds for the session and the picker says so in its
-footer. Two viewers on the same worktree see each other's pick at their next
+state directory the same session override applies. Two viewers on the same worktree see each other's pick at their next
 resolution, which happens on their next refresh of the base (a scope switch
 or `r`), not on every poll.
 
@@ -337,7 +348,9 @@ columns wide at most, over the body like the key sheet:
   substring match on the label; an empty input shows every row. The row of the
   current base, when it matches, comes right after the reset row and is marked
   `picked` or `config` by its source; the checked-out branch is marked
-  `current`. Rows are never disabled.
+  `current`; every tag row is marked `tag`, so a branch and a tag that share a
+  name (`release` and `release` · `tag`) stay distinguishable while their
+  labels are the same. Rows are never disabled.
 - Keys inside the picker: printable characters and `Backspace` edit the input;
   `Down`/`Up` and `Ctrl+n`/`Ctrl+p` move the cursor (`j`/`k` are text here);
   `Enter` picks the row under the cursor, whichever kind of row it is; `Esc`
@@ -401,8 +414,9 @@ Frozen tree. The merge-base commands are built by the engine, not by the
 frozen `get_git_diff_inner`, which hard-codes its two bases (working tree or
 index against `HEAD`). The engine needs four functions of the frozen module
 that are private today: `run_git_with_timeout` (the 30 s timeout and the
-D3-compatible spawn), `parse_git_diff`, `parse_numstat` and
-`validate_file_path`. Divergence D6 is a registered patch that changes their
+D3-compatible spawn), `parse_git_diff`, `parse_numstat`,
+`decode_git_patch_path` and `validate_file_path`. Divergence D6 is a
+registered patch that changes their
 visibility to `pub(crate)` and nothing else; it is listed in
 `PORT-SURFACE.md` and checked by `port-check` like D4 and D5. No frozen
 behaviour changes, and the frozen tests are unaffected. One frozen defect is
