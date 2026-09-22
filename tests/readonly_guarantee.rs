@@ -1,4 +1,4 @@
-use herdr_hunks::engine::{init_process_env, spawn, Command, DiffState, SessionConfig};
+use herdr_hunks::engine::{init_process_env, spawn, Command, DiffState, Scope, SessionConfig};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
@@ -86,7 +86,11 @@ fn the_engine_never_mutates_the_repository() {
     std::fs::write(p.join("b.txt"), "b\n").unwrap();
     git(&real, p, &["add", "b.txt"]);
     git(&real, p, &["commit", "-q", "-m", "b"]);
-    git(&real, p, &["branch", "other"]); // same commit, so switching HEAD touches neither index nor worktree
+    git(&real, p, &["switch", "-q", "-c", "feat"]);
+    std::fs::write(p.join("c.txt"), "c\n").unwrap();
+    git(&real, p, &["add", "c.txt"]);
+    git(&real, p, &["commit", "-q", "-m", "c"]);
+    git(&real, p, &["branch", "other", "main"]);
     std::fs::write(p.join("b.txt"), "B\n").unwrap();
     git(&real, p, &["add", "b.txt"]); // a staged row
     std::fs::write(p.join("a.txt"), "ONE\n").unwrap(); // an unstaged row
@@ -126,30 +130,25 @@ fn the_engine_never_mutates_the_repository() {
         .enable_all()
         .build()
         .unwrap();
+    let state = tempfile::tempdir().unwrap();
     let mut config = SessionConfig::production(p.to_path_buf());
     config.poll_interval = Duration::from_millis(100);
+    config.state_dir = Some(state.path().to_path_buf());
     let handle = spawn(rt.handle(), config);
-    // Load every row, then switch branches underneath the engine.
+    // Load every worktree row before switching scope.
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut loaded = std::collections::BTreeSet::new();
     let mut rows = 0usize;
-    let mut switched = false;
-    let mut saw_other = false;
-    while Instant::now() < deadline && !(rows > 0 && loaded.len() == rows && saw_other) {
+    while Instant::now() < deadline && !(rows > 0 && loaded.len() == rows) {
         let Ok(s) = handle.snapshots.recv_timeout(Duration::from_millis(200)) else {
             continue;
         };
         rows = s.files.len();
-        saw_other |= matches!(&s.repo, herdr_hunks::engine::RepoState::Repo { branch: Some(b), .. } if b == "other");
         if let DiffState::Ready(d) = &s.diff {
             if loaded.insert((d.key.path.clone(), d.key.staged)) {
                 handle.commands.send(Command::SelectNext).unwrap();
                 handle.commands.send(Command::Refresh).unwrap();
             }
-        }
-        if rows > 0 && loaded.len() == rows && !switched {
-            switched = true;
-            git(&real, p, &["symbolic-ref", "HEAD", "refs/heads/other"]); // the harness, through the real git
         }
     }
     assert_eq!(
@@ -157,6 +156,83 @@ fn the_engine_never_mutates_the_repository() {
         "expected a staged, an unstaged and an untracked row"
     );
     assert_eq!(loaded.len(), rows, "not every row was loaded: {loaded:?}");
+    // Branch scope: every row, the ref list, a different base, and back.
+    handle
+        .commands
+        .send(Command::SetScope(Scope::Branch))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut branch_loaded = std::collections::BTreeSet::new();
+    let mut branch_rows = 0usize;
+    while Instant::now() < deadline && !(branch_rows > 0 && branch_loaded.len() == branch_rows) {
+        let Ok(s) = handle.snapshots.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
+        if s.scope != Scope::Branch {
+            continue;
+        }
+        branch_rows = s.files.len();
+        if let DiffState::Ready(d) = &s.diff {
+            if branch_loaded.insert((d.key.path.clone(), d.key.untracked)) {
+                handle.commands.send(Command::SelectNext).unwrap();
+            }
+        }
+    }
+    assert_eq!(
+        branch_rows, 4,
+        "a.txt, b.txt, c.txt and new.txt against main"
+    );
+    assert_eq!(
+        branch_loaded.len(),
+        branch_rows,
+        "not every branch row was loaded: {branch_loaded:?}"
+    );
+    handle.commands.send(Command::LoadRefs).unwrap();
+    handle
+        .commands
+        .send(Command::SetBase(Some("refs/heads/other".into())))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (mut saw_refs, mut picked) = (false, false);
+    while Instant::now() < deadline && !(saw_refs && picked) {
+        let Ok(s) = handle.snapshots.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
+        saw_refs |= s
+            .refs
+            .as_ref()
+            .is_some_and(|r| r.iter().any(|r| r == "refs/heads/other"));
+        picked |= s.pick_seq == 1
+            && s.base
+                .as_ref()
+                .is_some_and(|b| b.requested == "refs/heads/other")
+            && s.pick_error.is_none();
+    }
+    assert!(saw_refs, "the ref list never listed refs/heads/other");
+    assert!(picked, "the pick was not published");
+    handle
+        .commands
+        .send(Command::SetScope(Scope::Worktree))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut back = false;
+    while Instant::now() < deadline && !back {
+        let Ok(s) = handle.snapshots.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
+        back = s.scope == Scope::Worktree && s.files.len() == 3;
+    }
+    assert!(back, "worktree scope did not come back");
+    // Now the harness switches HEAD underneath the engine, through the real git.
+    git(&real, p, &["symbolic-ref", "HEAD", "refs/heads/other"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut saw_other = false;
+    while Instant::now() < deadline && !saw_other {
+        let Ok(s) = handle.snapshots.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
+        saw_other = matches!(&s.repo, herdr_hunks::engine::RepoState::Repo { branch: Some(b), .. } if b == "other");
+    }
     assert!(saw_other, "the branch switch never reached the engine");
     std::thread::sleep(Duration::from_millis(400)); // a few D2 ticks
     handle.commands.send(Command::Shutdown).unwrap();
@@ -202,6 +278,52 @@ fn the_engine_never_mutates_the_repository() {
             fields[0]
         );
     }
+    let subs: std::collections::BTreeSet<&str> = recorded
+        .lines()
+        .map(|entry| {
+            let args: Vec<&str> = entry
+                .split('\t')
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .collect();
+            let mut i = 0;
+            while args.get(i) == Some(&"-C") {
+                i += 2;
+            }
+            args.get(i).copied().unwrap_or("")
+        })
+        .collect();
+    for expected in ["merge-base", "for-each-ref", "symbolic-ref", "rev-parse"] {
+        assert!(subs.contains(expected), "{expected} never ran: {subs:?}");
+    }
+    assert!(
+        recorded
+            .lines()
+            .any(|l| l.contains("diff ") && l.contains("--name-status -M -z --")),
+        "no name-status against the merge-base"
+    );
+    assert!(
+        !recorded.lines().any(|l| l.contains("--merge-base")),
+        "the merge-base must be pinned, never recomputed by git diff"
+    );
+    let mut written: Vec<String> = std::fs::read_dir(state.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    written.sort();
+    assert_eq!(
+        written,
+        ["bases.json", "split-panes.lock"],
+        "the viewer wrote something else"
+    );
+    let picks: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(&std::fs::read_to_string(state.path().join("bases.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        picks.values().collect::<Vec<_>>(),
+        [&"refs/heads/other".to_string()]
+    );
     assert_eq!(
         std::fs::read(p.join(".git/index")).unwrap(),
         index_before,

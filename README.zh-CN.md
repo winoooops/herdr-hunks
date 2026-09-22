@@ -35,7 +35,7 @@ herdr plugin action invoke update --plugin winoooops.hunks
 | `update` | 对 GitHub 安装，当最新发行标签比当前运行版本更新时安装它，否则提示已是最新；拒绝本地链接或未知来源。 |
 
 独立运行：`herdr-hunks [PATH]` 或 `herdr-hunks tui [PATH]`；PATH 默认为当前目录。
-标准输入和标准输出都必须连接到终端。`--version` 输出 `herdr-hunks 0.0.1`。
+标准输入和标准输出都必须连接到终端。`--version` 输出 `herdr-hunks 0.1.0`。
 可通过 `herdr plugin log list --plugin winoooops.hunks --limit 1` 查看操作诊断信息。
 
 ## 快捷键绑定
@@ -65,13 +65,15 @@ description = "Open the hunk viewer"
 | `t` | 切换统一 / 并排视图；并排视图至少需要 100 列 |
 | `e` / `E` | 切换 / 固定文件面板 |
 | `r` | 刷新 |
+| `b` | 切换范围：worktree <-> branch |
+| `B` | 选择比较基准 |
 | `g` / `G`、Home / End | 第一行 / 最后一行 |
 | `H` / `L` | 向左 / 向右滚动八个显示单元 |
 | `m` | 切换鼠标捕获 |
 | `?` | 打开按键帮助；用 `j` / `k` 或 Down / Up 滚动 |
 | `q` | 退出；若按键帮助已打开，则先关闭帮助 |
-| Esc | 关闭按键帮助；否则关闭弹出查看器 |
-| Ctrl+C | 立即退出，包括在按键帮助中 |
+| Esc | 关闭按键帮助或基准选择器；否则关闭弹出查看器 |
+| Ctrl+C | 立即退出，包括在按键帮助或基准选择器中 |
 
 方向键、PageDown、PageUp、Home 和 End 的别名仅在不带修饰键时生效。
 第一阶段保留 `s d D i I u U x v y Y @ c /`，不绑定任何操作。
@@ -80,11 +82,11 @@ description = "Open the hunk viewer"
 
 工具栏控件是带左右留白、粗体和反色的按钮。禁用控件变暗且不可点击：
 文件少于两个时的文件切换按钮、已加载区块少于两个时的区块切换按钮，
-以及所请求模式为统一视图且宽度不足 100 列时的视图按钮。
+以及所请求模式为统一视图且宽度不足 100 列时的视图按钮。未解析到基准时，范围按钮也会禁用。
 悬停按钮会高亮，并在页脚显示说明和按键；悬停文件行会加粗。
 移开后恢复通常的按键提示。可点击按钮、文件行和差异行。滚轮每次滚动三行。
 按 `m` 禁用捕获，恢复终端原生文本选择；再次按下可启用捕获。禁用捕获会清除悬停状态。
-帮助打开时，滚轮用于滚动帮助内容。
+帮助打开时，滚轮用于滚动帮助内容。在基准选择器中，点击一行即可选择，滚轮用于移动光标。
 
 ## 配置
 
@@ -93,11 +95,15 @@ description = "Open the hunk viewer"
 
 ```toml
 [view]
-mode = "auto"     # auto, unified, split
-files = "auto"    # auto, pinned, hidden
+mode = "auto"      # auto, unified, split
+files = "auto"     # auto, pinned, hidden
+scope = "worktree" # worktree, branch
 
 [input]
 mouse = true
+
+[base]
+ref = "main"       # 任意修订；参见“分支范围”
 
 [popup]
 width = "80%"
@@ -111,12 +117,42 @@ height = "80%"
 根据初始宽度，auto 视图模式在达到 120 列时选择并排视图，auto 文件面板在达到 100 列时固定。
 选择并排视图后，宽度不足 100 列会临时改为统一视图，恢复宽度后再切回。
 尺寸小于 40×10 时仅显示尺寸提示。
-无效的 view/input 设置会逐项回退并显示提示；诊断信息写入 `$HERDR_PLUGIN_STATE_DIR` 下的
+无效的 view/input/base 设置会逐项回退并显示提示；诊断信息写入 `$HERDR_PLUGIN_STATE_DIR` 下的
 `config-problems.log`，否则使用 `${XDG_STATE_HOME:-$HOME/.local/state}/herdr-hunks`。
 
 目录设置必须是绝对路径；空值或相对路径会继续尝试下一个绝对路径设置。
 没有可用状态目录时，仍可打开分割窗格，但不复用已有窗格，并报告原因。
 不会根据仓库位置推导状态目录。
+
+## 分支范围
+
+查看器有两种范围。`worktree`（默认）列出 `git status` 中的内容：
+相对于 `HEAD` 的已暂存、未暂存和未跟踪更改。`branch` 列出当前分支相对于基准的全部更改：
+将工作树与 `merge-base(HEAD, base)` 比较，无论是否已提交，每个路径显示一行，另加未跟踪文件。
+按 `b` 切换（工具栏按钮显示 `worktree` 或 `vs <base>`）；
+将 `prefix+f` 绑定到 `open-split` 后，依次按 `prefix`、`f`、`b` 即可进入。
+在分支上删除后又以未跟踪文件重建的路径会显示为两行。
+
+基准按以下顺序解析，采用第一个指向提交的值：
+
+1. 在此工作树中用 `B` 选择的基准（保存在状态目录的 `bases.json` 中）；
+2. `config.toml` 中的 `[base] ref`；
+3. `refs/heads/main`；
+4. 远程仓库的默认分支（`refs/remotes/origin/HEAD`）；
+5. `refs/heads/master`。
+
+如果都无法解析，按 `b` 会显示 `no base branch: set [base] ref or press B`。
+
+`B` 打开“Compare against”：输入文字可筛选本地分支、远程分支和标签
+（按新到旧排列，最多 200 条；其余项可直接输入），也可输入任意修订，例如 `origin/main` 或 `HEAD~3`。
+`Enter` 选择，`Esc` 取消，第一行 `default (...)` 用于清除已选基准。
+从列表选择的引用会以完整限定名传给 git；自由输入和 `[base] ref` 按原文传入，
+因此存在同名标签时应写成 `refs/heads/x`。选择的基准按工作树保存；
+状态目录不可用时，仅在当前会话内有效。
+
+分支范围与查看器的其他部分一样为只读，只在运行的 git 命令中增加 `merge-base` 和 `for-each-ref`。
+每次刷新都会重新检查基准，因此基准移动后（例如合并到 `main` 或执行 fetch），
+会在一个轮询间隔内反映出来。
 
 ## 运行要求
 
@@ -128,9 +164,11 @@ height = "80%"
 ## 已知限制
 
 本阶段为只读，尚未实现暂存和评论。
-[PORT-SURFACE.md 列出了 K1–K6](PORT-SURFACE.md#known-defects)：K1–K4 是冻结代码中修改路径的缺陷，
+[PORT-SURFACE.md 列出了 K1–K7](PORT-SURFACE.md#known-defects)：K1–K4 是冻结代码中修改路径的缺陷，
 第一阶段不会触发；K5 可能隐藏先暂存修改或新增、再删除文件时的暂存部分；
 K6 会使已被新请求取代的慢速差异请求累积 git 进程。
+在 worktree 范围中，若已暂存行的路径由文件变成目录，会把目录的补丁解析为该行自己的补丁
+（PORT-SURFACE.md 中的 K7）；branch 范围不受影响。
 差异视图最多保留 200,000 行，超出后显示截断提示行。
 `GIT_NO_LAZY_FETCH` 从 Git 2.45 起生效；更早的 Git 在读取部分克隆时可能下载缺失对象。
 尚不支持语法高亮或展开上下文。
