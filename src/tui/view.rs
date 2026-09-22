@@ -1,6 +1,6 @@
 //! Pure view: snapshot + view state in, styled lines and hit regions out.
 use crate::engine::nav::ViewMode;
-use crate::engine::{DiffState, FileKey, RepoState, Snapshot};
+use crate::engine::{DiffState, FileKey, RepoState, Scope, Snapshot};
 use crate::git::ChangedFileStatus;
 use crate::tui::format::{pad, truncate, width};
 use crate::tui::rows::Row;
@@ -18,6 +18,7 @@ pub enum Action {
     NextFile,
     PrevHunk,
     NextHunk,
+    ToggleScope,
     ToggleView,
     ToggleFiles,
     Refresh,
@@ -33,6 +34,7 @@ impl Action {
             Self::NextFile => KeyAction::FileNext,
             Self::PrevHunk => KeyAction::HunkPrev,
             Self::NextHunk => KeyAction::HunkNext,
+            Self::ToggleScope => KeyAction::ToggleScope,
             Self::ToggleView => KeyAction::ToggleView,
             Self::ToggleFiles => KeyAction::ToggleFiles,
             Self::Refresh => KeyAction::Refresh,
@@ -168,7 +170,11 @@ fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Ve
     } else {
         "⟳"
     };
-    vec![
+    let scope_chip = match (snapshot.scope, &snapshot.base) {
+        (Scope::Branch, Some(base)) => format!("vs {}", truncate(&sanitize(base.label()), 16)),
+        _ => "worktree".to_string(),
+    };
+    let mut items: Vec<ToolbarItem> = vec![
         (
             vec![
                 ("‹".into(), Some(Action::PrevFile)),
@@ -186,6 +192,7 @@ fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Ve
             ],
             1,
         ),
+        (vec![(scope_chip, Some(Action::ToggleScope))], 2),
         (
             vec![(
                 if state.mode == ViewMode::Split {
@@ -196,16 +203,19 @@ fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Ve
                 .into(),
                 Some(Action::ToggleView),
             )],
-            2,
-        ),
-        (
-            vec![(if staged { "STAGED" } else { "UNSTAGED" }.into(), None)],
             3,
         ),
-        (vec![(stats, None)], 4),
-        (vec![("files".into(), Some(Action::ToggleFiles))], 5),
-        (vec![(busy.into(), Some(Action::Refresh))], 6),
-    ]
+    ];
+    if snapshot.scope == Scope::Worktree {
+        items.push((
+            vec![(if staged { "STAGED" } else { "UNSTAGED" }.into(), None)],
+            4,
+        ));
+    }
+    items.push((vec![(stats, None)], 5));
+    items.push((vec![("files".into(), Some(Action::ToggleFiles))], 6));
+    items.push((vec![(busy.into(), Some(Action::Refresh))], 7));
+    items
 }
 
 fn toolbar(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> (Line, Vec<Hit>) {
@@ -247,6 +257,7 @@ fn toolbar(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> (Line, V
                     Action::ToggleView => {
                         total_width >= MIN_SPLIT_WIDTH || state.requested_mode == ViewMode::Split
                     }
+                    Action::ToggleScope => snapshot.base.is_some(),
                     _ => true,
                 };
                 if enabled {
@@ -768,6 +779,7 @@ mod tests {
         for piece in [
             "‹  a.rs 2/2  ›",
             "{} 1/2  ↑   ↓",
+            "worktree",
             "unified",
             "UNSTAGED",
             "+4 −3",
@@ -795,6 +807,7 @@ mod tests {
         let (r, _) = rendered(50, 20, FilesPanel::Hidden);
         let bar = &r.plain()[0];
         assert!(bar.contains("‹  a.rs 2/2  ›") && bar.contains("{} 1/2"));
+        assert!(bar.contains("worktree") && !bar.contains("unified"));
         assert!(!bar.contains("⟳") && !bar.contains("files"));
     }
 
@@ -1104,6 +1117,7 @@ mod tests {
                 (" › ", Action::NextFile, file_count >= 2),
                 (" ↑ ", Action::PrevHunk, loaded && hunks >= 2),
                 (" ↓ ", Action::NextHunk, loaded && hunks >= 2),
+                (" worktree ", Action::ToggleScope, false),
                 (
                     " unified ",
                     Action::ToggleView,
@@ -1230,6 +1244,7 @@ mod tests {
             let visible = [
                 text.contains("‹"),
                 text.contains("{}"),
+                text.contains("worktree"),
                 text.contains("unified"),
                 text.contains("UNSTAGED"),
                 text.contains("+4"),
@@ -1267,5 +1282,89 @@ mod tests {
             render(&snap, &state, 80, 12).plain()[6].trim(),
             "not a git repository"
         );
+    }
+
+    #[test]
+    fn the_scope_chip_names_the_base_and_is_dim_without_one() {
+        use crate::engine::{Base, BaseSource, Scope};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        // No base: the chip reads `worktree`, is dim and has no hit region.
+        let r = render(&snap, &st, 120, 24);
+        let bar = &r.lines[0];
+        let chip = bar
+            .iter()
+            .find(|s| s.text == " worktree ")
+            .or_else(|| bar.iter().find(|s| s.text == "worktree"));
+        assert_eq!(chip.map(|s| s.style.role), Some(Role::Label));
+        assert!(!r.hits.iter().any(|h| h.action == Action::ToggleScope));
+        assert!(r.plain()[0].contains("UNSTAGED"));
+        // A base: clickable, and the hover hint names the key.
+        snap.base = Some(Base {
+            requested: "refs/heads/main".into(),
+            commit: "0".repeat(40),
+            merge_base: None,
+            source: BaseSource::Default,
+        });
+        let r = render(&snap, &st, 120, 24);
+        let hit = r
+            .hits
+            .iter()
+            .find(|h| h.action == Action::ToggleScope)
+            .expect("chip hit");
+        assert_eq!(hit.y, 0);
+        st.hover = Some((hit.x0, 0));
+        let r = render(&snap, &st, 120, 24);
+        assert_eq!(r.plain().last().unwrap(), "switch scope · b");
+        // Branch scope: `vs main`, and the staged label is gone.
+        snap.scope = Scope::Branch;
+        snap.base.as_mut().unwrap().merge_base = Some("1".repeat(40));
+        st.hover = None;
+        let r = render(&snap, &st, 120, 24);
+        let top = &r.plain()[0];
+        assert!(top.contains("vs main"), "{top}");
+        assert!(
+            !top.contains("UNSTAGED") && !top.contains("STAGED"),
+            "{top}"
+        );
+        snap.base.as_mut().unwrap().requested =
+            "refs/remotes/origin/a-very-long-branch-name".into();
+        let r = render(&snap, &st, 120, 24);
+        assert!(
+            r.plain()[0].contains("vs origin/a-very-l…"),
+            "{}",
+            r.plain()[0]
+        ); // 15 cells + the ellipsis
+    }
+
+    #[test]
+    fn the_view_chip_drops_before_the_scope_chip() {
+        use crate::engine::{Base, BaseSource};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        snap.base = Some(Base {
+            requested: "refs/heads/main".into(),
+            commit: "0".repeat(40),
+            merge_base: None,
+            source: BaseSource::Default,
+        });
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        let mut width = 120u16;
+        let mut saw_scope_without_view = false;
+        while width >= 40 {
+            let top = render(&snap, &st, width, 24).plain()[0].clone();
+            let has_scope = top.contains("worktree");
+            let has_view = top.contains("unified");
+            assert!(
+                !has_view || has_scope,
+                "the view chip outlived the scope chip at {width}: {top}"
+            );
+            saw_scope_without_view |= has_scope && !has_view;
+            width -= 4;
+        }
+        assert!(saw_scope_without_view);
     }
 }

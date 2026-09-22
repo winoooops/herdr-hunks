@@ -27,6 +27,7 @@ pub struct ViewState {
     pub rows: Option<Rows>,
     pub body_height: u16,
     pub help_offset: usize,
+    seen_base_error: Option<String>,
     width: u16,
     /// The diff the rows were built from. Holding the Arc makes `Arc::ptr_eq` a safe,
     /// allocation-free "did anything change" test; the engine swaps the Arc only on change.
@@ -51,6 +52,7 @@ impl ViewState {
             rows: None,
             body_height: 0,
             help_offset: 0,
+            seen_base_error: None,
             width: 0,
             built_from: None,
         }
@@ -119,26 +121,38 @@ impl ViewState {
         }
     }
 
+    /// Called once per snapshot the shell receives, before the next frame.
+    pub fn observe(&mut self, snapshot: &Snapshot) {
+        if snapshot.base_error != self.seen_base_error {
+            self.seen_base_error = snapshot.base_error.clone();
+            if let Some(error) = &snapshot.base_error {
+                self.notice = Some(crate::tui::sanitize::sanitize(error));
+            }
+        }
+    }
+
     pub fn reconcile(&mut self, snapshot: &Snapshot) {
         let DiffState::Ready(diff) = &snapshot.diff else {
+            // Keep the identity and previous diff for the next Ready.
             self.rows = None;
             self.cursor = None;
-            self.cursor_id = None;
             self.offset = 0;
             self.hscroll = 0;
-            self.built_from = None;
             return;
         };
         // Runs before every frame, so the unchanged case must cost nothing: no clone, no compare of text.
         if let Some((built, mode)) = &self.built_from {
-            if std::sync::Arc::ptr_eq(built, diff) && *mode == self.mode {
+            if std::sync::Arc::ptr_eq(built, diff) && *mode == self.mode && self.rows.is_some() {
                 return;
             }
         }
         let same_file = self
             .built_from
             .as_ref()
-            .map(|(built, _)| built.key == diff.key)
+            .map(|(built, _)| {
+                built.key == diff.key
+                    || (built.comparison != diff.comparison && built.key.path == diff.key.path)
+            })
             .unwrap_or(false);
         let old_row = match (&self.rows, self.cursor) {
             (Some(rows), Some(c)) => rows.row_of_target.get(c).copied(),
@@ -392,5 +406,67 @@ pub(crate) mod tests {
         st.reconcile(&snapshot("a.rs", "r2", &[(1, "++")]));
         assert_eq!(st.cursor, Some(1));
         assert_eq!(st.cursor_id, Some((Side::Additions, 2)));
+    }
+
+    #[test]
+    fn a_new_base_error_becomes_a_notice_once() {
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.observe(&snap);
+        assert!(st.notice.is_none());
+        snap.base_error = Some("remembered pick: not a commit: gone\u{1b}".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_deref(),
+            Some("remembered pick: not a commit: gone\u{241b}")
+        );
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none(), "the same error is not repeated");
+        snap.base_error = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none());
+    }
+
+    #[test]
+    fn a_scope_switch_keeps_the_line_and_a_new_path_starts_at_the_first_change() {
+        use crate::engine::Comparison;
+        let mut snap = snapshot("a.rs", "r1", &[(10, " --+ "), (40, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        let first_change = st.cursor.expect("first changed row");
+        let DiffState::Ready(diff) = &snap.diff else {
+            unreachable!()
+        };
+        st.set_cursor(diff, 3);
+        let id = st.cursor_id.expect("cursor identity");
+        snap.diff = DiffState::Loading;
+        st.reconcile(&snap);
+        assert!(st.cursor.is_none() && st.rows.is_none());
+        let mut branch = snapshot("a.rs", "r2", &[(10, " --+ "), (40, "+")]);
+        if let DiffState::Ready(d) = &mut branch.diff {
+            std::sync::Arc::make_mut(d).comparison = Comparison::Branch {
+                merge_base: "1".repeat(40),
+            };
+        }
+        snap.diff = branch.diff;
+        st.reconcile(&snap);
+        assert_eq!(
+            st.cursor_id,
+            Some(id),
+            "the same path under the new comparison keeps its line"
+        );
+        assert_eq!(st.cursor, Some(3));
+        snap.diff = DiffState::Loading;
+        st.reconcile(&snap);
+        snap.diff = snapshot("b.rs", "r3", &[(10, " --+ "), (40, "+")]).diff;
+        st.reconcile(&snap);
+        assert_eq!(
+            st.cursor,
+            Some(first_change),
+            "a new path starts at its first change"
+        );
+        assert_ne!(st.cursor, Some(3));
     }
 }

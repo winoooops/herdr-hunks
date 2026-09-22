@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::engine::Scope;
 pub use crate::paths::{config_dir, state_dir};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +21,8 @@ pub struct Config {
     pub mode: ModeSetting,
     pub files: FilesSetting,
     pub mouse: bool,
+    pub scope: Scope,
+    pub base: Option<String>,
 }
 
 impl Default for Config {
@@ -28,6 +31,8 @@ impl Default for Config {
             mode: ModeSetting::Auto,
             files: FilesSetting::Auto,
             mouse: true,
+            scope: Scope::Worktree,
+            base: None,
         }
     }
 }
@@ -74,6 +79,21 @@ pub fn load(dir: &Path) -> (Config, Vec<String>) {
         None => {}
         Some(Some(b)) => config.mouse = b,
         Some(None) => problems.push("input.mouse: expected true or false".to_string()),
+    }
+    match get("view", "scope").map(|v| v.as_str().map(str::to_owned)) {
+        None => {}
+        Some(Some(s)) if s == "worktree" => config.scope = Scope::Worktree,
+        Some(Some(s)) if s == "branch" => config.scope = Scope::Branch,
+        Some(other) => problems.push(format!(
+            "view.scope: expected \"worktree\" or \"branch\", got {other:?}"
+        )),
+    }
+    match get("base", "ref").map(|v| v.as_str().map(str::to_owned)) {
+        None => {}
+        Some(Some(s)) if crate::engine::base::check_text(&s).is_ok() => config.base = Some(s),
+        Some(other) => problems.push(format!(
+            "base.ref: expected a revision that does not start with '-', got {other:?}"
+        )),
     }
     (config, problems)
 }
@@ -176,5 +196,38 @@ mod tests {
         assert_eq!(config, Config::default());
         assert_eq!(problems.len(), 1);
         assert!(problems[0].starts_with("config.toml:"));
+    }
+
+    #[test]
+    fn scope_and_base_keys_are_parsed_and_bad_values_cost_only_their_key() {
+        use crate::engine::Scope;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[view]\nscope = \"branch\"\n[base]\nref = \"origin/main\"\n",
+        )
+        .unwrap();
+        let (config, problems) = load(dir.path());
+        assert_eq!(
+            (config.scope, config.base.as_deref()),
+            (Scope::Branch, Some("origin/main"))
+        );
+        assert!(problems.is_empty());
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[view]\nscope = \"both\"\n[base]\nref = \"-x\"\n",
+        )
+        .unwrap();
+        let (config, problems) = load(dir.path());
+        assert_eq!((config.scope, config.base), (Scope::Worktree, None));
+        assert_eq!(problems.len(), 2);
+        assert!(
+            problems[0].starts_with("view.scope: ") && problems[1].starts_with("base.ref: "),
+            "{problems:?}"
+        );
+        assert_eq!(
+            load(tempfile::tempdir().unwrap().path()).0.scope,
+            Scope::Worktree
+        );
     }
 }

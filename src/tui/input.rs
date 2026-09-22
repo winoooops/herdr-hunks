@@ -4,7 +4,7 @@ use crossterm::event::{
 };
 
 use crate::engine::nav::{self, Side, ViewMode};
-use crate::engine::{Command, DiffState, FileKey, Snapshot};
+use crate::engine::{Command, DiffState, FileKey, Snapshot, NO_BASE_NOTICE};
 use crate::tui::keys::{self, KeyAction};
 use crate::tui::layout::clamp_scroll;
 use crate::tui::state::{FilesPanel, ViewState};
@@ -96,6 +96,15 @@ fn act(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction, width: u16
     match action {
         Quit => return Outcome::Quit,
         Refresh => return Outcome::Engine(Command::Refresh),
+        ToggleScope => {
+            return match snapshot.base {
+                None => {
+                    state.notice = Some(NO_BASE_NOTICE.into());
+                    Outcome::Redraw
+                }
+                Some(_) => Outcome::Engine(Command::SetScope(snapshot.scope.other())),
+            };
+        }
         FileNext => return Outcome::Engine(Command::SelectNext),
         FilePrev => return Outcome::Engine(Command::SelectPrev),
         ToggleView => {
@@ -1108,5 +1117,38 @@ mod tests {
         st.hover = Some((1, 0));
         assert_eq!(handle_key(&mut st, &snap, key("m"), 120), Outcome::Redraw);
         assert_eq!(st.hover, None);
+    }
+
+    #[test]
+    fn b_switches_scope_or_says_there_is_no_base() {
+        use crate::engine::{Base, BaseSource, Scope, NO_BASE_NOTICE};
+        let (mut snap, mut st) = setup(&[(1, "+")]);
+        assert_eq!(handle_key(&mut st, &snap, key("b"), 120), Outcome::Redraw);
+        assert_eq!(st.notice.as_deref(), Some(NO_BASE_NOTICE));
+        snap.base = Some(Base {
+            requested: "refs/heads/main".into(),
+            commit: "0".repeat(40),
+            merge_base: None,
+            source: BaseSource::Default,
+        });
+        assert_eq!(
+            handle_key(&mut st, &snap, key("b"), 120),
+            Outcome::Engine(Command::SetScope(Scope::Branch))
+        );
+        assert!(st.notice.is_none(), "any handled key clears the notice");
+        snap.scope = Scope::Branch;
+        assert_eq!(
+            handle_key(&mut st, &snap, key("b"), 120),
+            Outcome::Engine(Command::SetScope(Scope::Worktree))
+        );
+        for reserved in RESERVED {
+            assert!(
+                matches!(
+                    handle_key(&mut st, &snap, key(reserved), 120),
+                    Outcome::Inert
+                ),
+                "{reserved} in branch scope"
+            );
+        }
     }
 }

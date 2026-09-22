@@ -143,6 +143,7 @@ fn run_terminal(
             }
         }
         while let Ok(next) = handle.snapshots.try_recv() {
+            state.observe(&next);
             snapshot = next;
             dirty = true;
         }
@@ -231,7 +232,11 @@ pub fn run(path: PathBuf) -> i32 {
             return 1;
         }
     };
-    let handle = engine::spawn(runtime.handle(), SessionConfig::production(path.clone()));
+    let mut session = SessionConfig::production(path.clone());
+    session.scope = config.scope;
+    session.base_ref = config.base.clone();
+    session.state_dir = config::state_dir(lookup);
+    let handle = engine::spawn(runtime.handle(), session);
     install_panic_hook();
     let result = run_terminal(&handle, &config, notice, &path);
     let _ = handle.commands.send(Command::Shutdown);
@@ -305,6 +310,7 @@ mod tests {
             mode: ModeSetting::Split,
             files: FilesSetting::Hidden,
             mouse: false,
+            ..Config::default()
         };
         let mut state = initial_state(&config, 99);
         assert_eq!(
@@ -320,6 +326,7 @@ mod tests {
             mode: ModeSetting::Unified,
             files: FilesSetting::Pinned,
             mouse: true,
+            ..Config::default()
         };
         assert_eq!(initial_state(&config, 120).mode, ViewMode::Unified);
         assert_eq!(initial_state(&config, 40).files_panel, FilesPanel::Pinned);
