@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 use std::time::{Duration, Instant};
 
-const ALLOWED: [&str; 8] = [
+const ALLOWED: [&str; 10] = [
     "--version",
     "rev-parse",
     "status",
@@ -13,6 +13,8 @@ const ALLOWED: [&str; 8] = [
     "show",
     "cat-file",
     "symbolic-ref",
+    "merge-base",
+    "for-each-ref",
 ];
 
 fn real_git() -> PathBuf {

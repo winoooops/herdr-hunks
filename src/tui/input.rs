@@ -282,12 +282,7 @@ pub fn handle_mouse(
         Some(Action::SelectFile(index)) => snapshot
             .files
             .get(*index)
-            .map(|file| {
-                Outcome::Engine(Command::Select(FileKey {
-                    path: file.path.clone(),
-                    staged: file.staged,
-                }))
-            })
+            .map(|file| Outcome::Engine(Command::Select(FileKey::of(file))))
             .unwrap_or(Outcome::Inert),
         Some(Action::CursorToRow(row)) => {
             if let (DiffState::Ready(diff), Some(rows)) = (&snapshot.diff, &state.rows) {
@@ -866,7 +861,8 @@ mod tests {
             handle_mouse(&mut st, &snap, &rendered, click),
             Outcome::Engine(Command::Select(FileKey {
                 path: "a.rs".into(),
-                staged: true
+                staged: true,
+                untracked: false,
             }))
         );
         assert_eq!(

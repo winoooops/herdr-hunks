@@ -188,7 +188,7 @@ impl ViewState {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::engine::{DiffState, FileKey, LoadedDiff, RepoState, Snapshot};
+    use crate::engine::{Comparison, DiffState, FileKey, LoadedDiff, RepoState, Snapshot};
     use crate::git::{DiffHunk, DiffLine, DiffLineType, FileDiff, GetGitDiffResponse};
     use std::sync::Arc;
 
@@ -220,9 +220,11 @@ pub(crate) mod tests {
         let key = FileKey {
             path: path.into(),
             staged: false,
+            untracked: false,
         };
         let loaded = LoadedDiff::build(
             key.clone(),
+            Comparison::Worktree,
             GetGitDiffResponse {
                 file_diff: FileDiff {
                     file_path: path.into(),

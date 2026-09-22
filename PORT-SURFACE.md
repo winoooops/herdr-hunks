@@ -11,8 +11,9 @@ then changed only by the registered patches below:
 - `src/git/test_helpers.rs`
 
 `scripts/port-check.sh <vimeflow-checkout>` verifies the pinned sources plus
-`port/patches/*.patch` in order against `src/git/`. Two patches are registered:
-`0001-no-ext-diff.patch` (D4) and `0002-drain-sync-output.patch` (D5).
+`port/patches/*.patch` in order against `src/git/`. Three patches are registered:
+`0001-no-ext-diff.patch` (D4), `0002-drain-sync-output.patch` (D5) and
+`0003-engine-visibility.patch` (D6).
 `sh scripts/port-check-selftest.sh <vimeflow-checkout>` verifies the baseline and rejection of symlinks, extra files, hand edits, and unregistered patches in a temporary copy.
 
 ## Port surface
@@ -26,6 +27,20 @@ crate::runtime::{serialize_event, EventSink}
 
 Tests additionally import `crate::runtime::FakeEventSink`.
 The mutating git functions are copied but are not called in Phase 1.
+
+The engine calls these frozen functions:
+
+- `git_status_inner`
+- `get_git_diff_inner`
+- `git_branch_inner`
+- `git_worktree_name_inner`
+- `start_git_watcher_backend`
+- `stop_git_watcher_backend`
+- `run_git_with_timeout` (D6, pub(crate))
+- `validate_file_path` (D6, pub(crate))
+- `parse_numstat` (D6, pub(crate))
+- `parse_git_diff` (D6, pub(crate))
+- `decode_git_patch_path` (D6, pub(crate))
 
 ## Shims
 
@@ -126,12 +141,21 @@ status-hash fallback never works and a git process is always hung.
 threads while waiting, and adds its test inside `watcher.rs`, because the function
 is private.
 
+**D6 (branch scope, patch): engine visibility.** Branch scope builds its own
+`merge-base`, `name-status`, `numstat` and per-row `diff` commands (spec 7.2)
+instead of the frozen `get_git_diff_inner`, which hard-codes its two bases.
+`port/patches/0003-engine-visibility.patch` changes `run_git_with_timeout`,
+`validate_file_path`, `parse_numstat`, `parse_git_diff` and
+`decode_git_patch_path` from private to `pub(crate)`. Nothing else changes: the
+30 s timeout, the D3-compatible spawn and both parsers behave exactly as
+before, and every frozen test is unaffected.
+
 ## Known defects
 
-**K1-K6: known defects.** K1-K5 are in the frozen tree. K1-K4 sit in the mutating
-paths and are unreachable in Phase 1. K5 is in a read path and is visible in
-Phase 1. All five are fixed in Phase 2, through the patch mechanism of 2.2 or by sibling
-reimplementation where a patch would be large.
+**K1-K7: known defects.** K1-K5 and K7 are in the frozen tree. K1-K4 sit in the
+mutating paths and are unreachable in Phase 1. K5 and K7 are in read paths and
+are visible in Phase 1. K1-K5 and K7 are fixed in Phase 2, through the patch
+mechanism of 2.2 or by sibling reimplementation where a patch would be large.
 
 - **K1.** Stage, unstage and discard run with `current_dir(<pane cwd>)`
   (`mod.rs:369,393,437-462`), while status and diff return toplevel-relative paths
@@ -157,6 +181,12 @@ reimplementation where a patch would be large.
   would not kill its git child. Holding n/p with slow diffs can therefore pile
   up git processes. Phase 1 accepts this limitation. Phase 2 adds a concurrency
   cap or a cancellable runner.
+- **K7.** A staged row whose path was a file and is now a directory (`D tools`
+  next to `A tools/run` in the index) gets both patches from
+  `git diff --cached -- tools`, because a pathspec matches its descendants, and
+  `parse_git_diff` reads the second file's headers as content of the first.
+  Rare, worktree scope only. Branch scope is unaffected: the engine cuts the
+  output into `diff --git` sections and keeps only the row's own (spec 7.2).
 
 ## Adapted tests
 

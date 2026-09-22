@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Semaphore;
 
-use super::{gitver, Command, DiffState, FileKey, LoadedDiff, RepoState, Snapshot};
-use crate::git::{self, ChangedFile, ChangedFileStatus, GetGitDiffResponse, GitStatusResponse};
+use super::{gitver, Command, Comparison, DiffState, FileKey, LoadedDiff, RepoState, Snapshot};
+use crate::git::{self, ChangedFile, GetGitDiffResponse, GitStatusResponse};
 use crate::runtime::EventSink;
 
 pub type BoxFut<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
@@ -121,14 +121,24 @@ fn fingerprint(s: &Snapshot) -> String {
         DiffState::Ready(d) => format!("ready:{:p}", Arc::as_ptr(d)),
     };
     format!(
-        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}",
+        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}",
         s.repo,
         serde_json::to_string(&s.files).unwrap_or_default(),
         s.selected,
         diff,
         s.status_error,
         s.watcher_error,
-        s.refreshing
+        s.refreshing,
+        s.scope,
+        s.base,
+        s.base_error,
+        s.default_base,
+        s.rename_sources,
+        s.refs.as_ref().map(Arc::as_ptr),
+        s.refs_overflow,
+        s.refs_seq,
+        s.pick_seq,
+        s.pick_error
     )
 }
 
@@ -203,11 +213,6 @@ impl State {
         let generation = self.diff_generation;
         self.diff_in_flight = Some((generation, key.clone()));
         self.diff_dirty = false;
-        let untracked = self
-            .snapshot
-            .files
-            .iter()
-            .any(|f| key_of(f) == key && matches!(f.status, ChangedFileStatus::Untracked));
         let cwd = cwd.to_string();
         let results = results.clone();
         tokio::spawn(async move {
@@ -218,7 +223,8 @@ impl State {
                 gate.acquire().await.expect("diff gate closed").forget();
             }
             let result =
-                git::get_git_diff_inner(cwd, key.path.clone(), key.staged, Some(untracked)).await;
+                git::get_git_diff_inner(cwd, key.path.clone(), key.staged, Some(key.untracked))
+                    .await;
             let _ = results.send(Done::Diff {
                 generation,
                 key,
@@ -299,10 +305,7 @@ async fn stop_watcher(
 }
 
 fn key_of(file: &ChangedFile) -> FileKey {
-    FileKey {
-        path: file.path.clone(),
-        staged: file.staged,
-    }
+    FileKey::of(file)
 }
 
 async fn run(
@@ -522,7 +525,7 @@ async fn run(
                                 Ok(response) => {
                                     let unchanged = matches!(&next.diff, DiffState::Ready(d) if d.key == key && d.raw_diff == response.raw_diff);
                                     if !unchanged {
-                                        next.diff = DiffState::Ready(Arc::new(LoadedDiff::build(key, response)));
+                                        next.diff = DiffState::Ready(Arc::new(LoadedDiff::build(key, Comparison::Worktree, response)));
                                     }
                                 }
                                 Err(e) => next.diff = DiffState::Failed(e),
@@ -687,7 +690,8 @@ mod tests {
             s.selected,
             Some(FileKey {
                 path: "a.txt".into(),
-                staged: false
+                staged: false,
+                untracked: false,
             })
         );
         assert_eq!(ready(&s).unwrap().file_diff.hunks.len(), 1);

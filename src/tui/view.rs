@@ -1,6 +1,6 @@
 //! Pure view: snapshot + view state in, styled lines and hit regions out.
 use crate::engine::nav::ViewMode;
-use crate::engine::{DiffState, RepoState, Snapshot};
+use crate::engine::{DiffState, FileKey, RepoState, Snapshot};
 use crate::git::ChangedFileStatus;
 use crate::tui::format::{pad, truncate, width};
 use crate::tui::rows::Row;
@@ -119,12 +119,10 @@ type ToolbarItem = (Vec<(String, Option<Action>)>, u8);
 /// Toolbar items left to right; a higher drop order drops first.
 fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Vec<ToolbarItem> {
     let total = snapshot.files.len();
-    let index = snapshot.selected.as_ref().and_then(|k| {
-        snapshot
-            .files
-            .iter()
-            .position(|f| f.path == k.path && f.staged == k.staged)
-    });
+    let index = snapshot
+        .selected
+        .as_ref()
+        .and_then(|k| snapshot.files.iter().position(|f| FileKey::of(f) == *k));
     let name = snapshot
         .selected
         .as_ref()
@@ -337,7 +335,7 @@ fn files_lines(snapshot: &Snapshot, state: &ViewState, height: u16) -> (Vec<Line
         snapshot
             .files
             .iter()
-            .position(|file| file.path == key.path && file.staged == key.staged)
+            .position(|file| FileKey::of(file) == *key)
     });
     let count = usize::from(height.saturating_sub(2));
     let first = selected
