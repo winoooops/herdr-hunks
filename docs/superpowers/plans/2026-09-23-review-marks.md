@@ -663,6 +663,15 @@ Also applied there: `request_status` must not let a queued `Change::Mark` swallo
 `resolve_pending` flag an explicit `r` set. A mark now runs `BaseJob::Resolve` when that flag is
 pending and `BaseJob::Keep` otherwise, so `Mark → Refresh → Mark` still reloads the preferences.
 
+The fourth round found the other half of both: `rows_at` was taken from the refresh's *opening*
+sample, so rows loaded across a HEAD move could name a commit whose files they never listed --
+restoring that commit afterwards then let a clean diff pass the check and `M` acknowledge unseen
+files. It now comes from `confirmed`, the bracketed sample, so a refresh that spanned a move
+vouches for nothing. And a resolution is only *consumed* when it is delivered: `State`'s
+`in_flight_resolve` puts `resolve_pending` back whenever the refresh carrying it published no
+rows, which covers a mark whose id will not verify and, with it, the older case of an explicit
+`r` lost to a failed status.
+
 - [ ] **Step 9: Commit (orchestrator)**
 
 ```bash

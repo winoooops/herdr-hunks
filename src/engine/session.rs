@@ -192,6 +192,8 @@ struct State {
     in_flight_mark: Option<String>,
     /// The commit the published row list was loaded at; `None` before the first rows.
     rows_at: Option<String>,
+    /// The refresh in flight was asked to run the resolution steps.
+    in_flight_resolve: bool,
     pick_seq: u64,
     mark_seq: u64,
 }
@@ -539,6 +541,7 @@ impl State {
                 BaseJob::Keep(self.snapshot.base.clone())
             }
         };
+        self.in_flight_resolve = matches!(base, BaseJob::Resolve);
         let job = Job {
             cwd: cwd.to_string(),
             with_head,
@@ -779,6 +782,7 @@ async fn run(
         changes: VecDeque::new(),
         in_flight_mark: None,
         rows_at: None,
+        in_flight_resolve: false,
         pick_seq: 0,
         mark_seq: 0,
     };
@@ -999,7 +1003,10 @@ async fn run(
                     Done::Status { response, head, head_seen, head_sampled, confirmed, loaded, change } => {
                         state.status_in_flight = false;
                         state.in_flight_mark = None;
-                        let head_seen_for_rows = head_seen.clone();
+                        // The rows may only claim a commit the refresh bracketed: the opening
+                        // sample alone would let rows loaded across a move name a commit whose
+                        // files they never listed.
+                        let head_seen_for_rows = confirmed.clone();
                         let before = comparison_of(&state.snapshot);
                         let mut succeeded = false;
                         let mut change_error = None;
@@ -1124,6 +1131,13 @@ async fn run(
                             next.mark_seq = state.mark_seq;
                             next.mark_error = mark_answer.or_else(|| Some("no answer".into()));
                         }
+                        // A refresh asked to resolve that delivered no rows puts the request
+                        // back: an explicit `r` must not be lost to a failed status or to a mark
+                        // whose id would not verify.
+                        if !succeeded && state.in_flight_resolve {
+                            state.resolve_pending = true;
+                        }
+                        state.in_flight_resolve = false;
                         if head_sampled {
                             // Published even when the load failed: this is the observation, not
                             // a claim about the rows. A failed refresh keeps the previous rows,
@@ -2959,13 +2973,30 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         base::save_pick(state.path(), &toplevel, Some("refs/heads/side")).unwrap();
-        h.commands.send(Command::MarkReviewed(a)).unwrap();
+        h.commands.send(Command::MarkReviewed(a.clone())).unwrap();
         h.commands.send(Command::Refresh).unwrap();
         h.commands.send(Command::MarkReviewed(b)).unwrap();
         let s = wait_for(&h, "the remembered pick is resolved", |s| {
             s.base.as_ref().map(|base| base.requested.as_str()) == Some("refs/heads/side")
         });
         assert_eq!(s.mark_seq, 2, "both marks still answered");
+
+        // The same holds when the mark that carries the resolution cannot be verified. The
+        // first mark's refresh is in flight, so `r` only records the request, and the failing
+        // mark's refresh is the one that takes it: its rows never load, so the request must go
+        // back rather than be consumed with them.
+        git(dir.path(), &["branch", "later", "HEAD~1"]);
+        base::save_pick(state.path(), &toplevel, Some("refs/heads/later")).unwrap();
+        h.commands.send(Command::MarkReviewed(a)).unwrap();
+        h.commands.send(Command::Refresh).unwrap();
+        h.commands
+            .send(Command::MarkReviewed("b".repeat(40)))
+            .unwrap();
+        let s = wait_for(&h, "the failed mark did not eat the resolution", |s| {
+            s.base.as_ref().map(|base| base.requested.as_str()) == Some("refs/heads/later")
+                && s.mark_seq == 4
+        });
+        assert_eq!(s.mark_error.as_deref(), Some("not a commit: bbbbbbb"));
     }
 
     #[test]
