@@ -209,7 +209,10 @@ impl ViewState {
                 _ => {}
             }
         }
-        if snapshot.base_error != self.seen_base_error {
+        // A base error arriving in the same snapshot as a mark answer waits its turn: the
+        // answer the user is owed for the key they just pressed is not overwritten before it
+        // is drawn, and `seen_base_error` stays unrecorded so the next snapshot still reports.
+        if snapshot.base_error != self.seen_base_error && !answered_mark {
             self.seen_base_error = snapshot.base_error.clone();
             if let (Some(error), None) = (&snapshot.base_error, &self.picker) {
                 self.warn(crate::tui::sanitize::sanitize(error));
@@ -632,6 +635,37 @@ pub(crate) mod tests {
         assert!(
             st.notice.is_none(),
             "an unreadable pair also warns only once"
+        );
+    }
+
+    #[test]
+    fn a_base_error_does_not_overwrite_a_mark_answer_from_the_same_snapshot() {
+        use crate::engine::{Mark, MarkState};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        // One refresh answers the mark and reports a base problem at once.
+        snap.mark_seq = 1;
+        snap.mark_error = Some("mark not remembered: no state directory".into());
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Current,
+            classified_at: None,
+        });
+        snap.base_error = Some("remembered pick: not a commit: gone".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("mark not remembered: no state directory"),
+            "the mark answer is not overwritten before it is drawn"
+        );
+
+        // The base error is not lost either: it speaks at the next snapshot.
+        st.notice = None;
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("remembered pick: not a commit: gone")
         );
     }
 

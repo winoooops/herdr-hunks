@@ -161,6 +161,11 @@ fn apply_action(
 ) -> Outcome {
     let cleared_notice = state.notice.take().is_some();
     let outcome = act(state, snapshot, action, width);
+    // A warning held back behind that answer has no new snapshot to arrive on: a settled
+    // repository publishes none. Give it this frame, now that the answer is acknowledged.
+    if cleared_notice && state.notice.is_none() {
+        state.observe(snapshot);
+    }
     if cleared_notice && outcome == Outcome::Inert {
         Outcome::Redraw
     } else {
@@ -1674,6 +1679,38 @@ mod tests {
             );
             assert_eq!(snap.scope, scope);
         }
+    }
+
+    #[test]
+    fn acknowledging_an_answer_shows_the_warning_that_waited_behind_it() {
+        use crate::engine::{Mark, MarkState};
+        let (mut snap, mut st) = setup(&[(1, "+")]);
+        snap.head_seen = Some("h1".repeat(20));
+        // One snapshot carries both the unwritable mark and its rewritten classification.
+        snap.mark_seq = 1;
+        snap.mark_error = Some("mark not remembered: no state directory".into());
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Rewritten,
+            classified_at: snap.head_seen.clone(),
+        });
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.clone()).as_deref(),
+            Some("mark not remembered: no state directory")
+        );
+
+        // A settled repository publishes no further snapshot, so the body key that clears the
+        // answer is the only chance the warning gets.
+        handle_key(&mut st, &snap, key("t"), 120);
+        let notice = st.notice.as_ref().expect("the warning follows the answer");
+        assert!(notice.urgent);
+        assert!(notice.text.contains("no longer on this branch"));
+
+        // And the next body key clears that one, leaving nothing behind.
+        handle_key(&mut st, &snap, key("t"), 120);
+        assert!(st.notice.is_none());
     }
 
     #[test]

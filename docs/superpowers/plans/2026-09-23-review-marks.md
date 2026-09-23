@@ -2220,6 +2220,14 @@ Every existing assignment becomes a call: `state.notice = Some("split view needs
 with the private fields `seen_mark_seq: u64` and
 `seen_rewrite: Option<(String, String, crate::engine::MarkState)>` initialised in `new`.
 
+The pre-PR review's fifth round closed the two holes this deferral opens. A `base_error` in the
+same snapshot as a mark answer waits its turn as well (`&& !answered_mark`, with `seen_base_error`
+left unrecorded), so the answer the user is owed for the key they just pressed is drawn before
+anything replaces it. And a warning held back this way has no snapshot to arrive on in a settled
+repository -- polls that change nothing publish nothing -- so `apply_action` re-runs `observe`
+when a body key clears a notice and leaves none behind. That is the only moment a deferred
+warning can surface without new engine state, and it is where the regression test presses.
+
 `src/tui/view.rs`'s `notice` puts an urgent one first:
 
 ```rust
