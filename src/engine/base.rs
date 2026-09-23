@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::actions::reuse;
-use crate::engine::{Base, BaseSource};
+use crate::engine::{ref_label, Base, BaseSource, QuickBase};
 use crate::git::run_git_with_timeout;
 
 pub const REFS_CAP: usize = 200;
@@ -307,6 +307,38 @@ pub(crate) async fn list_refs(toplevel: &str) -> Result<(Vec<String>, bool), Str
     let overflow = refs.len() > REFS_CAP;
     refs.truncate(REFS_CAP);
     Ok((refs, overflow))
+}
+
+/// Independent quick bases in display order; unresolved revisions are omitted.
+pub(crate) async fn quick_bases(toplevel: &str) -> Vec<QuickBase> {
+    let mut rows = Vec::new();
+    if let Ok(output) = git(
+        toplevel,
+        &["rev-parse", "--symbolic-full-name", "@{upstream}"],
+    )
+    .await
+    {
+        if output.status.success() {
+            let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !name.is_empty() {
+                rows.push(QuickBase {
+                    label: "upstream".into(),
+                    detail: ref_label(&name).to_string(),
+                    submits: name,
+                });
+            }
+        }
+    }
+    for (label, revision) in [("last commit", "HEAD~1"), ("last 3 commits", "HEAD~3")] {
+        if let Ok(id) = verify(toplevel, revision).await {
+            rows.push(QuickBase {
+                label: label.into(),
+                detail: id[..id.len().min(7)].to_string(),
+                submits: revision.into(),
+            });
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -655,5 +687,61 @@ mod tests {
 
         // A relative state directory is refused, as for picks.
         assert!(save_mark(std::path::Path::new("relative"), "/r/one", &record).is_err());
+    }
+    #[test]
+    fn quick_bases_offer_only_what_resolves() {
+        let (dir, top) = repo("main");
+        // One commit: no parent, no upstream.
+        let quick = rt().block_on(quick_bases(&top));
+        assert!(quick.is_empty(), "{quick:?}");
+
+        for n in 2..=4 {
+            std::fs::write(dir.path().join("a.txt"), format!("v{n}\n")).unwrap();
+            run(dir.path(), &["add", "-A"]);
+            run(dir.path(), &["commit", "-q", "-m", &format!("c{n}")]);
+            if n == 2 {
+                let quick = rt().block_on(quick_bases(&top));
+                assert_eq!(quick.len(), 1);
+                assert_eq!(quick[0].label, "last commit");
+                assert_eq!(quick[0].submits, "HEAD~1");
+            }
+        }
+        let quick = rt().block_on(quick_bases(&top));
+        assert_eq!(
+            quick.iter().map(|q| q.submits.as_str()).collect::<Vec<_>>(),
+            ["HEAD~1", "HEAD~3"]
+        );
+        // Upstream resolution needs a configured remote and fetch mapping.
+        run(dir.path(), &["remote", "add", "origin", "."]);
+        run(
+            dir.path(),
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        run(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD~1"],
+        );
+        run(
+            dir.path(),
+            &["branch", "--set-upstream-to=origin/main", "main"],
+        );
+
+        let quick = rt().block_on(quick_bases(&top));
+        let labels: Vec<&str> = quick.iter().map(|q| q.label.as_str()).collect();
+        assert_eq!(labels, ["upstream", "last commit", "last 3 commits"]);
+        assert_eq!(quick[0].submits, "refs/remotes/origin/main");
+        assert_eq!(quick[0].detail, "origin/main");
+        assert_eq!(quick[1].submits, "HEAD~1");
+        assert_eq!(quick[2].submits, "HEAD~3");
+        assert_eq!(
+            quick[1].detail.len(),
+            7,
+            "a short id: {:?}",
+            quick[1].detail
+        );
     }
 }

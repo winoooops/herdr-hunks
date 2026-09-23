@@ -6,6 +6,7 @@
 - Before committing, run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and `cargo check --no-default-features`, plus both port checks. Test HOME must be writable and outside a git repository; preserve CARGO_HOME and RUSTUP_HOME when overriding it.
 - Keep inherited clippy allowances on the `git` module declaration; do not alter frozen sources to satisfy lints.
 - Reserved keys remain unbound: `s d D i I u U x v y Y @ c /`. `b` and `B` are the scope keys; the Phase 2 write actions bind in `worktree` scope only and, in `branch` scope, show `switch to worktree scope (b) to stage or discard`.
+- `M` marks a commit as reviewed and writes only `marks.json`; the git allow-list remains unchanged at ten subcommands.
 - Read the plugin ID from `HERDR_PLUGIN_ID`. Reach the host through `HERDR_BIN_PATH` or `HERDR_SOCKET_PATH`; never hardcode its executable name in Rust.
 - Use the shared absolute config/state directory helpers. Never write state relative to the current directory. Sanitize git text before drawing; use named ANSI colours only.
 - Keep Cargo.toml, Cargo.lock, and herdr-plugin.toml versions together, and mirror README changes in English, Simplified Chinese, and Japanese.

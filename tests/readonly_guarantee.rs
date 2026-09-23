@@ -80,6 +80,7 @@ fn the_engine_never_mutates_the_repository() {
     let home = PathBuf::from(std::env::var_os("HOME").expect("test HOME"));
     let home_before: Vec<_> = [
         "bases.json",
+        "marks.json",
         "split-panes.json",
         "split-panes.lock",
         "config-problems.log",
@@ -233,13 +234,34 @@ fn the_engine_never_mutates_the_repository() {
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut back = false;
-    while Instant::now() < deadline && !back {
+    let mut head = None;
+    while Instant::now() < deadline && !(back && head.is_some()) {
         let Ok(s) = handle.snapshots.recv_timeout(Duration::from_millis(200)) else {
             continue;
         };
         back = s.scope == Scope::Worktree && s.files.len() == 3;
+        if back {
+            head = s.head.clone();
+        }
     }
     assert!(back, "worktree scope did not come back");
+    // Mark a loaded head and open the picker again without widening the allow-list.
+    handle
+        .commands
+        .send(Command::MarkReviewed(head.expect("a markable head")))
+        .unwrap();
+    handle.commands.send(Command::LoadRefs(2)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (mut marked, mut refs) = (false, false);
+    while Instant::now() < deadline && !(marked && refs) {
+        let Ok(s) = handle.snapshots.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
+        marked |= s.mark_seq == 1 && s.mark_error.is_none();
+        refs |= s.refs_seq == 2 && s.quick.is_some();
+    }
+    assert!(marked, "the mark was never answered");
+    assert!(refs, "the quick rows never arrived for this opening");
     // Now the harness switches HEAD underneath the engine, through the real git.
     git(&real, p, &["symbolic-ref", "HEAD", "refs/heads/other"]);
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -331,7 +353,7 @@ fn the_engine_never_mutates_the_repository() {
     written.sort();
     assert_eq!(
         written,
-        ["bases.json", "split-panes.lock"],
+        ["bases.json", "marks.json", "split-panes.lock"],
         "the viewer wrote something else"
     );
     let picks: std::collections::BTreeMap<String, String> =

@@ -10,7 +10,7 @@ use tokio::sync::Semaphore;
 use super::base::{self, MarkRecord, ResolveInputs};
 use super::{
     branch, gitver, marks, Base, BaseSource, Command, Comparison, DiffState, FileKey, LoadedDiff,
-    Mark, MarkState, RepoState, Scope, Snapshot, NO_BASE_NOTICE,
+    Mark, MarkState, QuickBase, RepoState, Scope, Snapshot, NO_BASE_NOTICE,
 };
 use crate::git::{self, ChangedFile, GetGitDiffResponse, GitStatusResponse};
 use crate::runtime::EventSink;
@@ -255,6 +255,7 @@ enum Done {
     Refs {
         token: u64,
         result: Result<(Vec<String>, bool), String>,
+        quick: Vec<QuickBase>,
     },
 }
 
@@ -614,7 +615,7 @@ fn fingerprint(s: &Snapshot) -> String {
         DiffState::Ready(d) => format!("ready:{:p}", Arc::as_ptr(d)),
     };
     format!(
-        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}",
+        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}",
         s.repo,
         serde_json::to_string(&s.files).unwrap_or_default(),
         s.selected,
@@ -637,7 +638,8 @@ fn fingerprint(s: &Snapshot) -> String {
         s.mark,
         s.mark_seq,
         s.mark_error,
-        s.unread
+        s.unread,
+        s.quick.as_ref().map(Arc::as_ptr)
     )
 }
 
@@ -861,11 +863,14 @@ async fn run(
                         };
                         let results = results_tx.clone();
                         tokio::spawn(async move {
-                            let result = match toplevel {
-                                Some(toplevel) => base::list_refs(&toplevel).await,
-                                None => Ok((Vec::new(), false)),
+                            let (result, quick) = match toplevel {
+                                Some(toplevel) => (
+                                    base::list_refs(&toplevel).await,
+                                    base::quick_bases(&toplevel).await,
+                                ),
+                                None => (Ok((Vec::new(), false)), Vec::new()),
                             };
-                            let _ = results.send(Done::Refs { token, result });
+                            let _ = results.send(Done::Refs { token, result, quick });
                         });
                     }
                     selection => {
@@ -936,10 +941,11 @@ async fn run(
                         }
                         publish(&mut state, next, &snapshots);
                     }
-                    Done::Refs { token, result } => {
+                    Done::Refs { token, result, quick } => {
                         if token > next.refs_seq {
                             let (refs, overflow) = result.unwrap_or_default();
                             next.refs = Some(Arc::new(refs));
+                            next.quick = Some(Arc::new(quick));
                             next.refs_overflow = overflow;
                             next.refs_seq = token;
                             publish(&mut state, next, &snapshots);
@@ -2429,6 +2435,12 @@ mod tests {
         );
         assert!(!s.refs_overflow);
         assert_eq!(s.refs_seq, 1);
+        assert!(s
+            .quick
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|q| q.submits == "HEAD~1"));
         h.commands.send(Command::LoadRefs(2)).unwrap();
         wait_for(&h, "second answer", |s| s.refs_seq == 2);
 
@@ -2472,6 +2484,10 @@ mod tests {
         assert!(Arc::ptr_eq(
             latest.refs.as_ref().unwrap(),
             newest.refs.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            latest.quick.as_ref().unwrap(),
+            newest.quick.as_ref().unwrap()
         ));
     }
 

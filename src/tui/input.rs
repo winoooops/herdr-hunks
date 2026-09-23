@@ -96,7 +96,7 @@ fn picker_key(state: &mut ViewState, snapshot: &Snapshot, key: KeyEvent) -> Outc
     };
     let rows = picker.rows(snapshot);
     let moved = |picker: &mut crate::tui::picker::Picker, delta: isize| {
-        if picker.move_by(delta, rows.len(), visible) {
+        if picker.move_by(delta, &rows, visible) {
             Outcome::Redraw
         } else {
             Outcome::Inert
@@ -147,7 +147,7 @@ fn pick_row(state: &mut ViewState, snapshot: &Snapshot, index: usize) -> Outcome
     };
     let sent = snapshot.pick_seq.max(state.submitted_pick_seq);
     state.submitted_pick_seq = sent + 1;
-    picker.cursor = index;
+    picker.set_cursor(index, &rows);
     picker.pending = Some(sent);
     picker.error = None;
     Outcome::Engine(Command::SetBase(row.submit()))
@@ -368,8 +368,8 @@ pub fn handle_mouse(
             .saturating_add(u16::from(view::notice(state, snapshot).is_some()));
         if let Some(picker) = state.picker.as_mut() {
             let visible = picker.visible(overlay);
-            let len = picker.rows(snapshot).len();
-            return if picker.move_by(delta, len, visible) {
+            let rows = picker.rows(snapshot);
+            return if picker.move_by(delta, &rows, visible) {
                 Outcome::Redraw
             } else {
                 Outcome::Inert

@@ -38,7 +38,7 @@ herdr plugin action invoke update --plugin winoooops.hunks
 
 Standalone: `herdr-hunks [PATH]` or `herdr-hunks tui [PATH]`; PATH defaults to the
 current directory. Both stdin and stdout must be terminals. `--version` prints
-`herdr-hunks 0.0.2`. Action diagnostics are available through
+`herdr-hunks 0.0.3`. Action diagnostics are available through
 `herdr plugin log list --plugin winoooops.hunks --limit 1`.
 
 ## Keybinding
@@ -70,6 +70,7 @@ To bind the split action instead, change `command` to
 | `r` | Refresh |
 | `b` | Switch scope: worktree <-> branch |
 | `B` | Compare against: pick the base |
+| `M` | Mark the current commit as reviewed |
 | `g` / `G`, Home / End | First / last row |
 | `H` / `L` | Scroll left / right by eight display cells |
 | `m` | Toggle mouse capture |
@@ -167,6 +168,25 @@ Branch scope is read-only like the rest of the viewer: it adds `merge-base`
 and `for-each-ref` to the git commands the viewer runs. The base is
 re-checked on every refresh, so a base that moved (a merge into `main`, a
 fetch) is reflected within the poll interval.
+
+## Review marks
+
+In branch scope, `M` records the commit you have read up to for this worktree.
+Every row a later commit touches then carries `●` in the files panel, and `M`
+again clears them. The dots count commits, not edits: uncommitted work raises
+none, so `M` always clears every dot, and the edits themselves are in the row's
+diff as before. Untracked rows never carry one.
+
+The mark is kept in `marks.json` beside `bases.json` in the state directory, one
+commit per worktree, so it survives closing the viewer and is shared with a
+second viewer on the same worktree. It changes no comparison: a mark that is
+rewritten or pruned flags every row and says so, and the rows, diffs and base
+keep working.
+
+`B` offers the mark as a base — `reviewed (a1b2c3d · 12 min ago)` — and
+choosing it narrows the list to what the working tree differs from the mark by.
+The same picker now lists `upstream`, `last commit` and `last 3 commits` when
+they resolve, so the common bases need no typing.
 
 ## Requirements
 

@@ -285,6 +285,76 @@ fn open_split_creates_one_viewer_and_reuses_it() {
             "--timeout",
             "15000",
         ]);
+        // Wait for the loaded body before marking its commit.
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "@@",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        iso.herdr(&["pane", "send-text", viewer_id, "M"]);
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "as reviewed",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        // Pin the files panel even in a narrow split pane.
+        wait_for("the files panel is shown", || {
+            let screen = iso
+                .herdr(&["pane", "read", viewer_id, "--source", "visible"])
+                .to_string();
+            if screen.contains("CHANGED ") {
+                return true;
+            }
+            iso.herdr(&["pane", "send-text", viewer_id, "E"]);
+            false
+        });
+
+        // Commit to the selected file so its marker and new diff both appear.
+        std::fs::write(repo.join("c.txt"), "c\nAFTER-THE-MARK\n").unwrap();
+        git(&["add", "c.txt"]);
+        git(&["commit", "-q", "-m", "later"]);
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "●",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        // Wait for the new commit's body before marking again.
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "AFTER-THE-MARK",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        iso.herdr(&["pane", "send-text", viewer_id, "M"]);
+        wait_for("the marker clears", || {
+            let screen = iso
+                .herdr(&["pane", "read", viewer_id, "--source", "visible"])
+                .to_string();
+            !screen.contains('●')
+        });
         assert_eq!(
             viewer["cwd"].as_str().map(PathBuf::from),
             Some(std::fs::canonicalize(&repo).unwrap())

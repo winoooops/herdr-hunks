@@ -73,6 +73,15 @@ pub struct Mark {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuickBase {
+    /// `upstream`, `last commit`, or `last 3 commits`.
+    pub label: String,
+    /// A ref name or short object id for display.
+    pub detail: String,
+    pub submits: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Base {
     /// Exactly what git is given: a qualified ref for a picked or resolved
     /// branch, the typed text for free text and config.
@@ -218,6 +227,7 @@ pub struct Snapshot {
     pub refreshing: bool,
     /// The picker's candidates, qualified, most recently created first; `None` until `LoadRefs`.
     pub refs: Option<Arc<Vec<String>>>,
+    pub quick: Option<Arc<Vec<QuickBase>>>,
     pub refs_overflow: bool,
     /// The token of the opening whose `LoadRefs` was answered last.
     pub refs_seq: u64,
@@ -252,6 +262,7 @@ impl Snapshot {
             watcher_error: None,
             refreshing: false,
             refs: None,
+            quick: None,
             refs_overflow: false,
             refs_seq: 0,
             pick_seq: 0,
