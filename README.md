@@ -183,7 +183,10 @@ mutation-path defects unreachable in Phase 1; K5 can hide the staged half of a
 modified/added-then-deleted file; K6 allows superseded slow diffs to accumulate
 git processes. In worktree scope, a staged row whose path turned from a file into
 a directory parses the directory's patch as its own (K7 in PORT-SURFACE.md); branch
-scope is unaffected. The diff view keeps at most 200,000 lines, with a truncation row.
+scope is unaffected. Paths that are not valid UTF-8 are shown with `\u{fffd}` in
+place of the offending bytes and their diff cannot be loaded, because git is given the
+replaced name; two such paths that differ only in those bytes look alike but stay
+separate rows. The diff view keeps at most 200,000 lines, with a truncation row.
 `GIT_NO_LAZY_FETCH` takes effect from Git 2.45; older Git may fetch missing objects
 when reading a partial clone. No syntax highlighting or context expansion yet.
 

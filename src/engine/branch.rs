@@ -119,9 +119,12 @@ pub(crate) async fn rows(
                 .cmp(&matches!(b.status, ChangedFileStatus::Untracked))
         })
     });
-    // Status can precede a git add; only a deletion may coexist with an untracked row.
+    // Status can precede a git add: an untracked row duplicating a tracked one is dropped,
+    // unless the tracked row is a deletion. Two tracked rows with the same displayed path stay.
     files.dedup_by(|current, previous| {
-        current.path == previous.path && !matches!(previous.status, ChangedFileStatus::Deleted)
+        current.path == previous.path
+            && matches!(current.status, ChangedFileStatus::Untracked)
+            && !matches!(previous.status, ChangedFileStatus::Deleted)
     });
     Ok(BranchRows {
         files,
@@ -271,6 +274,58 @@ pub(crate) async fn untracked_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two paths that differ only in bytes UTF-8 cannot represent display alike but stay two rows.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn paths_that_are_not_utf8_are_shown_lossily_but_never_collapsed() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::Command as Proc;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let git = |args: &[&str]| {
+            assert!(Proc::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(p.join("a.txt"), "a\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        git(&["switch", "-q", "-c", "feat"]);
+        std::fs::write(p.join(OsStr::from_bytes(b"n\xfe.txt")), "one\n").unwrap();
+        std::fs::write(p.join(OsStr::from_bytes(b"n\xff.txt")), "two\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "odd names"]);
+        let toplevel = p.canonicalize().unwrap().to_string_lossy().into_owned();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let merge_base = rt
+            .block_on(base::merge_base(&toplevel, "refs/heads/main"))
+            .unwrap();
+        let rows = rt
+            .block_on(rows(&toplevel, &merge_base, Vec::new()))
+            .unwrap();
+        let names: Vec<&str> = rows.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            names,
+            ["n\u{fffd}.txt", "n\u{fffd}.txt"],
+            "both rows survive the sort and dedup"
+        );
+        assert!(rows
+            .files
+            .iter()
+            .all(|f| matches!(f.status, ChangedFileStatus::Added)));
+    }
 
     #[test]
     fn name_status_records_carry_the_old_path_for_renames_and_copies() {
