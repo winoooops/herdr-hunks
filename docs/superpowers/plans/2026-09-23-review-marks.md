@@ -2220,13 +2220,19 @@ Every existing assignment becomes a call: `state.notice = Some("split view needs
 with the private fields `seen_mark_seq: u64` and
 `seen_rewrite: Option<(String, String, crate::engine::MarkState)>` initialised in `new`.
 
-The pre-PR review's fifth round closed the two holes this deferral opens. A `base_error` in the
+The pre-PR review's fifth and sixth rounds closed the holes this deferral opens, and the rule
+that came out of them is worth stating once: **nothing overwrites a notice that has not been
+read, and nothing deferred is forgotten.** A `base_error` in the
 same snapshot as a mark answer waits its turn as well (`&& !answered_mark`, with `seen_base_error`
 left unrecorded), so the answer the user is owed for the key they just pressed is drawn before
-anything replaces it. And a warning held back this way has no snapshot to arrive on in a settled
-repository -- polls that change nothing publish nothing -- so `apply_action` re-runs `observe`
-when a body key clears a notice and leaves none behind. That is the only moment a deferred
-warning can surface without new engine state, and it is where the regression test presses.
+anything replaces it. A base error also waits behind an unacknowledged warning -- including one the
+rewrite branch has just set, whose pair is already recorded and would otherwise never speak
+again. And a notice held back this way has no snapshot to arrive on in a settled repository --
+polls that change nothing publish nothing -- so `apply_action` re-runs `observe` when a body key
+clears a notice and leaves none behind. That is the only moment a deferred notice can surface
+without new engine state, and it is where the regression test presses. The three deferrals then
+form a queue: each acknowledging key shows the next thing that was waiting, and each speaks
+exactly once.
 
 `src/tui/view.rs`'s `notice` puts an urgent one first:
 

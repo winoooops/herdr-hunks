@@ -209,10 +209,14 @@ impl ViewState {
                 _ => {}
             }
         }
-        // A base error arriving in the same snapshot as a mark answer waits its turn: the
-        // answer the user is owed for the key they just pressed is not overwritten before it
-        // is drawn, and `seen_base_error` stays unrecorded so the next snapshot still reports.
-        if snapshot.base_error != self.seen_base_error && !answered_mark {
+        // One rule for every notice that has not been read: nothing overwrites it, and nothing
+        // deferred is forgotten. A base error therefore waits behind a mark answer from this
+        // same snapshot and behind any unacknowledged warning -- including the one the branch
+        // above just set, whose pair is already recorded and would never speak again --
+        // leaving `seen_base_error` unrecorded so the next snapshot, or the `observe` that
+        // follows the acknowledging key, still reports it.
+        let urgent_now = self.notice.as_ref().is_some_and(|n| n.urgent);
+        if snapshot.base_error != self.seen_base_error && !answered_mark && !urgent_now {
             self.seen_base_error = snapshot.base_error.clone();
             if let (Some(error), None) = (&snapshot.base_error, &self.picker) {
                 self.warn(crate::tui::sanitize::sanitize(error));
@@ -667,6 +671,43 @@ pub(crate) mod tests {
             st.notice.as_ref().map(|n| n.text.as_str()),
             Some("remembered pick: not a commit: gone")
         );
+    }
+
+    #[test]
+    fn a_base_error_waits_behind_a_rewrite_warning_and_then_speaks() {
+        use crate::engine::{Mark, MarkState};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        snap.head_seen = Some("h1".repeat(20));
+        // One refresh classifies the mark as rewritten and reports a base problem at once.
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Rewritten,
+            classified_at: snap.head_seen.clone(),
+        });
+        snap.base_error = Some("remembered pick: not a commit: gone".into());
+        st.observe(&snap);
+        assert!(
+            st.notice
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("no longer on this branch"),
+            "the warning for the pair just classified is not overwritten"
+        );
+
+        // Its pair is recorded and would never warn again, so the base error had to wait; it
+        // speaks once the warning is acknowledged.
+        st.notice = None;
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("remembered pick: not a commit: gone")
+        );
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none(), "each of them spoke exactly once");
     }
 
     #[test]
