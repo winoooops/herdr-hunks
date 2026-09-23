@@ -2120,12 +2120,12 @@ pub struct QuickBase {
         ]));
         s.mark = Some(Mark { commit: "a".repeat(40), at: now() - 7_200, state: MarkState::Current, classified_at: None });
         let p = Picker::open(0);
-        let labels = labels(&p.rows(&s));
-        assert_eq!(&labels[0], "default (main)");
-        assert_eq!(&labels[1], "reviewed (aaaaaaa · 2 h ago)");
-        assert_eq!(&labels[2], "upstream (origin/main)");
-        assert_eq!(&labels[3], "last commit (9ffc8fd)");
-        assert!(labels[4..].iter().any(|l| l.starts_with("main")));
+        let shown = labels(&p.rows(&s));
+        assert_eq!(&shown[0], "default (main)");
+        assert_eq!(&shown[1], "reviewed (aaaaaaa · 2 h ago)");
+        assert_eq!(&shown[2], "upstream (origin/main)");
+        assert_eq!(&shown[3], "last commit (9ffc8fd)");
+        assert!(shown[4..].iter().any(|l| l.starts_with("main")));
         assert_eq!(p.rows(&s)[1].submit().as_deref(), Some("a".repeat(40).as_str()));
 
         // The reviewed row is live: its detail follows the snapshot, not a frozen string.
@@ -2166,6 +2166,7 @@ pub struct QuickBase {
             label: "upstream".into(), detail: "origin/main".into(), submits: "refs/remotes/origin/main".into(),
         }]));
         let mut p = Picker::open(0);
+        p.observe(&s); // consume this opening's refs_seq, so the move below is not undone
         p.move_by(1, p.rows(&s).len(), 10); // onto `upstream`
         let before = p.rows(&s)[p.cursor].submit();
         assert_eq!(before.as_deref(), Some("refs/remotes/origin/main"));
@@ -2220,7 +2221,8 @@ whose `submit()` returns `Some(submits.clone())`. `rows()` inserts them after th
                 });
             }
         }
-        for quick in snapshot.quick.as_deref().map(Vec::as_slice).unwrap_or(&[]) {
+        // The same token as the refs: a list from an earlier opening is never shown.
+        for quick in self.quick(snapshot) {
             let haystack = format!("{} {}", quick.label, quick.detail).to_lowercase();
             if haystack.contains(&needle) {
                 rows.push(PickerRow::Quick {
@@ -2232,7 +2234,56 @@ whose `submit()` returns `Some(submits.clone())`. `rows()` inserts them after th
         }
 ```
 
-with the age helper:
+with the token guard beside `refs`:
+
+```rust
+    /// This opening's quick rows; empty until its own `LoadRefs` is answered.
+    pub fn quick<'a>(&self, snapshot: &'a Snapshot) -> &'a [QuickBase] {
+        if snapshot.refs_seq > self.refs_after {
+            snapshot.quick.as_deref().map(Vec::as_slice).unwrap_or(&[])
+        } else {
+            &[]
+        }
+    }
+```
+
+Two rules of 0.0.2's `rows()` and `follow_input` extend to the new rows, each one line:
+
+- the typed row is suppressed when the input is exactly a quick row's label as well as
+  exactly a listed ref label, so `listed` becomes
+  `refs.iter().any(|r| ref_label(r) == self.input) || self.input == "reviewed"
+  || self.quick(snapshot).iter().any(|q| q.label == self.input)`;
+- `follow_input` puts the cursor on the first row that submits a revision *in display
+  order*, which now means `matches!(r, PickerRow::Quick { .. } | PickerRow::Ref { .. })`
+  before falling back to the typed row. Without it, typing `reviewed` or `last commit` and
+  pressing Enter would submit those words as free text rather than the row's revision.
+
+Their test:
+
+```rust
+    #[test]
+    fn typing_a_quick_rows_label_submits_that_base() {
+        use crate::engine::{Mark, MarkState, QuickBase};
+        let mut s = snap(&REFS, None);
+        s.quick = Some(std::sync::Arc::new(vec![QuickBase {
+            label: "last commit".into(), detail: "9ffc8fd".into(), submits: "HEAD~1".into(),
+        }]));
+        s.mark = Some(Mark { commit: "a".repeat(40), at: now(), state: MarkState::Current, classified_at: None });
+        let mut p = Picker::open(0);
+        p.input = "last commit".into();
+        p.retarget(&s);
+        assert_eq!(p.rows(&s)[p.cursor].submit().as_deref(), Some("HEAD~1"));
+        assert!(
+            !labels(&p.rows(&s)).iter().any(|l| l.starts_with("use ")),
+            "an exact quick label leaves no typed row to pick by mistake"
+        );
+        p.input = "reviewed".into();
+        p.retarget(&s);
+        assert_eq!(p.rows(&s)[p.cursor].submit().as_deref(), Some("a".repeat(40).as_str()));
+    }
+```
+
+and the age helper:
 
 ```rust
 /// Coarse, computed at every render: `just now`, `N min ago`, `N h ago`, `N d ago`.
@@ -2303,7 +2354,8 @@ with `seen_mark: Option<String>`, `seen_base: Option<String>` and `rows_at_curso
         id.expect("a markable head")
     };
     handle.commands.send(Command::MarkReviewed(head)).unwrap();
-    handle.commands.send(Command::LoadRefs(1)).unwrap();
+    // A token beyond the one 0.0.2's drive already used, so this is a fresh answer.
+    handle.commands.send(Command::LoadRefs(2)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let (mut marked, mut refs) = (false, false);
     while Instant::now() < deadline && !(marked && refs) {
@@ -2311,10 +2363,10 @@ with `seen_mark: Option<String>`, `seen_base: Option<String>` and `rows_at_curso
             continue;
         };
         marked |= s.mark_seq == 1 && s.mark_error.is_none();
-        refs |= s.quick.is_some();
+        refs |= s.refs_seq == 2 && s.quick.is_some();
     }
     assert!(marked, "the mark was never answered");
-    assert!(refs, "the quick rows never arrived");
+    assert!(refs, "the quick rows never arrived for this opening");
 ```
 
 and the state-directory assertion accepts the new file:
@@ -2403,7 +2455,7 @@ git commit -m "feat: quick picker bases, docs and version 0.0.3"
 - 8.2: head sampled first and used in the commands, the id carried by `LoadedDiff`, `drawn_head` only for body frames, the boundary (Task 1); `MarkReviewed`'s four steps, `marks.json`, the session mark, `mark_seq`/`mark_error`, `at` at the write, the shape check on stored ids (Task 2); `head_seen` (Task 1) and the mark on the snapshot (Tasks 2, 3); the urgent notice rank (Task 4).
 - 8.3: the `--name-only --no-renames` command between two commits, untracked rows excluded, the rename-source rule, the `(mark, head_seen)` classification with retries and the three states (Task 3); the row marker's use of `rename_sources` (Task 4).
 - 8.4: the four quick rows, the live `reviewed` row, label-only matching for it, the cursor rules, the `refs_seq` token (Task 5).
-- 8.5: the marker column, `M`, the key sheet's 24 rows, the chip's alias, the empty-list wording (Task 4; the chip needs no code change — 0.0.2 already derives `vs reviewed` from `base.requested == mark.commit`, and Task 2's `Snapshot.mark` is what it reads).
+- 8.5: the marker column, `M`, the key sheet's 24 rows, the chip's `vs reviewed` alias and its hover hint, the empty-list wording (all Task 4; the alias is a comparison made at render time, so it also stops by itself when a later `M` moves the mark away from the base in force).
 - 8.6: every failure row has a home — nothing drawn (Task 4's refusal), an id that will not validate (Task 2), a malformed or unwritable `marks.json` (Task 2), `Rewritten` and `Unreadable` (Task 3), an unanswerable classification (Task 3's retry), the head `rev-parse` failing or finding nothing (Task 1), a diff that fails or spans a move (Task 1), a quick row that does not resolve (Task 5); the cost paragraph is the commands Tasks 1, 3 and 5 add; no new config key; version 0.0.3 (Task 5).
 - 8.7: tests 1-2 in Task 2, 3 in Task 1, 4 in Task 3, 5 in Task 5, 6-7 in Task 4, 8-9 in Task 5; criteria 10-12 in Task 5's acceptance row.
 
