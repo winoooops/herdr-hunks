@@ -122,6 +122,17 @@ been reset and there is nothing to list. What an empty frame acknowledges is
 "there was nothing to read at this id", and the boundary below says when that
 can be untrue.
 
+The diff that promotes a candidate is named, not merely awaited. When a
+refresh publishes its rows, the engine records with the candidate the
+generation of 3.3's diff request issued for that publication, and only a
+`Done::Diff` carrying that generation, successfully, promotes it. Without the
+pairing, a request issued before the refresh -- 3.3 coalesces a second request
+for the same key and comparison instead of reissuing -- could finish
+afterwards, having read the tree before the commit, and promote an id whose
+changes were never drawn. When the engine coalesces rather than reissues, the
+`diff_dirty` rule of 3.3 reissues once the running diff completes, so the
+generation the candidate waits for always arrives.
+
 A candidate is dropped, not published, when the id it belongs to is
 invalidated: if a later refresh reports no commit at all (below), the pending
 candidate goes with the published id, so a diff that was already running
@@ -233,7 +244,14 @@ whatever refreshes are queued, and each of its git calls carries the frozen
 layer and makes the stored value mean exactly one thing.
 
 **Where the mark lives while the viewer runs.** `Snapshot` gains
-`mark: Option<Mark>`:
+`head_seen: Option<String>` beside the gated `head`: the id the last refresh
+observed, published as observed, with no gate. It is what ancestry is
+classified against and what tells the view that a head change happened at all
+-- the gated `head` cannot, since a refresh whose diff keeps failing leaves it
+unchanged -- and, being part of the snapshot, it also keeps 3.3 from
+suppressing the publication of a head change that altered nothing else.
+
+`Snapshot` also gains `mark: Option<Mark>`:
 
 ```rust
 pub struct Mark {
@@ -279,10 +297,14 @@ reads `just now`; a mark is never rejected for its time.
 promises: after `commit --amend` or a rebase, the marked commit still exists
 but is no longer on the branch, and 7.2 compares against the merge-base of
 `HEAD` and that commit -- their common ancestor -- so changes that were
-already read reappear. Ancestry is therefore recomputed whenever the *sampled* head id changes and a
-mark exists -- the id the refresh observed, not the one the gate of 8.2 has
-published, so a selected diff that keeps failing cannot leave the flag stale
-and the warning unspoken -- and not only when the preference is resolved:
+already read reappear. Ancestry classifies the pair `(mark.commit, head_seen)`: it is computed when a
+mark is first seen, and again when either half changes -- another viewer's
+mark read by a resolution at an unchanged head counts, and so does a head
+change while the gated id stands still. A successful `M` needs no command at
+all, since it marks the head and the pair is trivially true. The
+classification is therefore at most one process per changed pair, which 8.5
+counts, and the flag a snapshot carries always belongs to the pair that
+snapshot carries:
 one `git merge-base --is-ancestor <mark.commit> HEAD` (the subcommand is
 allow-listed by 7.6), which is at most one process per commit, none per poll.
 Its exit status is the answer, and only two values are answers: `0` is true,
@@ -291,7 +313,9 @@ failure to spawn -- leaves the flag as it was. The frozen runner returns
 `Ok(Output)` for every exit status, so the three cases are told apart by the
 code, not by `Result`. When the answer is false the viewer says so
 rather than pretending: the urgent notice `the marked commit is no longer on
-this branch; press M again` appears once per head change, and the picker's row
+this branch; press M again` appears once per classified pair -- the view
+remembers the `(mark.commit, head_seen)` it last warned about, so the warning
+follows every head the refresh observed rather than every head it published -- and the picker's row
 reads `reviewed (abc1234 · rewritten)`. The comparison is left alone -- it is
 still a correct diff against a real commit -- and one `M` repairs it. When the
 command itself fails to run, the flag keeps its previous value and no notice
@@ -302,9 +326,14 @@ leaves the marked root and the new root with no common ancestor at all, so
 `merge-base` fails and 7.8's rule keeps the previous rows with a status error.
 The head gate above then holds `head` at the marked commit, because no refresh
 completes, and `M` would resubmit the very id that cannot be compared. The way
-out is the base, not the mark: `B` and the reset row (or any working base)
-make the rows load again, after which `M` marks the new head. 8.5 lists the
-case so it is not mistaken for a defect in marking.
+out is the base, not the mark, and it has to be a base that shares history
+with the new root: the reset row helps only when what it resolves to does --
+on a feature branch whose root was amended while `main` still points into the
+old history, resolving back to `main` fails the same way. A typed `HEAD`
+always works (`merge-base(HEAD, HEAD)` is `HEAD`, so the rows become the
+uncommitted changes), and so does any commit of the current history. Once rows
+load again, `M` marks the new head. 8.5 lists the case so it is not mistaken
+for a defect in marking.
 
 A mark whose commit no longer exists at all (an amend plus a pruned object)
 needs the same care as the root-commit case, because the marked id is also the
@@ -432,7 +461,7 @@ Additions to the tables of 5.1 and 7.8:
 | the marked commit no longer exists | in branch scope the base fails to verify on every refresh, so 7.8 keeps the previous rows with a status error until `r` (or `B`) re-resolves; resolution then skips the invalid pick with `base_error` and continues at step 2; the picker's `reviewed` row fails validation if chosen |
 | `@{upstream}`, `HEAD~1` or `HEAD~3` do not resolve | that quick row is not offered; the others are |
 | `merge-base --is-ancestor` fails to run | `ancestor` keeps its previous value and no notice is shown |
-| a rewrite leaves no common ancestor at all (an amended root commit) | 7.8's rule: the rows and the head both stay, with git's message as a status error; `B` and a working base restore the rows, and `M` marks again afterwards |
+| a rewrite leaves no common ancestor at all (an amended root commit) | 7.8's rule: the rows and the head both stay, with git's message as a status error; recovery needs a base that shares the new history -- a typed `HEAD` always does, the reset row only if what it resolves to does -- after which `M` marks again |
 | the selected row's diff fails during a refresh | `head` does not advance; `M` keeps marking the last commit whose hunks were drawn |
 | the head `rev-parse` cannot be run (spawn failure, timeout) | `head` keeps its previous value; `M` marks that older id, the safe direction of 8.2 |
 | the head `rev-parse` runs and finds no commit (unborn branch, not a repository) | `head` becomes `None` in the next publication, gate or no gate, taking any pending candidate with it, and clears `drawn_head`; `M` then shows `nothing to mark: no commit yet` instead of marking a commit of the branch that was left |
@@ -470,7 +499,8 @@ Test layers, added to 5.2 and 7.9:
 2. Engine, the published head: a failed diff does not advance it while an
    empty row list does (the recovery of 8.2 needs it); a diff still running
    when `head` is invalidated cannot promote its candidate afterwards; the
-   refresh's row commands carry the sampled id
+   a diff issued before the rows were published never promotes a candidate,
+   even when it completes after them; the refresh's row commands carry the sampled id
    (`merge-base <head> <base>`), so the rows a frame shows are the comparison
    of the id it publishes even when `HEAD` leaves and returns during the job;
    a refresh during which `HEAD` moves -- a commit landing between the two
@@ -493,8 +523,11 @@ Test layers, added to 5.2 and 7.9:
    diff then fails repeatedly still publishes `ancestor = false` and its
    warning, because ancestry follows the sampled head, not the published one; an amended
    root commit leaves the rows and the head untouched with a status error, and
-   picking the reset row restores them so the next `M` succeeds; a pruned
-   marked object is recovered by `r` alone, which re-resolves and skips it.
+   picking the reset row restores them only when what it resolves to shares the
+   new history, while a typed `HEAD` always does, after which the next `M`
+   succeeds; a pruned marked object is recovered by `r` alone, which
+   re-resolves and skips it; a mark loaded from another viewer at an unchanged
+   head is classified on arrival.
 4. Engine, quick bases: the three git-computed rows' presence and `submits` on
    repositories with and without an upstream and with one, two and four
    commits; they ride
@@ -546,4 +579,4 @@ Success criteria, in addition to 1.5 and 7.9:
 11. `docs/acceptance-p1.md` gains row 8 with the same evidence columns; the
     release guard is unchanged.
 
-<!-- codex-reviewed: 2026-09-23T11:13:12Z -->
+<!-- codex-reviewed: 2026-09-23T11:14:03Z -->
