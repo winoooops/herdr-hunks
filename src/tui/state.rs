@@ -11,6 +11,14 @@ pub enum FilesPanel {
     Pinned,
 }
 
+/// Which of `observe`'s notices is on screen. Everything the shell and the keys set is `Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeKind {
+    Other,
+    Rewrite,
+    BaseError,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub text: String,
@@ -42,6 +50,8 @@ pub struct ViewState {
     seen_base_error: Option<String>,
     /// A base error taken from a snapshot and still owed to the user.
     pending_base_error: Option<String>,
+    /// What the notice on screen is, so displacing one can put it back.
+    notice_kind: NoticeKind,
     seen_mark_seq: u64,
     seen_rewrite: Option<(String, String, crate::engine::MarkState)>,
     width: u16,
@@ -74,6 +84,7 @@ impl ViewState {
             help_offset: 0,
             seen_base_error: None,
             pending_base_error: None,
+            notice_kind: NoticeKind::Other,
             seen_mark_seq: 0,
             seen_rewrite: None,
             width: 0,
@@ -86,6 +97,7 @@ impl ViewState {
             text: text.into(),
             urgent: false,
         });
+        self.notice_kind = NoticeKind::Other;
     }
 
     pub fn warn(&mut self, text: impl Into<String>) {
@@ -93,6 +105,7 @@ impl ViewState {
             text: text.into(),
             urgent: true,
         });
+        self.notice_kind = NoticeKind::Other;
     }
 
     /// Record only a drawn body's id; any snapshot without an id clears the last one.
@@ -183,11 +196,17 @@ impl ViewState {
             self.seen_mark_seq = snapshot.mark_seq;
             answered_mark = true;
             // The answer to the key the user just pressed is shown at once, even over an
-            // unread warning -- but displacing one forgets that it was shown, so it speaks
-            // again once this answer is read. If the answer resolved what it warned about,
-            // the branch below simply finds nothing to say.
-            if self.notice.as_ref().is_some_and(|n| n.urgent) {
-                self.seen_rewrite = None;
+            // unread warning -- but displacing one puts it back, so it speaks again once this
+            // answer is read. A classification warning regenerates itself from the snapshot;
+            // a base error is text nothing else holds, so it returns to its slot. If the
+            // answer resolved what the warning was about, the branch below finds nothing to
+            // say and nothing comes back.
+            if let Some(displaced) = self.notice.as_ref().filter(|n| n.urgent) {
+                match self.notice_kind {
+                    NoticeKind::Rewrite => self.seen_rewrite = None,
+                    NoticeKind::BaseError => self.pending_base_error = Some(displaced.text.clone()),
+                    NoticeKind::Other => {}
+                }
             }
             match (&snapshot.mark_error, &snapshot.mark) {
                 (Some(error), _) => self.warn(crate::tui::sanitize::sanitize(error)),
@@ -210,12 +229,16 @@ impl ViewState {
             self.seen_rewrite = rewritten.clone();
             match rewritten.map(|(_, _, state)| state) {
                 Some(MarkState::Rewritten) => {
-                    self.warn("the marked commit is no longer on this branch; press M again")
+                    self.warn("the marked commit is no longer on this branch; press M again");
+                    self.notice_kind = NoticeKind::Rewrite;
                 }
-                Some(MarkState::Unreadable(reason)) => self.warn(format!(
-                    "the mark cannot be read: {}",
-                    crate::tui::sanitize::sanitize(&reason)
-                )),
+                Some(MarkState::Unreadable(reason)) => {
+                    self.warn(format!(
+                        "the mark cannot be read: {}",
+                        crate::tui::sanitize::sanitize(&reason)
+                    ));
+                    self.notice_kind = NoticeKind::Rewrite;
+                }
                 _ => {}
             }
         }
@@ -236,6 +259,7 @@ impl ViewState {
             if !answered_mark && !self.notice.as_ref().is_some_and(|n| n.urgent) {
                 self.pending_base_error = None;
                 self.warn(error);
+                self.notice_kind = NoticeKind::BaseError;
             }
         }
     }
@@ -687,6 +711,43 @@ pub(crate) mod tests {
             st.notice.as_ref().map(|n| n.text.as_str()),
             Some("remembered pick: not a commit: gone")
         );
+    }
+
+    #[test]
+    fn a_mark_answer_over_an_unread_base_error_lets_it_speak_again() {
+        use crate::engine::{Mark, MarkState};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        // The pick that could not be written is on screen, unread.
+        snap.base_error = Some("pick not remembered: no state directory".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("pick not remembered: no state directory")
+        );
+
+        // A mark answers before the next draw: it is shown, and the warning goes back.
+        snap.base_error = None;
+        snap.mark_seq = 1;
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Current,
+            classified_at: None,
+        });
+        st.observe(&snap);
+        assert!(st.notice.as_ref().unwrap().text.contains("as reviewed"));
+
+        st.notice = None;
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("pick not remembered: no state directory"),
+            "the pick failure was not lost behind the answer"
+        );
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none(), "and then it rests");
     }
 
     #[test]

@@ -2242,7 +2242,11 @@ below finds nothing to say and nothing comes back. `Notice` therefore has exactl
 exactly one exception, and the tests in `state.rs` pin both. The eighth round added the last
 piece: a deferred base error is *held in `ViewState`*, not read back from the snapshot, because a
 later refresh publishes none and a snapshot is no place to keep something still owed to the
-reader.
+reader. The ninth closed the symmetry: `notice_kind` records which of `observe`'s notices is on
+screen, so displacing one puts it back by whichever mechanism owns it -- a classification warning
+regenerates itself from the snapshot (`seen_rewrite = None`), and a base error, which nothing
+else holds, returns to its slot. Everything the shell and the keys set is `Other` and is simply
+replaced, as before.
 
 `src/tui/view.rs`'s `notice` puts an urgent one first:
 
