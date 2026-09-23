@@ -545,3 +545,5 @@ Success criteria, in addition to 1.5 and 7.9:
     again compares against it.
 11. `docs/acceptance-p1.md` gains row 8 with the same evidence columns; the
     release guard is unchanged.
+
+<!-- codex-reviewed: 2026-09-23T11:13:12Z -->
