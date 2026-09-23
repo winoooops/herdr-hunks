@@ -190,6 +190,8 @@ struct State {
     changes: VecDeque<Change>,
     /// The mark a refresh is carrying right now, so key repeat cannot queue it again.
     in_flight_mark: Option<String>,
+    /// The commit the published row list was loaded at; `None` before the first rows.
+    rows_at: Option<String>,
     pick_seq: u64,
     mark_seq: u64,
 }
@@ -224,14 +226,20 @@ fn markable(
     previous_head: Option<String>,
     head_sampled: bool,
     confirmed: Option<String>,
+    rows_at: Option<&str>,
 ) -> Option<String> {
-    if !head_sampled {
+    let id = if !head_sampled {
         // A sample that could not run keeps the previous id for an empty list.
-        return head_of(next, previous_head);
-    }
-    // A successful sample with no commit invalidates even a retained diff's id.
-    next.head_seen.as_ref()?;
-    head_of(next, confirmed)
+        head_of(next, previous_head)
+    } else {
+        // A successful sample with no commit invalidates even a retained diff's id.
+        next.head_seen.as_ref()?;
+        head_of(next, confirmed)
+    };
+    // Both surfaces must answer for the same commit. A diff read after a commit the row list
+    // has not seen yet would otherwise let `M` acknowledge files that are not on screen, and
+    // they would arrive with no dot; a diff older than the rows cannot vouch for them either.
+    id.filter(|id| rows_at == Some(id.as_str()))
 }
 
 enum Done {
@@ -523,8 +531,13 @@ impl State {
         // Explicit changes resolve preferences; polls only re-verify ids.
         let base = match (&change, std::mem::take(&mut self.resolve_pending)) {
             (Some(Change::Base(pick)), _) => BaseJob::Pick(pick.clone()),
-            (Some(Change::Scope(_)), _) | (None, true) => BaseJob::Resolve,
-            (Some(Change::Mark(_)), _) | (None, false) => BaseJob::Keep(self.snapshot.base.clone()),
+            // A mark changes no comparison, but it must not swallow a resolution `r` asked for.
+            (Some(Change::Scope(_)), _) | (Some(Change::Mark(_)), true) | (None, true) => {
+                BaseJob::Resolve
+            }
+            (Some(Change::Mark(_)), false) | (None, false) => {
+                BaseJob::Keep(self.snapshot.base.clone())
+            }
         };
         let job = Job {
             cwd: cwd.to_string(),
@@ -765,6 +778,7 @@ async fn run(
         resolve_pending: true,
         changes: VecDeque::new(),
         in_flight_mark: None,
+        rows_at: None,
         pick_seq: 0,
         mark_seq: 0,
     };
@@ -985,6 +999,7 @@ async fn run(
                     Done::Status { response, head, head_seen, head_sampled, confirmed, loaded, change } => {
                         state.status_in_flight = false;
                         state.in_flight_mark = None;
+                        let head_seen_for_rows = head_seen.clone();
                         let before = comparison_of(&state.snapshot);
                         let mut succeeded = false;
                         let mut change_error = None;
@@ -1098,6 +1113,7 @@ async fn run(
                                                 }
                                             }
                                         }
+                                        state.rows_at = head_seen_for_rows.clone();
                                         succeeded = true;
                                     }
                                 }
@@ -1128,7 +1144,13 @@ async fn run(
                             next.diff = if next.selected.is_some() { DiffState::Loading } else { DiffState::Idle };
                         }
                         let previous_head = next.head.clone();
-                        next.head = markable(&next, previous_head, head_sampled, confirmed.filter(|_| succeeded));
+                        next.head = markable(
+                            &next,
+                            previous_head,
+                            head_sampled,
+                            confirmed.filter(|_| succeeded),
+                            state.rows_at.as_deref(),
+                        );
                         if matches!(change, Some(Change::Base(_))) {
                             state.pick_seq += 1;
                             next.pick_seq = state.pick_seq;
@@ -1161,7 +1183,9 @@ async fn run(
                                     if !unchanged {
                                         next.diff = DiffState::Ready(Arc::new(LoadedDiff::build(key, comparison, read_at.clone(), response)));
                                     }
-                                    next.head = read_at;
+                                    // Only when the rows on screen came from this commit too.
+                                    next.head =
+                                        read_at.filter(|id| state.rows_at.as_deref() == Some(id.as_str()));
                                 }
                                 Err(e) => {
                                     next.diff = DiffState::Failed(e);
@@ -2694,31 +2718,88 @@ mod tests {
         let mut snap = Snapshot::empty("/r");
         let previous = "a".repeat(40);
         let confirmed = "b".repeat(40);
+        let rows = |id: &String| Some(id.clone());
         // An empty list gets its id from the sample.
         assert_eq!(
-            markable(&snap, Some(previous.clone()), true, Some(confirmed.clone())),
+            markable(
+                &snap,
+                Some(previous.clone()),
+                true,
+                Some(confirmed.clone()),
+                rows(&confirmed).as_deref()
+            ),
             None,
             "sampled, and there is no commit"
         );
         snap.head_seen = Some(confirmed.clone());
         assert_eq!(
-            markable(&snap, Some(previous.clone()), true, Some(confirmed.clone())),
+            markable(
+                &snap,
+                Some(previous.clone()),
+                true,
+                Some(confirmed.clone()),
+                rows(&confirmed).as_deref()
+            ),
             Some(confirmed.clone()),
             "a confirmed sample is what the empty list is marked at"
         );
         assert_eq!(
-            markable(&snap, Some(previous.clone()), true, None),
+            markable(
+                &snap,
+                Some(previous.clone()),
+                true,
+                None,
+                rows(&confirmed).as_deref()
+            ),
             None,
             "sampled, but the two samples disagreed"
         );
         assert_eq!(
-            markable(&snap, Some(previous.clone()), false, None),
+            markable(
+                &snap,
+                Some(previous.clone()),
+                false,
+                None,
+                rows(&previous).as_deref()
+            ),
             Some(previous.clone()),
             "the sample could not run: 8.6 keeps the previous id"
         );
+        // The rows must answer for the same commit as the content.
+        assert_eq!(
+            markable(
+                &snap,
+                Some(previous.clone()),
+                true,
+                Some(confirmed.clone()),
+                rows(&previous).as_deref()
+            ),
+            None,
+            "rows from another commit cannot vouch for this one"
+        );
+        assert_eq!(
+            markable(
+                &snap,
+                Some(previous.clone()),
+                true,
+                Some(confirmed.clone()),
+                None
+            ),
+            None,
+            "no rows yet, nothing to mark"
+        );
         // A loading diff cannot vouch for an id.
         snap.diff = DiffState::Loading;
-        assert_eq!(markable(&snap, Some(previous.clone()), false, None), None);
+        assert_eq!(
+            markable(
+                &snap,
+                Some(previous.clone()),
+                false,
+                None,
+                rows(&previous).as_deref()
+            ),
+            None
+        );
     }
 
     #[test]
@@ -2846,6 +2927,45 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(marks.get(&toplevel).map(|m| m.commit.clone()), Some(a));
+    }
+
+    #[test]
+    fn a_mark_does_not_swallow_a_pending_resolution() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        let a = s.head.clone().unwrap();
+        let b = git_out(dir.path(), &["rev-parse", "HEAD~1"])
+            .trim()
+            .to_string();
+        assert_eq!(
+            s.base.as_ref().map(|base| base.requested.clone()),
+            Some("refs/heads/main".to_string())
+        );
+
+        // Another viewer remembers a different base. `r` asks for the resolution steps; the
+        // mark queued behind it must not consume that request and leave the pick unread.
+        git(dir.path(), &["branch", "side", "HEAD~1"]);
+        let toplevel = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        base::save_pick(state.path(), &toplevel, Some("refs/heads/side")).unwrap();
+        h.commands.send(Command::MarkReviewed(a)).unwrap();
+        h.commands.send(Command::Refresh).unwrap();
+        h.commands.send(Command::MarkReviewed(b)).unwrap();
+        let s = wait_for(&h, "the remembered pick is resolved", |s| {
+            s.base.as_ref().map(|base| base.requested.as_str()) == Some("refs/heads/side")
+        });
+        assert_eq!(s.mark_seq, 2, "both marks still answered");
     }
 
     #[test]

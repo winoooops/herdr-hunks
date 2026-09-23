@@ -650,6 +650,19 @@ Add its own test in `src/tui/state.rs`:
     }
 ```
 
+Applied after the pre-PR review's third round (codex, 2026-09-23): the markable id needs *both*
+loaded surfaces to name the same commit, not only the diff. `State.rows_at` records the commit
+the published row list was loaded at, `markable` ends with `id.filter(|id| rows_at == Some(id))`,
+and the `Done::Diff` arm applies the same filter to `read_at`. Without it a diff that brackets
+cleanly after a commit the status refresh has not published yet makes that commit markable while
+its new rows are still absent: `M` would then acknowledge files that were never on screen, and
+they would arrive carrying no dot. The disagreement lasts one refresh cycle, during which `M`
+refuses -- the conservative direction, because a mark that is too old only shows dots again.
+
+Also applied there: `request_status` must not let a queued `Change::Mark` swallow the
+`resolve_pending` flag an explicit `r` set. A mark now runs `BaseJob::Resolve` when that flag is
+pending and `BaseJob::Keep` otherwise, so `Mark → Refresh → Mark` still reloads the preferences.
+
 - [ ] **Step 9: Commit (orchestrator)**
 
 ```bash
