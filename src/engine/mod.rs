@@ -2,6 +2,7 @@
 pub mod base;
 pub mod branch;
 pub mod gitver;
+pub mod marks;
 pub mod nav;
 pub mod session;
 pub mod types;

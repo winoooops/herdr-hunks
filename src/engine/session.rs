@@ -9,12 +9,12 @@ use tokio::sync::Semaphore;
 
 use super::base::{self, MarkRecord, ResolveInputs};
 use super::{
-    branch, gitver, Base, BaseSource, Command, Comparison, DiffState, FileKey, LoadedDiff, Mark,
-    MarkState, RepoState, Scope, Snapshot, NO_BASE_NOTICE,
+    branch, gitver, marks, Base, BaseSource, Command, Comparison, DiffState, FileKey, LoadedDiff,
+    Mark, MarkState, RepoState, Scope, Snapshot, NO_BASE_NOTICE,
 };
 use crate::git::{self, ChangedFile, GetGitDiffResponse, GitStatusResponse};
 use crate::runtime::EventSink;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub type BoxFut<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
@@ -144,8 +144,11 @@ struct Job {
     inputs: ResolveInputs,
     default_base: Option<String>,
     previous_mark: Option<Mark>,
+    previous_unread: Option<(String, BTreeSet<String>)>,
     change: Option<Change>,
 }
+
+type Marked = (Mark, BTreeSet<String>, Result<(), String>, Option<String>);
 
 /// What a refresh loaded, published only as a whole.
 struct Loaded {
@@ -153,13 +156,15 @@ struct Loaded {
     base: Option<Base>,
     default_base: Option<String>,
     mark: Option<Mark>,
+    unread: BTreeSet<String>,
+    unread_at: Option<String>,
     base_error: Option<String>,
     files: Vec<ChangedFile>,
     rename_sources: BTreeMap<String, String>,
     /// `Some` after a pick or reset: whether `bases.json` took it.
     persisted: Option<Result<(), String>>,
     /// The mark answered by this refresh and whether it was remembered.
-    marked: Option<(Mark, Result<(), String>)>,
+    marked: Option<Marked>,
 }
 
 struct State {
@@ -179,6 +184,7 @@ struct State {
     requested_scope: Scope,
     inputs: ResolveInputs,
     session_mark: Option<MarkRecord>,
+    unread_at: Option<String>,
     /// Run the resolution steps in the next refresh (start, `r`, and after a pick).
     resolve_pending: bool,
     changes: VecDeque<Change>,
@@ -354,46 +360,90 @@ async fn load_rows(
                 Some(dir) => base::save_mark(dir, toplevel, &record).map_err(|e| e.to_string()),
                 None => Err("no state directory".to_string()),
             };
-            Some((
-                Mark {
-                    commit: record.commit,
-                    at: record.at,
-                    state: MarkState::Current,
-                    classified_at: None,
-                },
-                written,
-            ))
+            let (mark, set, read_at) = match head_id {
+                Some(head) if scope == Scope::Branch => {
+                    let (mark, set) = marks::classify(toplevel, &record, head, None, None).await;
+                    (mark, set, Some(head.to_string()))
+                }
+                _ => (
+                    Mark {
+                        commit: record.commit,
+                        at: record.at,
+                        state: MarkState::Current,
+                        classified_at: None,
+                    },
+                    BTreeSet::new(),
+                    None,
+                ),
+            };
+            Some((mark, set, written, read_at))
         }
         _ => None,
     };
-    let mark = if let Some((mark, _)) = &marked {
-        Some(mark.clone())
-    } else if matches!(job.base, BaseJob::Keep(_)) && !branch_changed {
-        job.previous_mark.clone()
+    let (mark, unread, unread_at) = if let Some((mark, set, _, read_at)) = &marked {
+        (Some(mark.clone()), set.clone(), read_at.clone())
     } else {
-        let record = match (&job.inputs.session_mark, &job.inputs.state_dir) {
-            (Some(record), _) => Some(record.clone()),
-            (None, Some(dir)) => {
-                let (marks, problem) = base::load_marks(dir);
-                if let Some(problem) = problem {
-                    base::note_problem(dir, &problem);
+        let mark_record = if matches!(job.base, BaseJob::Keep(_)) && !branch_changed {
+            job.previous_mark.as_ref().map(|mark| MarkRecord {
+                commit: mark.commit.clone(),
+                at: mark.at,
+            })
+        } else {
+            match (&job.inputs.session_mark, &job.inputs.state_dir) {
+                (Some(record), _) => Some(record.clone()),
+                (None, Some(dir)) => {
+                    let (marks, problem) = base::load_marks(dir);
+                    if let Some(problem) = problem {
+                        base::note_problem(dir, &problem);
+                    }
+                    marks.get(toplevel).cloned()
                 }
-                marks.get(toplevel).cloned()
+                (None, None) => None,
             }
-            (None, None) => None,
         };
-        record.map(|record| Mark {
-            commit: record.commit,
-            at: record.at,
-            state: MarkState::Current,
-            classified_at: None,
-        })
+        match (&mark_record, head_id) {
+            (Some(record), Some(head)) if scope == Scope::Branch => {
+                let (mark, set) = marks::classify(
+                    toplevel,
+                    record,
+                    head,
+                    job.previous_mark.as_ref(),
+                    job.previous_unread
+                        .as_ref()
+                        .map(|(at, set)| (at.as_str(), set)),
+                )
+                .await;
+                (Some(mark), set, Some(head.to_string()))
+            }
+            (Some(record), _) => (
+                Some(Mark {
+                    commit: record.commit.clone(),
+                    at: record.at,
+                    state: job
+                        .previous_mark
+                        .as_ref()
+                        .filter(|p| p.commit == record.commit)
+                        .map(|p| p.state.clone())
+                        .unwrap_or(MarkState::Current),
+                    classified_at: job
+                        .previous_mark
+                        .as_ref()
+                        .filter(|p| p.commit == record.commit)
+                        .and_then(|p| p.classified_at.clone()),
+                }),
+                BTreeSet::new(),
+                None,
+            ),
+            (None, _) => (None, BTreeSet::new(), None),
+        }
     };
     Ok(Loaded {
         scope,
         base,
         default_base,
         mark,
+        unread,
+        unread_at,
         base_error,
         files,
         rename_sources,
@@ -482,6 +532,10 @@ impl State {
             },
             default_base: self.snapshot.default_base.clone(),
             previous_mark: self.snapshot.mark.clone(),
+            previous_unread: self
+                .unread_at
+                .clone()
+                .map(|at| (at, (*self.snapshot.unread).clone())),
             change,
         };
         let results = results.clone();
@@ -560,7 +614,7 @@ fn fingerprint(s: &Snapshot) -> String {
         DiffState::Ready(d) => format!("ready:{:p}", Arc::as_ptr(d)),
     };
     format!(
-        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{}|{:?}",
+        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}",
         s.repo,
         serde_json::to_string(&s.files).unwrap_or_default(),
         s.selected,
@@ -582,7 +636,8 @@ fn fingerprint(s: &Snapshot) -> String {
         s.pick_error,
         s.mark,
         s.mark_seq,
-        s.mark_error
+        s.mark_error,
+        s.unread
     )
 }
 
@@ -699,6 +754,7 @@ async fn run(
             state_dir: config.state_dir.clone(),
         },
         session_mark: None,
+        unread_at: None,
         resolve_pending: true,
         changes: VecDeque::new(),
         pick_seq: 0,
@@ -947,6 +1003,8 @@ async fn run(
                                                 base: None,
                                                 default_base: None,
                                                 mark: None,
+                                                unread: BTreeSet::new(),
+                                                unread_at: None,
                                                 base_error: None,
                                                 files: response.files,
                                                 rename_sources: BTreeMap::new(),
@@ -959,12 +1017,14 @@ async fn run(
                                         let old_index = previous.as_ref().and_then(|key| next.files.iter().position(|f| &key_of(f) == key));
                                         next.scope = loaded.scope;
                                         next.base = loaded.base;
-                                        next.mark = loaded.mark;
                                         next.base_error = loaded.base_error;
                                         // `Keep` echoes the previous default; a resolution publishes its own, `None` included.
                                         next.default_base = loaded.default_base;
                                         next.files = loaded.files;
                                         next.rename_sources = Arc::new(loaded.rename_sources);
+                                        next.mark = loaded.mark;
+                                        next.unread = Arc::new(loaded.unread);
+                                        state.unread_at = loaded.unread_at;
                                         next.selected = if switched {
                                             // The path survives a scope switch; the unstaged row wins when both exist.
                                             previous.as_ref().and_then(|key| {
@@ -985,11 +1045,13 @@ async fn run(
                                                 None => {}
                                             }
                                         }
-                                        if let Some((mark, written)) = loaded.marked {
+                                        if let Some((mark, set, written, read_at)) = loaded.marked {
                                             mark_answered = true;
                                             state.mark_seq += 1;
                                             next.mark_seq = state.mark_seq;
                                             next.mark = Some(mark.clone());
+                                            next.unread = Arc::new(set);
+                                            state.unread_at = read_at;
                                             match written {
                                                 Ok(()) => {
                                                     state.session_mark = None;
@@ -2872,6 +2934,203 @@ mod tests {
                 } else {
                     assert_eq!(s.mark_error.as_deref(), Some("not a git repository"));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn the_unread_set_follows_the_mark_and_empties_on_a_new_one() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        assert!(s.unread.is_empty(), "no mark, no dots");
+        let head = s.head.clone().unwrap();
+
+        h.commands.send(Command::MarkReviewed(head)).unwrap();
+        let s = wait_for(&h, "marked", |s| s.mark_seq == 1);
+        assert!(
+            s.unread.is_empty(),
+            "marking the head leaves nothing unread"
+        );
+
+        // Commit only fresh.txt, leaving a.txt edited and u.txt untracked.
+        std::fs::write(dir.path().join("fresh.txt"), "fresh\n").unwrap();
+        git(dir.path(), &["add", "fresh.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "fresh"]);
+        // Wait for the new commit's diff before marking again.
+        let fresh_head = git_out(dir.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let s = wait_for(&h, "the new commit is unread and drawn", |s| {
+            s.unread.contains("fresh.txt") && s.head.as_deref() == Some(fresh_head.as_str())
+        });
+        assert!(!s.unread.contains("a.txt"), "{:?}", s.unread);
+        assert!(
+            !s.unread.contains("u.txt"),
+            "untracked rows are never in the set"
+        );
+        assert_eq!(
+            s.mark.as_ref().map(|m| m.state.clone()),
+            Some(crate::engine::MarkState::Current)
+        );
+
+        // Uncommitted work raises nothing, and a second mark clears the set on a dirty tree.
+        std::fs::write(dir.path().join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+        let s = wait_for(&h, "the edit is listed", |s| {
+            s.files.iter().any(|f| f.path == "a.txt")
+                && ready(s).is_some_and(|d| d.raw_diff.contains("+four"))
+                && s.head.as_deref() == Some(fresh_head.as_str())
+        });
+        assert!(
+            !s.unread.contains("a.txt"),
+            "an uncommitted edit is not a dot"
+        );
+        let head = s.head.clone().unwrap();
+        h.commands.send(Command::MarkReviewed(head)).unwrap();
+        let s = wait_for(&h, "marked again", |s| s.mark_seq == 2);
+        assert!(
+            s.unread.is_empty(),
+            "M clears every dot even with a dirty worktree"
+        );
+    }
+
+    #[test]
+    fn a_scope_switch_and_back_keeps_the_dots() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        h.commands
+            .send(Command::MarkReviewed(s.head.clone().unwrap()))
+            .unwrap();
+        wait_for(&h, "marked", |s| s.mark_seq == 1);
+        std::fs::write(dir.path().join("fresh.txt"), "fresh\n").unwrap();
+        git(dir.path(), &["add", "fresh.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "fresh"]);
+        wait_for(&h, "a dot", |s| s.unread.contains("fresh.txt"));
+
+        h.commands.send(Command::SetScope(Scope::Worktree)).unwrap();
+        let s = wait_for(&h, "worktree", |s| s.scope == Scope::Worktree);
+        assert!(s.unread.is_empty(), "worktree scope publishes no set");
+        h.commands.send(Command::SetScope(Scope::Branch)).unwrap();
+        let s = wait_for(&h, "branch again", |s| s.scope == Scope::Branch);
+        assert!(
+            s.unread.contains("fresh.txt"),
+            "the dots come back: {:?}",
+            s.unread
+        );
+    }
+
+    #[test]
+    fn an_amended_mark_is_rewritten_and_one_mark_repairs_it() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        h.commands
+            .send(Command::MarkReviewed(s.head.clone().unwrap()))
+            .unwrap();
+        wait_for(&h, "marked", |s| s.mark_seq == 1);
+
+        // A new message guarantees a different commit ID.
+        git(dir.path(), &["commit", "-q", "--amend", "-m", "amended"]);
+        let amended = git_out(dir.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let s = wait_for(&h, "rewritten", |s| {
+            matches!(
+                s.mark.as_ref().map(|m| m.state.clone()),
+                Some(crate::engine::MarkState::Rewritten)
+            ) && s.head.as_deref() == Some(amended.as_str())
+        });
+        assert!(
+            s.unread.is_empty(),
+            "the view flags every row from the state, not the set"
+        );
+        assert!(s.files.len() >= 4, "the rows and the base keep working");
+
+        // Marking the pre-amend frame must still classify the stale commit as rewritten.
+        let stale = s.mark.as_ref().unwrap().commit.clone();
+        h.commands.send(Command::MarkReviewed(stale)).unwrap();
+        let s = wait_for(&h, "stale frame marked", |s| s.mark_seq == 2);
+        let mark = s.mark.as_ref().unwrap();
+        assert_eq!(mark.state, MarkState::Rewritten);
+        assert_eq!(mark.classified_at.as_deref(), Some(amended.as_str()));
+
+        let head = s.head.clone().unwrap();
+        h.commands.send(Command::MarkReviewed(head)).unwrap();
+        let s = wait_for(&h, "repaired", |s| s.mark_seq == 3);
+        assert_eq!(
+            s.mark.as_ref().map(|m| m.state.clone()),
+            Some(crate::engine::MarkState::Current)
+        );
+    }
+
+    #[test]
+    fn stored_marks_are_classified_on_arrival_without_changing_the_base() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let initial = wait_for(&h, "first", |s| ready(s).is_some());
+        let main = git_out(dir.path(), &["rev-parse", "refs/heads/main"])
+            .trim()
+            .to_string();
+        for (commit, unreadable) in [("b".repeat(40), true), (main, false)] {
+            base::save_mark(
+                state.path(),
+                &top,
+                &MarkRecord {
+                    commit: commit.clone(),
+                    at: 1,
+                },
+            )
+            .unwrap();
+            h.commands.send(Command::Refresh).unwrap();
+            let s = wait_for(&h, "stored mark classified", |s| {
+                s.mark
+                    .as_ref()
+                    .is_some_and(|m| m.commit == commit && m.classified_at == s.head_seen)
+            });
+            assert_eq!(s.head_seen, initial.head_seen);
+            assert_eq!(s.base, initial.base);
+            assert_eq!(rows_of(&s), rows_of(&initial));
+            assert!(s.status_error.is_none());
+            assert_eq!(s.mark_seq, 0);
+            if unreadable {
+                assert!(matches!(&s.mark.as_ref().unwrap().state,
+                    MarkState::Unreadable(reason) if reason.starts_with("git diff --name-only failed:")));
+                assert!(s.unread.is_empty());
+            } else {
+                assert_eq!(s.mark.as_ref().unwrap().state, MarkState::Current);
+                assert!(s.unread.contains("a.txt"));
+                assert!(s.unread.contains("old.txt") && s.unread.contains("new.txt"));
             }
         }
     }

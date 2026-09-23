@@ -1,5 +1,5 @@
 //! Snapshot types the UI renders from. No terminal types here.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::engine::nav::{targets_for_diff, unified_order, Target};
@@ -209,6 +209,8 @@ pub struct Snapshot {
     pub files: Vec<ChangedFile>,
     /// Branch scope only: a renamed row's path -> its old path.
     pub rename_sources: Arc<BTreeMap<String, String>>,
+    /// Branch scope paths changed since the mark; non-Current states flag every row instead.
+    pub unread: Arc<BTreeSet<String>>,
     pub selected: Option<FileKey>,
     pub diff: DiffState,
     pub status_error: Option<String>,
@@ -243,6 +245,7 @@ impl Snapshot {
             default_base: None,
             files: Vec::new(),
             rename_sources: Arc::new(BTreeMap::new()),
+            unread: Arc::new(BTreeSet::new()),
             selected: None,
             diff: DiffState::Idle,
             status_error: None,
