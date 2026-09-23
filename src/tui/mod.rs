@@ -5,6 +5,7 @@ pub mod guard;
 pub mod input;
 pub mod keys;
 pub mod layout;
+pub mod picker;
 pub mod rows;
 pub mod sanitize;
 pub mod shell;

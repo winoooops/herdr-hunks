@@ -227,6 +227,10 @@ fn open_split_creates_one_viewer_and_reuses_it() {
         std::fs::write(repo.join("a.txt"), "one\n").unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", "init"]);
+        git(&["switch", "-q", "-c", "feat"]);
+        std::fs::write(repo.join("c.txt"), "c\n").unwrap();
+        git(&["add", "c.txt"]);
+        git(&["commit", "-q", "-m", "c"]);
         std::fs::write(repo.join("a.txt"), "ONE\n").unwrap();
 
         let manifest: toml::Table = include_str!("../herdr-plugin.toml").parse().unwrap();
@@ -246,6 +250,41 @@ fn open_split_creates_one_viewer_and_reuses_it() {
         wait_for("one viewer pane", || iso.viewers().len() == 1);
         let viewer = iso.viewers().remove(0);
         let viewer_id = viewer["pane_id"].as_str().expect("viewer pane id");
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "a.txt",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        iso.herdr(&["pane", "send-text", viewer_id, "b"]);
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "vs main",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        iso.herdr(&["pane", "send-text", viewer_id, "n"]);
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "c.txt",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
         assert_eq!(
             viewer["cwd"].as_str().map(PathBuf::from),
             Some(std::fs::canonicalize(&repo).unwrap())

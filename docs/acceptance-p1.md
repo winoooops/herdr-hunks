@@ -3,7 +3,9 @@ Status: PASS
 # Phase 1 release acceptance
 
 This is the release gate for the five success criteria in
-[spec section 1.5](superpowers/specs/2026-09-18-hunks-roadmap-p1-viewer-design.md#15-phase-1-success-criteria).
+[spec section 1.5](superpowers/specs/2026-09-18-hunks-roadmap-p1-viewer-design.md#15-phase-1-success-criteria)
+and the branch-scope criteria in
+[spec section 7.9](superpowers/specs/2026-09-22-branch-scope-design.md#79-tests-and-success-criteria).
 The orchestrator and user perform and record these checks. Automated test results
 alone do not complete manual acceptance. Phase 1 is not release-ready while any
 result is PENDING.
@@ -15,18 +17,30 @@ result is PENDING.
 | 3. Live refresh and degraded mode | Have an agent edit the same file twice and observe without pressing refresh. Repeat on an isolated Linux test host with `fs.inotify.max_user_watches` exhausted before opening; restore the test host's resources afterward. | Both edits appear without input; the notification failure shows a degraded-mode notice and polling still converges on the second edit. | pass | 2026-09-21 | herdr 0.8.0 | Linux 7.1.3 x86_64 (Nobara 44) |
 | 4. Same build in both hosts | Build once; link that same build into upstream Herdr 0.8.0 and the fork using its `vimeflow` binary. Invoke `open` from each host's separate plugin registry. Record both host versions. | The same binary opens and works in both hosts. | pass | 2026-09-21 | herdr 0.8.0 + vimeflow 0.8.0 | Linux 7.1.3 x86_64 (Nobara 44) |
 | 5. Read-only guarantee | Run `cargo test --test readonly_guarantee`. | Only allow-listed git reads occur, required environment policy is present, and the index, refs, and worktree remain unchanged. | pass | 2026-09-20 | n/a (no host involved; git 2.55.0) | Linux 7.1.3 x86_64 (Nobara 44) |
+| 6. Branch scope parity | On a branch with committed and uncommitted changes (the fixture of `branch_scope_lists_every_change_the_branch_carries_once`, or a real worktree), press `b`. Compare the row list with `git diff $(git merge-base HEAD main) --name-status -M --` plus the `??` rows of `git status --porcelain --untracked-files=all`; compare one tracked row's hunks with `git diff <M> -- <path>`, the rename with `git diff <M> -M -- <old> <new>`, and an untracked row with `git diff --no-index -- /dev/null <path>`. | Every changed path is listed once (twice only for a path deleted on the branch and recreated untracked) and each diff matches hunk for hunk. | pass | 2026-09-22 | herdr 0.8.0 + vimeflow 0.8.0 (tier B on both at `b090e5a`); by-hand check on a build of `b090e5a` | Linux 7.1.3 x86_64 (Nobara 44) |
+| 7. Default base and remembered pick | On a repository with `main` and no configuration, press `b`: the chip reads `vs main`. Press `B`, pick another ref, close the viewer, reopen it on the same worktree and press `b`. | The base is `main` without configuration; the reopened viewer compares against the picked ref. | pass | 2026-09-22 | n/a (viewer built from `b090e5a`, run directly; git 2.55.0) | Linux 7.1.3 x86_64 (Nobara 44) |
 
 Only the orchestrator/user may replace result cells with `pass`, fill in the date,
 version, and host evidence, and change the first line to `Status: PASS` after all
-five rows pass. The release workflow's guard refuses to build or publish without
+seven rows pass. The release workflow's guard refuses to build or publish without
 that PASS line. Record both upstream and fork observations for criteria 2–4;
 the inotify exhaustion check specifically requires a Linux test host.
 
 ## Evidence
 
-All five rows pass. The owner confirmed the dialog and the toolbar buttons added after the
-field test (commit `063982b`) on 2026-09-21, which completed the acceptance; the status line
-above is what lets the release workflow build a tag.
+Rows 1–5 passed for the original Phase 1 release. The owner confirmed the dialog and the
+toolbar buttons added after the field test (commit `063982b`) on 2026-09-21, completing that
+acceptance. Rows 6 and 7 (branch scope, 0.0.2) passed on 2026-09-22 on the tree of `b090e5a`,
+the last code change of the branch: the tier B test ran green against both hosts, and a by-hand
+session with a fresh state directory on a demo repository (`main`, a feature branch with a
+committed edit, rename, addition and deletion, plus an uncommitted edit, an untracked file and a
+deleted-then-recreated path) listed the six rows `git diff <M> --name-status -M --` and the `??`
+rows give, with `app.rs` showing the committed and uncommitted change in one hunk equal to
+`git diff <M> -- app.rs`, the untracked row equal to `git diff --no-index -- /dev/null u.txt`,
+and the rename row carrying its old path and, after editing the renamed file, the hunk
+`@@ -1,3 +1,4 @@` / `+plus a line` with `+1 −0` equal to `git diff <M> -M -- old.txt new.txt`;
+the base was `main` with no configuration, a pick of
+`refs/tags/v0.1` was written to `bases.json` and survived quitting and reopening the viewer.
 
 - **Row 1.** `cargo test --locked git_diff_response` (16 tests) on 2026-09-20. By hand on
   2026-09-21 the owner staged part of a file with `git add -p`: two rows, one marked `S`, each
@@ -60,9 +74,9 @@ all 15 passed.
 This ignored test starts and stops its own named server under a short `/tmp`
 directory, with separate HOME, XDG_CONFIG_HOME, and XDG_STATE_HOME. Every child
 starts with a cleared environment; host commands select the isolated session via
-`--session`. It links the plugin, verifies the viewer cwd, invokes `open-split`
-twice from the opener, and checks pane reuse and the saved reuse record. It never
-sets the test process's HERDR_SOCKET_PATH.
+`--session`. It links the plugin, verifies the viewer cwd, presses `b` and selects
+a committed row, invokes `open-split` twice from the opener, and checks pane reuse
+and the saved reuse record. It never sets the test process's HERDR_SOCKET_PATH.
 
 Build first: `plugin link` skips build steps and uses `target/release/herdr-hunks`.
 Set HERDR_BIN_PATH to the absolute path of the host binary. Set

@@ -1,4 +1,6 @@
 //! UI-agnostic engine. No ratatui or crossterm types appear here.
+pub mod base;
+pub mod branch;
 pub mod gitver;
 pub mod nav;
 pub mod session;

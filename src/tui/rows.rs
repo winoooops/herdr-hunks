@@ -238,7 +238,7 @@ pub fn build(diff: &LoadedDiff, mode: ViewMode) -> Rows {
 mod tests {
     use super::*;
     use crate::engine::nav::ViewMode;
-    use crate::engine::{FileKey, LoadedDiff};
+    use crate::engine::{Comparison, FileKey, LoadedDiff};
     use crate::git::{DiffHunk, DiffLine, DiffLineType, FileDiff, GetGitDiffResponse};
 
     type HunkSpec<'a> = (u32, u32, &'a [(char, &'a str)]);
@@ -272,7 +272,9 @@ mod tests {
             FileKey {
                 path: "src/f.rs".into(),
                 staged: false,
+                untracked: false,
             },
+            Comparison::Worktree,
             GetGitDiffResponse {
                 file_diff: FileDiff {
                     file_path: "src/f.rs".into(),

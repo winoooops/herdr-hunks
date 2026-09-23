@@ -63,6 +63,7 @@ fn the_environment_policy_is_applied_and_makes_pathspecs_literal() {
                     .send(Command::Select(FileKey {
                         path: "b*.txt".into(),
                         staged: false,
+                        untracked: false,
                     }))
                     .unwrap();
                 selection_sent = true;

@@ -1,13 +1,13 @@
 //! Pure view: snapshot + view state in, styled lines and hit regions out.
 use crate::engine::nav::ViewMode;
-use crate::engine::{DiffState, RepoState, Snapshot};
+use crate::engine::{DiffState, FileKey, RepoState, Scope, Snapshot};
 use crate::git::ChangedFileStatus;
 use crate::tui::format::{pad, truncate, width};
 use crate::tui::rows::Row;
 use crate::tui::sanitize::sanitize;
 use crate::tui::state::{FilesPanel, ViewState};
 use crate::tui::style::{Line, Role, Semantic, Span, Style};
-use crate::tui::{dialog, keys, layout};
+use crate::tui::{dialog, keys, layout, picker};
 
 pub const FILES_WIDTH: u16 = 18;
 pub const MIN_SPLIT_WIDTH: u16 = 100;
@@ -18,11 +18,13 @@ pub enum Action {
     NextFile,
     PrevHunk,
     NextHunk,
+    ToggleScope,
     ToggleView,
     ToggleFiles,
     Refresh,
     SelectFile(usize),
     CursorToRow(usize),
+    PickRow(usize),
 }
 
 impl Action {
@@ -33,10 +35,11 @@ impl Action {
             Self::NextFile => KeyAction::FileNext,
             Self::PrevHunk => KeyAction::HunkPrev,
             Self::NextHunk => KeyAction::HunkNext,
+            Self::ToggleScope => KeyAction::ToggleScope,
             Self::ToggleView => KeyAction::ToggleView,
             Self::ToggleFiles => KeyAction::ToggleFiles,
             Self::Refresh => KeyAction::Refresh,
-            Self::SelectFile(_) | Self::CursorToRow(_) => return None,
+            Self::SelectFile(_) | Self::CursorToRow(_) | Self::PickRow(_) => return None,
         })
     }
 }
@@ -52,6 +55,7 @@ impl Hit {
     fn hovered(&self, state: &ViewState) -> bool {
         state.mouse_requested
             && !state.help_open
+            && state.picker.is_none()
             && state
                 .hover
                 .is_some_and(|(x, y)| self.y == y && x >= self.x0 && x < self.x1)
@@ -119,12 +123,10 @@ type ToolbarItem = (Vec<(String, Option<Action>)>, u8);
 /// Toolbar items left to right; a higher drop order drops first.
 fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Vec<ToolbarItem> {
     let total = snapshot.files.len();
-    let index = snapshot.selected.as_ref().and_then(|k| {
-        snapshot
-            .files
-            .iter()
-            .position(|f| f.path == k.path && f.staged == k.staged)
-    });
+    let index = snapshot
+        .selected
+        .as_ref()
+        .and_then(|k| snapshot.files.iter().position(|f| FileKey::of(f) == *k));
     let name = snapshot
         .selected
         .as_ref()
@@ -170,7 +172,11 @@ fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Ve
     } else {
         "⟳"
     };
-    vec![
+    let scope_chip = match (snapshot.scope, &snapshot.base) {
+        (Scope::Branch, Some(base)) => format!("vs {}", truncate(&sanitize(base.label()), 16)),
+        _ => "worktree".to_string(),
+    };
+    let mut items: Vec<ToolbarItem> = vec![
         (
             vec![
                 ("‹".into(), Some(Action::PrevFile)),
@@ -188,6 +194,7 @@ fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Ve
             ],
             1,
         ),
+        (vec![(scope_chip, Some(Action::ToggleScope))], 2),
         (
             vec![(
                 if state.mode == ViewMode::Split {
@@ -198,16 +205,19 @@ fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Ve
                 .into(),
                 Some(Action::ToggleView),
             )],
-            2,
-        ),
-        (
-            vec![(if staged { "STAGED" } else { "UNSTAGED" }.into(), None)],
             3,
         ),
-        (vec![(stats, None)], 4),
-        (vec![("files".into(), Some(Action::ToggleFiles))], 5),
-        (vec![(busy.into(), Some(Action::Refresh))], 6),
-    ]
+    ];
+    if snapshot.scope == Scope::Worktree {
+        items.push((
+            vec![(if staged { "STAGED" } else { "UNSTAGED" }.into(), None)],
+            4,
+        ));
+    }
+    items.push((vec![(stats, None)], 5));
+    items.push((vec![("files".into(), Some(Action::ToggleFiles))], 6));
+    items.push((vec![(busy.into(), Some(Action::Refresh))], 7));
+    items
 }
 
 fn toolbar(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> (Line, Vec<Hit>) {
@@ -249,6 +259,7 @@ fn toolbar(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> (Line, V
                     Action::ToggleView => {
                         total_width >= MIN_SPLIT_WIDTH || state.requested_mode == ViewMode::Split
                     }
+                    Action::ToggleScope => snapshot.base.is_some(),
                     _ => true,
                 };
                 if enabled {
@@ -337,7 +348,7 @@ fn files_lines(snapshot: &Snapshot, state: &ViewState, height: u16) -> (Vec<Line
         snapshot
             .files
             .iter()
-            .position(|file| file.path == key.path && file.staged == key.staged)
+            .position(|file| FileKey::of(file) == *key)
     });
     let count = usize::from(height.saturating_sub(2));
     let first = selected
@@ -618,7 +629,20 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
         .find(|hit| hit.hovered(state))
         .and_then(|hit| hit.action.key_action())
         .and_then(|action| keys::KEYS.iter().find(|binding| binding.action == action))
-        .map(|binding| format!("{} · {}", binding.label, binding.key))
+        .map(|binding| {
+            let hint = format!("{} · {}", binding.label, binding.key);
+            if binding.action == keys::KeyAction::ToggleScope {
+                if let Some(base) = &snapshot.base {
+                    let commit: String = base.commit.chars().take(7).collect();
+                    return format!(
+                        "{hint} · {} @ {}",
+                        sanitize(base.label()),
+                        sanitize(&commit)
+                    );
+                }
+            }
+            hint
+        })
         .unwrap_or_else(|| hints.join("  "));
     lines.push(vec![Span::label(pad(&hint, columns.into()))]);
     for hit in &mut hits {
@@ -647,6 +671,40 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
             lines[y + 1] = line;
         }
         hits.clear();
+    }
+    if let Some(picker) = &state.picker {
+        let panel_width = columns.min(picker::WIDTH);
+        let panel_height = height.saturating_sub(2);
+        let x = usize::from((columns - panel_width) / 2);
+        let panel = picker.panel(snapshot, panel_width, panel_height);
+        for (y, overlay) in dialog::render(&panel, panel_width, panel_height)
+            .into_iter()
+            .enumerate()
+        {
+            let background = &lines[y + 1];
+            let mut line = clip_line(background, 0, x);
+            line.extend(overlay);
+            let right = x + usize::from(panel_width);
+            line.extend(clip_line(background, right, usize::from(columns) - right));
+            lines[y + 1] = line;
+        }
+        hits.clear();
+        // One hit per drawn list row: every panel row is one line, so row i is overlay line i + 1.
+        let head = panel
+            .rows
+            .iter()
+            .take_while(|r| !matches!(r, dialog::Row::Entry { .. }))
+            .count();
+        let first = picker.window(picker.visible(panel_height));
+        let listed = panel.rows.len() - head;
+        for i in 0..listed {
+            hits.push(Hit {
+                y: (2 + head + i) as u16,
+                x0: x as u16,
+                x1: (x + usize::from(panel_width)) as u16,
+                action: Action::PickRow(first + i),
+            });
+        }
     }
     Rendered { lines, hits }
 }
@@ -770,6 +828,7 @@ mod tests {
         for piece in [
             "‹  a.rs 2/2  ›",
             "{} 1/2  ↑   ↓",
+            "worktree",
             "unified",
             "UNSTAGED",
             "+4 −3",
@@ -797,6 +856,7 @@ mod tests {
         let (r, _) = rendered(50, 20, FilesPanel::Hidden);
         let bar = &r.plain()[0];
         assert!(bar.contains("‹  a.rs 2/2  ›") && bar.contains("{} 1/2"));
+        assert!(bar.contains("worktree") && !bar.contains("unified"));
         assert!(!bar.contains("⟳") && !bar.contains("files"));
     }
 
@@ -1106,6 +1166,7 @@ mod tests {
                 (" › ", Action::NextFile, file_count >= 2),
                 (" ↑ ", Action::PrevHunk, loaded && hunks >= 2),
                 (" ↓ ", Action::NextHunk, loaded && hunks >= 2),
+                (" worktree ", Action::ToggleScope, false),
                 (
                     " unified ",
                     Action::ToggleView,
@@ -1232,6 +1293,7 @@ mod tests {
             let visible = [
                 text.contains("‹"),
                 text.contains("{}"),
+                text.contains("worktree"),
                 text.contains("unified"),
                 text.contains("UNSTAGED"),
                 text.contains("+4"),
@@ -1269,5 +1331,140 @@ mod tests {
             render(&snap, &state, 80, 12).plain()[6].trim(),
             "not a git repository"
         );
+    }
+
+    #[test]
+    fn the_scope_chip_names_the_base_and_is_dim_without_one() {
+        use crate::engine::{Base, BaseSource, Scope};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        // No base: the chip reads `worktree`, is dim and has no hit region.
+        let r = render(&snap, &st, 120, 24);
+        let bar = &r.lines[0];
+        let chip = bar
+            .iter()
+            .find(|s| s.text == " worktree ")
+            .or_else(|| bar.iter().find(|s| s.text == "worktree"));
+        assert_eq!(chip.map(|s| s.style.role), Some(Role::Label));
+        assert!(!r.hits.iter().any(|h| h.action == Action::ToggleScope));
+        assert!(r.plain()[0].contains("UNSTAGED"));
+        // A base: clickable, and the hover hint names the key.
+        snap.base = Some(Base {
+            requested: "refs/heads/main".into(),
+            commit: "0".repeat(40),
+            merge_base: None,
+            source: BaseSource::Default,
+        });
+        let r = render(&snap, &st, 120, 24);
+        let hit = r
+            .hits
+            .iter()
+            .find(|h| h.action == Action::ToggleScope)
+            .expect("chip hit");
+        assert_eq!(hit.y, 0);
+        st.hover = Some((hit.x0, 0));
+        let r = render(&snap, &st, 120, 24);
+        assert_eq!(
+            r.plain().last().unwrap(),
+            "switch scope · b · main @ 0000000"
+        );
+        snap.base.as_mut().unwrap().commit = "123456789abcdef".into();
+        let r = render(&snap, &st, 120, 24);
+        assert_eq!(
+            r.plain().last().unwrap(),
+            "switch scope · b · main @ 1234567"
+        );
+        snap.base.as_mut().unwrap().requested = "refs/heads/main\u{1b}".into();
+        let r = render(&snap, &st, 120, 24);
+        assert_eq!(
+            r.plain().last().unwrap(),
+            "switch scope · b · main\u{241b} @ 1234567"
+        );
+        snap.base.as_mut().unwrap().requested = "refs/heads/main".into();
+        // Branch scope: `vs main`, and the staged label is gone.
+        snap.scope = Scope::Branch;
+        snap.base.as_mut().unwrap().merge_base = Some("1".repeat(40));
+        st.hover = None;
+        let r = render(&snap, &st, 120, 24);
+        let top = &r.plain()[0];
+        assert!(top.contains("vs main"), "{top}");
+        assert!(
+            !top.contains("UNSTAGED") && !top.contains("STAGED"),
+            "{top}"
+        );
+        snap.base.as_mut().unwrap().requested =
+            "refs/remotes/origin/a-very-long-branch-name".into();
+        let r = render(&snap, &st, 120, 24);
+        assert!(
+            r.plain()[0].contains("vs origin/a-very-l…"),
+            "{}",
+            r.plain()[0]
+        ); // 15 cells + the ellipsis
+    }
+
+    #[test]
+    fn the_view_chip_drops_before_the_scope_chip() {
+        use crate::engine::{Base, BaseSource};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        snap.base = Some(Base {
+            requested: "refs/heads/main".into(),
+            commit: "0".repeat(40),
+            merge_base: None,
+            source: BaseSource::Default,
+        });
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        let mut width = 120u16;
+        let mut saw_scope_without_view = false;
+        while width >= 40 {
+            let top = render(&snap, &st, width, 24).plain()[0].clone();
+            let has_scope = top.contains("worktree");
+            let has_view = top.contains("unified");
+            assert!(
+                !has_view || has_scope,
+                "the view chip outlived the scope chip at {width}: {top}"
+            );
+            saw_scope_without_view |= has_scope && !has_view;
+            width -= 4;
+        }
+        assert!(saw_scope_without_view);
+    }
+
+    #[test]
+    fn the_picker_overlays_the_body_and_clears_other_hits() {
+        use crate::engine::RepoState;
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        snap.refs = Some(std::sync::Arc::new(vec!["refs/heads/main".into()]));
+        snap.default_base = Some("refs/heads/main".into());
+        snap.repo = RepoState::Repo {
+            toplevel: "/r".into(),
+            branch: Some("main".into()),
+            worktree: None,
+        };
+        snap.refs_seq = 1;
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        st.picker = Some(crate::tui::picker::Picker::open(1));
+        let r = render(&snap, &st, 120, 24);
+        let text = r.plain();
+        assert!(text[1].contains("Compare against"), "{}", text[1]);
+        assert!(text[2].contains("> _"), "{}", text[2]);
+        assert!(text[3].contains("default (main)"), "{}", text[3]);
+        assert!(
+            text[4].contains("main") && text[4].contains("current"),
+            "{}",
+            text[4]
+        );
+        assert!(r
+            .hits
+            .iter()
+            .all(|h| matches!(h.action, Action::PickRow(_))));
+        assert_eq!(r.hits.len(), 2);
+        assert_eq!(r.hits[0].y, 3);
+        assert_eq!(text.len(), 24);
     }
 }
