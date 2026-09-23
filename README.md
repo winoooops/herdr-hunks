@@ -38,7 +38,7 @@ herdr plugin action invoke update --plugin winoooops.hunks
 
 Standalone: `herdr-hunks [PATH]` or `herdr-hunks tui [PATH]`; PATH defaults to the
 current directory. Both stdin and stdout must be terminals. `--version` prints
-`herdr-hunks 0.1.0`. Action diagnostics are available through
+`herdr-hunks 0.0.2`. Action diagnostics are available through
 `herdr plugin log list --plugin winoooops.hunks --limit 1`.
 
 ## Keybinding

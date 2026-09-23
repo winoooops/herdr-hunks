@@ -23,7 +23,7 @@
 - Commits are conventional with a lowercase subject; inline comments are one short line and never reference a task or PR. The orchestrator makes every commit; the implementer leaves the tree uncommitted.
 - `cargo test` is run with a writable `HOME` outside any git repository (the frozen test helpers create fixtures under `$HOME`); the coder's instructions say how.
 - Run before every commit: `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo check --locked --no-default-features && scripts/port-check.sh "$VIMEFLOW" && sh scripts/port-check-selftest.sh "$VIMEFLOW"`.
-- The version becomes `0.1.0` in Task 6 only; no other task touches `Cargo.toml`, `Cargo.lock` or `herdr-plugin.toml`.
+- The version becomes `0.0.2` in Task 6 only (the owner keeps 0.0.x until Phase 2 ships); no other task touches `Cargo.toml`, `Cargo.lock` or `herdr-plugin.toml`.
 
 ## File Structure
 
@@ -46,7 +46,7 @@ tests/readonly_guarantee.rs                allow-list of 10, branch scope drive,
 tests/e2e_real_herdr.rs                    presses `b` through the real host (Task 6)
 README.md, README.zh-CN.md, README.ja.md   "Branch scope" section, keys, config keys, K7 (Task 6)
 AGENTS.md, docs/acceptance-p1.md           scope boundary; rows 6 and 7 (Task 6)
-Cargo.toml, Cargo.lock, herdr-plugin.toml  0.1.0 (Task 6)
+Cargo.toml, Cargo.lock, herdr-plugin.toml  0.0.2 (Task 6)
 ```
 
 ---
@@ -3374,7 +3374,7 @@ git commit -m "feat(tui): base picker with a filtering input line"
 
 ---
 
-### Task 6: Read-only extension, tier B, documentation, acceptance rows, version 0.1.0
+### Task 6: Read-only extension, tier B, documentation, acceptance rows, version 0.0.2
 
 Implements spec 7.6 (the G7 extension), 7.7 (the version), 7.8 (README), 7.9 items 6-8 (G7, tier B, acceptance rows 6 and 7). Read those before starting.
 
@@ -3627,9 +3627,9 @@ fetch) is reflected within the poll interval.
 
 The document's own instruction (`change the first line to Status: PASS after all rows pass`) applies again once the orchestrator records the evidence for rows 6 and 7; the release workflow refuses to publish until then, which is the guard doing its job.
 
-- [ ] **Step 6: Version 0.1.0**
+- [ ] **Step 6: Version 0.0.2**
 
-Set `version = "0.1.0"` in `Cargo.toml` and `herdr-plugin.toml`, then run `cargo check` (without `--locked`) once so `Cargo.lock` records the new version of the root package, and commit the three files together.
+Set `version = "0.0.2"` in `Cargo.toml` and `herdr-plugin.toml`, then run `cargo check` (without `--locked`) once so `Cargo.lock` records the new version of the root package, and commit the three files together.
 
 - [ ] **Step 7: Verify**
 
@@ -3640,7 +3640,7 @@ Expected: all pass; `cargo test --locked` accepts the refreshed `Cargo.lock`.
 
 ```bash
 git add -A
-git commit -m "docs: branch scope, acceptance rows 6 and 7, version 0.1.0"
+git commit -m "docs: branch scope, acceptance rows 6 and 7, version 0.0.2"
 ```
 
 ---
@@ -3653,7 +3653,7 @@ git commit -m "docs: branch scope, acceptance rows 6 and 7, version 0.1.0"
 - 7.4: `b`, `B`, chip text and truncation, disabled chip, hover hint, drop order 2/3, hidden staged label (Task 4); the picker's rows, reset row, typed row, filtering, ordering, markers, keys, mouse, cap and overflow, `LoadRefs` on open with the list discarded on close (`refs_seq`/`refs_after`), error under the input, pick on Enter with `SetBase`, modality (Task 5; `hits.clear()` under the overlay); line reconciliation across a scope switch (Task 4, `reconcile`).
 - 7.5: one spawned task per refresh (`run_job`), triggers unchanged, cost as stated.
 - 7.6: allow-list of ten (Task 1), G7 drive and state-directory assertion (Task 6).
-- 7.7: D6 patch and K7 (Task 1), Phase 2 keys stay unbound in both scopes (Task 4 test), version 0.1.0 (Task 6).
+- 7.7: D6 patch and K7 (Task 1), Phase 2 keys stay unbound in both scopes (Task 4 test), version 0.0.2 (Task 6).
 - 7.8: every failure row has a home: no base (`NO_BASE_NOTICE` from the engine and the key), skipped steps (`skipped` -> `base_error` -> notice once), base disappears (`verify` fails in `load_rows` -> `status_error`, rows kept), unrelated histories (`merge_base` error), typed base fails (`pick_error` under the input), `for-each-ref` fails (`Done::Refs` -> empty list -> footer), `bases.json` malformed (`load_picks` problem -> `note_problem` + `base_error`), overflow footer; config keys (Task 4); README (Task 6).
 - 7.9: tests 1-3 in Task 3, 4-5 in Tasks 4 and 5, 6 and 7 in Task 6; criteria 6-8 in the acceptance rows.
 

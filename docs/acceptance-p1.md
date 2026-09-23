@@ -30,7 +30,7 @@ the inotify exhaustion check specifically requires a Linux test host.
 
 Rows 1–5 passed for the original Phase 1 release. The owner confirmed the dialog and the
 toolbar buttons added after the field test (commit `063982b`) on 2026-09-21, completing that
-acceptance. Rows 6 and 7 (branch scope, 0.1.0) passed on 2026-09-22 on the tree of `b090e5a`,
+acceptance. Rows 6 and 7 (branch scope, 0.0.2) passed on 2026-09-22 on the tree of `b090e5a`,
 the last code change of the branch: the tier B test ran green against both hosts, and a by-hand
 session with a fresh state directory on a demo repository (`main`, a feature branch with a
 committed edit, rename, addition and deletion, plus an uncommitted edit, an untracked file and a

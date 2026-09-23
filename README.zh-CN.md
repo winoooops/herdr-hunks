@@ -35,7 +35,7 @@ herdr plugin action invoke update --plugin winoooops.hunks
 | `update` | 对 GitHub 安装，当最新发行标签比当前运行版本更新时安装它，否则提示已是最新；拒绝本地链接或未知来源。 |
 
 独立运行：`herdr-hunks [PATH]` 或 `herdr-hunks tui [PATH]`；PATH 默认为当前目录。
-标准输入和标准输出都必须连接到终端。`--version` 输出 `herdr-hunks 0.1.0`。
+标准输入和标准输出都必须连接到终端。`--version` 输出 `herdr-hunks 0.0.2`。
 可通过 `herdr plugin log list --plugin winoooops.hunks --limit 1` 查看操作诊断信息。
 
 ## 快捷键绑定

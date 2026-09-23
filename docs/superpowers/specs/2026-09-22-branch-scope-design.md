@@ -442,7 +442,8 @@ comment.
 
 Phase 1 behaviour is untouched: with `[view] scope` unset the viewer opens in
 `worktree` scope and everything in sections 1-6 holds as written. The version
-becomes 0.1.0 (a new viewing dimension, no incompatible change).
+becomes 0.0.2 (the owner keeps 0.0.x until the write actions of Phase 2 ship; a new
+viewing dimension, no incompatible change).
 
 ### 7.8 Failure modes and configuration
 

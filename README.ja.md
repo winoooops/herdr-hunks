@@ -40,7 +40,7 @@ herdr plugin action invoke update --plugin winoooops.hunks
 
 単独実行は `herdr-hunks [PATH]` または `herdr-hunks tui [PATH]` です。
 PATH の既定値はカレントディレクトリです。標準入力と標準出力の両方が端末である必要があります。
-`--version` は `herdr-hunks 0.1.0` を表示します。アクションの診断情報は
+`--version` は `herdr-hunks 0.0.2` を表示します。アクションの診断情報は
 `herdr plugin log list --plugin winoooops.hunks --limit 1` で確認できます。
 
 ## キーバインド設定
