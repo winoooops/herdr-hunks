@@ -97,6 +97,15 @@ reissues, the `diff_dirty` rule of 3.3 reissues once the running diff
 completes, so the generation the candidate waits for always arrives. A
 candidate is dropped, never published, when its id is invalidated (below).
 
+A pending candidate is never replaced by a later refresh's id; it only adopts
+the generation of the newest diff request issued. Replacing it would let a
+repository whose diffs take longer than its poll interval move the generation
+the candidate waits for ahead of every completing diff, so diffs would keep
+being drawn and `head` would never advance. Keeping the id and moving the
+generation promotes the oldest unacknowledged id at the next completed diff --
+the safe direction of the promise above -- after which the next refresh's id
+becomes the candidate in the ordinary way.
+
 *What the terminal drew is what can be marked.* Publication is still not the
 terminal: the shell drains every queued snapshot and draws only the last, so a
 snapshot that completed a refresh can be skipped when a newer one arrives
@@ -134,6 +143,16 @@ redraws whatever the tree settled on. A rewind that does not come back is a
 rewrite, which 8.3's warning reports; a rewind that comes back inside one
 refresh is the one case where this section's promise rests on no other process
 rewinding history under the reader, and one more `M` corrects the mark.
+
+History need not move at all for the tree to mask a commit: an editor can put
+a file back to its pre-commit content, and the row's diff -- the working tree
+against the base -- then shows nothing of what that commit did, while `M`
+still acknowledges it. That is not information the viewer hid. The diff a
+frame draws is always the current truth about the tree, and a masked change is
+a real absence of difference, not a change waiting to be read; the dot of 8.3
+is computed between commits, so that file carries one anyway and says which
+commit touched it. What `M` acknowledges is "the state I was shown at this
+commit", and that is exactly what was shown.
 
 **What the engine does.** `MarkReviewed(commit)` is short, because no
 comparison changes:
@@ -183,6 +202,8 @@ pub struct Mark {
     /// Seconds since the Unix epoch, recorded when the mark was written.
     pub at: u64,
     pub state: MarkState,
+    /// The `head_seen` `state` was successfully classified against; `None` while unclassified.
+    pub classified_at: Option<String>,
 }
 
 pub enum MarkState {
@@ -262,8 +283,11 @@ next to `rename_sources`, from one command per refresh:
 git -C <toplevel> diff <mark.commit> <head_seen> --name-only --no-renames -z --
 ```
 
-Two commits, no working tree. That is the whole semantics of a dot: *a commit
-made after your mark touched this file*. Uncommitted work does not raise one,
+Two commits, no working tree. That is the whole semantics of a dot: *this
+file's committed content is not what it was at your mark*. It is a net
+difference, as every git diff is -- a file changed after the mark and then
+restored to its marked content carries no dot, which is the honest answer to
+"is there something here I have not read", not a gap in the accounting. Uncommitted work does not raise one,
 which is what makes `M` mean something -- the comparison of a mark against the
 working tree would leave a dot on every file the agent is still editing, and
 no number of presses could clear it, because uncommitted content is in no
@@ -296,8 +320,9 @@ successful `M` does not get that exemption by being a mark, because it submits
 the stale id still resolves, so validation succeeds and the mark would claim
 to be current while the branch has moved past it. Only two exit statuses are
 answers: `0` is true and `1` is false. Anything else -- `128` for a missing
-object, a signal, a failure to spawn -- is not cached: the pair stays
-unclassified and the next refresh tries again, so a classification that timed
+object, a signal, a failure to spawn -- is not cached: `classified_at` keeps
+the pair it last answered for, which is no longer the current one, and the
+next refresh tries again, so a classification that timed
 out once cannot leave a rewritten mark labelled `Current` for as long as the
 pair happens not to change. Until an answer arrives the previous state stands
 and no warning is shown; the frozen runner returns `Ok(Output)` for every exit
@@ -308,9 +333,11 @@ marked commit -- the mark no longer divides this branch's history, so the
 unread set is not computed and **every row is flagged**, which is the truthful
 reading: nothing on this branch can be said to have been read at that commit.
 The state is `MarkState::Rewritten`, the urgent notice `the marked commit is
-no longer on this branch; press M again` appears once per classified pair --
-the view remembers the `(mark.commit, head_seen)` it last warned about, so the
-warning follows every head the refresh observed rather than every head it
+no longer on this branch; press M again` appears once per classified pair: the
+view warns only when `classified_at == head_seen`, so a state retained through
+a failed classification at a new head says nothing until an answer confirms
+it, and it remembers the `(mark.commit, head_seen)` it last warned about, so
+the warning follows every head the refresh observed rather than every head it
 published -- and the picker's row reads `reviewed (a1b2c3d · rewritten)`. One
 `M` repairs it completely, because the mark is not the base: the rows, the
 diffs and the picker never stopped working.
@@ -340,8 +367,12 @@ quick rows of this section; then the ref rows, the current base first.
 | `last 3 commits (<7 hex>)` | `HEAD~3` | the same for `HEAD~3^{commit}` |
 
 Choosing `reviewed` is the narrowing of 8.1: the base becomes the marked
-commit, so the rows are what arrived after it and an empty list means there is
-nothing new. It is an ordinary pick -- remembered in `bases.json`, shown as
+commit, so the rows are what the working tree now differs from the mark by --
+the commits made since, the uncommitted edits, and the untracked files, by
+7.2's ordinary rules -- and an empty list means the tree matches what was
+read. It is a comparison, not a filter of the dotted rows: a file the agent
+edited without committing has no dot but is listed, and a file reverted to its
+marked content has neither. It is an ordinary pick -- remembered in `bases.json`, shown as
 `vs reviewed` by the chip of 8.5, cleared by the reset row -- and the mark
 itself is untouched by it, so the markers keep working and `default (main)`
 returns to the whole branch.
@@ -512,8 +543,9 @@ Test layers, added to 5.2 and 7.9:
    mark, flags rows, and the notice says so; a mark equal to `head_seen` skips
    the ancestry command while a stale `drawn_head` mark does not.
 2. Engine, the unread set: on a fixture whose branch carries four commits, a
-   mark at the second flags exactly the paths the third and fourth touched and
-   nothing else; a path changed both before and after the mark is flagged;
+   mark at the second flags exactly the paths whose committed content differs
+   between the second and the fourth, and nothing else; a path changed by the
+   third and restored by the fourth carries no dot; a path changed both before and after the mark is flagged;
    uncommitted edits to a file the mark already covers raise no flag, and a
    second `M` on a dirty worktree leaves the set empty; untracked rows are
    never in it; a file modified before the mark and renamed after it yields
@@ -522,7 +554,9 @@ Test layers, added to 5.2 and 7.9:
    post-mark change is the deletion of its rename source is flagged through
    `rename_sources`; the set is empty in worktree scope and with no mark.
 3. Engine, the published head: a failed diff does not advance it while an
-   empty row list does; a diff issued before the rows were published never
+   empty row list does; with diffs slower than the poll interval it still
+   advances, because a pending candidate keeps its id and only adopts the
+   newest generation; a diff issued before the rows were published never
    promotes a candidate, even when it completes afterwards; the refresh's row
    commands carry the sampled id, so the rows a frame shows are the rows of
    the id it publishes even when `HEAD` leaves and returns during the job; a
@@ -538,6 +572,8 @@ Test layers, added to 5.2 and 7.9:
    `--is-ancestor` exit of `1` is a negative answer while `128` and a spawn
    failure leave the pair unclassified and are retried by the next refresh,
    which a rewrite immediately after a timed-out classification proves; a
+   `Rewritten` state retained across a head change warns only once the new
+   pair is classified; a
    pruned marked object is
    `Unreadable`, flags every row, warns with git's reason rather than the
    rewrite wording, and leaves the rows, diffs and base working; the same mark
@@ -580,8 +616,9 @@ Success criteria, in addition to 1.5 and 7.9:
     none.
 11. The mark survives closing and reopening the viewer on the same worktree,
     and a second viewer on the same worktree shows the same markers at its
-    next resolution; picking `reviewed` in the picker narrows the list to the
-    marked rows and `default (...)` returns to the whole branch with the
-    markers intact.
+    next resolution; picking `reviewed` in the picker lists what the working
+    tree differs from the mark by -- the new commits' files, plus uncommitted
+    and untracked ones -- and `default (...)` returns to the whole branch with
+    the markers intact.
 12. `docs/acceptance-p1.md` gains row 8 with the same evidence columns; the
     release guard is unchanged.
