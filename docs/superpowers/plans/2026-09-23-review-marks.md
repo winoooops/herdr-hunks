@@ -2239,7 +2239,10 @@ warning -- it answers the key the user just pressed, and delaying it was the one
 and five ruled out -- so displacing one forgets that the warning was shown (`seen_rewrite = None`)
 and it queues again behind the answer. If the answer resolved what it warned about, the branch
 below finds nothing to say and nothing comes back. `Notice` therefore has exactly one rule with
-exactly one exception, and the tests in `state.rs` pin both.
+exactly one exception, and the tests in `state.rs` pin both. The eighth round added the last
+piece: a deferred base error is *held in `ViewState`*, not read back from the snapshot, because a
+later refresh publishes none and a snapshot is no place to keep something still owed to the
+reader.
 
 `src/tui/view.rs`'s `notice` puts an urgent one first:
 

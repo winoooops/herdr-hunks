@@ -40,6 +40,8 @@ pub struct ViewState {
     pub body_height: u16,
     pub help_offset: usize,
     seen_base_error: Option<String>,
+    /// A base error taken from a snapshot and still owed to the user.
+    pending_base_error: Option<String>,
     seen_mark_seq: u64,
     seen_rewrite: Option<(String, String, crate::engine::MarkState)>,
     width: u16,
@@ -71,6 +73,7 @@ impl ViewState {
             body_height: 0,
             help_offset: 0,
             seen_base_error: None,
+            pending_base_error: None,
             seen_mark_seq: 0,
             seen_rewrite: None,
             width: 0,
@@ -217,16 +220,22 @@ impl ViewState {
             }
         }
         // One rule for every notice that has not been read: nothing overwrites it, and nothing
-        // deferred is forgotten. A base error therefore waits behind a mark answer from this
-        // same snapshot and behind any unacknowledged warning -- including the one the branch
-        // above just set, whose pair is already recorded and would never speak again --
-        // leaving `seen_base_error` unrecorded so the next snapshot, or the `observe` that
-        // follows the acknowledging key, still reports it.
-        let urgent_now = self.notice.as_ref().is_some_and(|n| n.urgent);
-        if snapshot.base_error != self.seen_base_error && !answered_mark && !urgent_now {
+        // deferred is forgotten. A base error is taken from the snapshot once and held here,
+        // because a later refresh can publish none and the snapshot is no place to keep
+        // something still owed to the user.
+        if snapshot.base_error != self.seen_base_error {
             self.seen_base_error = snapshot.base_error.clone();
             if let (Some(error), None) = (&snapshot.base_error, &self.picker) {
-                self.warn(crate::tui::sanitize::sanitize(error));
+                self.pending_base_error = Some(crate::tui::sanitize::sanitize(error));
+            }
+        }
+        // It then waits behind a mark answer from this same snapshot and behind any unread
+        // warning -- including the one the branch above just set, whose pair is already
+        // recorded and would never speak again.
+        if let Some(error) = self.pending_base_error.clone() {
+            if !answered_mark && !self.notice.as_ref().is_some_and(|n| n.urgent) {
+                self.pending_base_error = None;
+                self.warn(error);
             }
         }
     }
@@ -678,6 +687,48 @@ pub(crate) mod tests {
             st.notice.as_ref().map(|n| n.text.as_str()),
             Some("remembered pick: not a commit: gone")
         );
+    }
+
+    #[test]
+    fn a_deferred_base_error_survives_a_refresh_that_no_longer_carries_it() {
+        use crate::engine::{Mark, MarkState};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        // An unwritable mark holds the screen; the pick that failed with it must wait.
+        snap.mark_seq = 1;
+        snap.mark_error = Some("mark not remembered: no state directory".into());
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Current,
+            classified_at: None,
+        });
+        snap.base_error = Some("pick not remembered: no state directory".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("mark not remembered: no state directory")
+        );
+
+        // An ordinary poll carries neither: the deferred warning is held here, not there.
+        snap.mark_error = None;
+        snap.base_error = None;
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("mark not remembered: no state directory"),
+            "the answer still stands"
+        );
+        st.notice = None;
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("pick not remembered: no state directory"),
+            "and the pick failure is still owed"
+        );
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none(), "each spoke exactly once");
     }
 
     #[test]

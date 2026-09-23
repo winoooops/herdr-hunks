@@ -613,6 +613,11 @@ impl State {
                         .await
                 }
             };
+            // Equal endpoints, not a proof of stillness: HEAD could have gone A -> B -> A
+            // within this read. The bracket is kept as is because that window errs the safe
+            // way -- the id is then older than the content, and a mark that is too old only
+            // shows dots for changes the reader has already seen. The dangerous direction,
+            // an id newer than the content, is what the samples do rule out.
             let read_at = match (before, base::read_head(&toplevel).await) {
                 (Ok(Some(a)), Ok(Some(b))) if a == b => Some(a),
                 _ => None,
