@@ -175,13 +175,34 @@ it needs no gate and its only effect is `M` refusing.
 
 ```rust
 pub struct Mark {
+    /// A full object id: hexadecimal only, of the length this repository's hash gives.
     pub commit: String,
     /// Seconds since the Unix epoch, recorded when the mark was written.
     pub at: u64,
-    /// False once the marked commit is no longer an ancestor of `head_seen` (8.3).
-    pub ancestor: bool,
+    pub state: MarkState,
+}
+
+pub enum MarkState {
+    /// An ancestor of `head_seen`: 8.3's unread set is the one the diff computed.
+    Current,
+    /// Still a commit, no longer on this branch: every row is flagged.
+    Rewritten,
+    /// The unread command failed; the string is git's reason. Every row is flagged.
+    Unreadable(String),
 }
 ```
+
+A stored `commit` is checked before it reaches any command, and by shape, not
+by asking git: it must be non-empty and hexadecimal, of the length the
+repository's hash function gives (40 or 64). A record that fails is treated as
+absent, with a problem line in `config-problems.log` as for a malformed file.
+The check is what keeps a hand-edited or corrupted `marks.json` from turning
+into an argument: `--output=tracked.txt` is a valid JSON string and a valid
+`git diff` option that writes a file, and the trailing `--` of 8.3's command
+protects paths, not the arguments before it. `check_text` of 7.3 would reject
+that particular value for its leading dash, but the shape check rejects every
+value that is not what `rev-parse` printed, which is the invariant this file
+is supposed to hold.
 
 The record is read from `marks.json` in the same step that reads
 `bases.json` -- whenever the preference is resolved (session start, `r`, a
@@ -235,12 +256,18 @@ pub unread: Arc<BTreeSet<String>>,   // row paths changed since the mark
 next to `rename_sources`, from one command per refresh:
 
 ```
-git -C <toplevel> diff <mark.commit> --name-only -M -z --
+git -C <toplevel> diff <mark.commit> --name-only -z --
 ```
 
 Names only, no content, no numstat: the set answers "did this path change",
 and the row's own diff is unchanged (it is still the working tree against the
-base's merge-base, 7.2). Untracked rows are in the set whatever it says,
+base's merge-base, 7.2). Rename detection is deliberately off here, unlike
+every other command of 7.2. With `-M`, git reports a detected rename by its
+destination alone, so a file that was modified before the mark and renamed
+after it would flag the new name and leave the deletion of the old one -- a
+row of its own in the base comparison -- unflagged and read as old. Without
+`-M` both endpoints appear as ordinary paths and both are flagged. Erring
+toward one flag too many is the direction this section errs in everywhere. Untracked rows are in the set whatever it says,
 because a path that is in no commit cannot have been read at one. The set is
 empty in worktree scope: every row there is an uncommitted change, which is
 new by construction, and dots that are always on say nothing. It is also empty
@@ -251,10 +278,13 @@ with no mark.
 `git merge-base --is-ancestor <mark.commit> <head_seen>`, computed when a mark
 is first seen and again when either half changes -- another viewer's mark read
 by a resolution at an unchanged head counts, and so does a head change while
-the gated id stands still. A successful `M` needs no command at all, since it
-marks the head and the pair is trivially true. Only two exit statuses are
+the gated id stands still. The command is skipped only when the marked commit *is* `head_seen`, where the
+pair is trivially true; a successful `M` does not get that exemption by being
+a mark, because it submits `drawn_head` (8.2), which can lag -- after an amend
+whose diff then failed, the stale id still resolves, so validation succeeds
+and the mark would claim to be current while the branch has moved past it. Only two exit statuses are
 answers: `0` is true, `1` is false, and anything else -- `128` for a missing
-object, a signal, a failure to spawn -- leaves the flag as it was; the frozen
+object, a signal, a failure to spawn -- leaves the state as it was; the frozen
 runner returns `Ok(Output)` for every exit status, so the three cases are told
 apart by the code, not by `Result`.
 
@@ -268,9 +298,16 @@ again` appears once per classified pair -- the view remembers the
 head the refresh observed rather than every head it published -- and the
 picker's row reads `reviewed (a1b2c3d · rewritten)`. One `M` repairs it
 completely, because the mark is not the base: the rows, the diffs and the
-picker never stopped working. The same holds when the marked object is gone
-entirely (an amend plus a pruned object): the `--name-only` command fails,
-every row is flagged, and the notice says so.
+picker never stopped working. A failure of the `--name-only` command itself -- the marked object pruned, a
+timeout, an unreadable object store -- is `MarkState::Unreadable(reason)`: it
+also flags every row, and its urgent notice is `the mark cannot be read:
+<reason>`, git's own message, which is what tells a pruned object from a
+timeout. It takes precedence over the ancestry flag, whose `--is-ancestor`
+would have exited `128` on the same object and kept its previous value by the
+rule above; the picker's row then reads `reviewed (a1b2c3d · unreadable)`. The
+view distinguishes the three states by `Mark::state`, never by the size of the
+unread set, which is all-paths in the ordinary case where every row did change
+after the mark.
 
 ### 8.4 Quick rows in the picker
 
@@ -291,6 +328,14 @@ nothing new. It is an ordinary pick -- remembered in `bases.json`, shown as
 `vs reviewed` by the chip of 8.5, cleared by the reset row -- and the mark
 itself is untouched by it, so the markers keep working and `default (main)`
 returns to the whole branch.
+
+It is also the one way to make a mark's fate matter to the rows, and the
+independence 8.2 claims is qualified exactly here: a pick is a base, and a
+base whose commit is later pruned fails 7.3's verification on every refresh,
+which 7.8 answers by keeping the last rows with a status error. `M` cannot
+repair that, because it writes no base; `r` and the reset row can, as they do
+for any other broken pick. The claim in 8.2 is about a mark that has not been
+picked as the base, which is the default and the case the markers are for.
 
 The two `HEAD~N` rows submit their revision as text, so they keep meaning what
 their label says as the agent commits: `last commit` is always the newest one.
@@ -406,9 +451,10 @@ rows, the diffs and the base untouched, because a mark is not a base:
 | the marked id no longer resolves between the frame and the press | `mark_error = not a commit: <7 hex>`; nothing is written; the previous mark stays |
 | `marks.json` is unreadable or malformed | treated as absent; a problem line goes to `config-problems.log`; the next `M` rewrites it |
 | `marks.json` cannot be written | the mark holds for this session (8.2's session mark) and flags rows normally; the urgent notice `mark not remembered: <reason>` |
-| the marked commit is no longer an ancestor of `head_seen` (amend, rebase, reset) | `Mark::ancestor` false; every row is flagged; the urgent notice `the marked commit is no longer on this branch; press M again` once per classified pair; the picker row reads `rewritten`; one `M` repairs it |
-| the marked object is gone entirely | `--name-only` fails; every row is flagged and the same notice is shown; one `M` repairs it |
-| `merge-base --is-ancestor` exits other than `0` or `1`, or cannot be run | the flag keeps its previous value and no notice is shown: failing to classify is not a reason to distrust the rows |
+| the marked commit is no longer an ancestor of `head_seen` (amend, rebase, reset) | `MarkState::Rewritten`; every row is flagged; the urgent notice `the marked commit is no longer on this branch; press M again` once per classified pair; the picker row reads `rewritten`; one `M` repairs it |
+| the `--name-only` command fails (pruned object, timeout, unreadable store) | `MarkState::Unreadable(reason)`; every row is flagged; the urgent notice `the mark cannot be read: <reason>`; the picker row reads `unreadable`; one `M` repairs it |
+| the mark has been picked as the base and its object is pruned | not a mark failure but a base failure: 7.3's verification fails and 7.8 keeps the last rows with a status error; `r` or the reset row recovers, `M` does not |
+| `merge-base --is-ancestor` exits other than `0` or `1`, or cannot be run | the state keeps its previous value and no notice is shown: failing to classify is not a reason to distrust the rows |
 | the head `rev-parse` cannot be run (spawn failure, timeout) | `head` and `head_seen` keep their previous values; `M` marks the older id, the safe direction of 8.2 |
 | the head `rev-parse` runs and finds no commit (unborn branch, not a repository) | both ids become `None` in the next publication, taking any pending candidate with them, and `drawn_head` clears; `M` then refuses instead of marking a commit of the branch that was left |
 | the selected row's diff fails during a refresh | `head` does not advance; `M` keeps marking the last commit whose hunks were drawn |
@@ -438,17 +484,22 @@ only in worktree scope, where no marker is drawn.
 
 Test layers, added to 5.2 and 7.9:
 
-1. Engine, marking: `MarkReviewed` validates the id, writes `marks.json` under
+1. Engine, marking: a stored `commit` that is not a hexadecimal object id --
+   `--output=x` among them -- makes the record absent with a problem line, and
+   no command ever receives it; `MarkReviewed` validates the id, writes `marks.json` under
    the lock and publishes the mark with a recomputed unread set, without
    touching `bases.json` or the base; a second `M` replaces the record; an id
    that no longer resolves answers `mark_error`, leaves `pick_seq` untouched
    and writes nothing; with no state directory the mark holds as the session
-   mark, flags rows, and the notice says so.
+   mark, flags rows, and the notice says so; a mark equal to `head_seen` skips
+   the ancestry command while a stale `drawn_head` mark does not.
 2. Engine, the unread set: on a fixture whose branch carries four commits, a
    mark at the second flags exactly the paths of the third and fourth plus the
    untracked rows, and not the paths only the first two touched; a path
-   changed both before and after the mark is flagged; the set is empty in
-   worktree scope and with no mark.
+   changed both before and after the mark is flagged; a file modified before
+   the mark and renamed after it flags both the old and the new name, which
+   `-M` would have reduced to one; the set is empty in worktree scope and with
+   no mark.
 3. Engine, the published head: a failed diff does not advance it while an
    empty row list does; a diff issued before the rows were published never
    promotes a candidate, even when it completes afterwards; the refresh's row
@@ -459,13 +510,16 @@ Test layers, added to 5.2 and 7.9:
    within one poll (the case a `with_head`-only rule would miss); switching to
    an unborn branch publishes `None` for both ids and drops the candidate,
    while a failed spawn keeps the previous ids.
-4. Engine, ancestry: a plain commit keeps `ancestor` true; `commit --amend`
-   makes the next refresh publish `ancestor = false`, flag every row and warn
+4. Engine, ancestry: a plain commit keeps the state `Current`; `commit --amend`
+   makes the next refresh publish `MarkState::Rewritten`, flag every row and warn
    once per classified pair, and one `M` restores both; a mark loaded from
    another viewer at an unchanged head is classified on arrival; an
    `--is-ancestor` exit of `1` is a negative answer while `128` and a spawn
-   failure leave the flag and show no notice; a pruned marked object flags
-   every row and warns, and the rows, diffs and base keep working throughout.
+   failure leave the state and show no notice; a pruned marked object is
+   `Unreadable`, flags every row, warns with git's reason rather than the
+   rewrite wording, and leaves the rows, diffs and base working; the same mark
+   picked as the base instead fails 7.3's verification and is recovered by `r`
+   or the reset row, not by `M`.
 5. Engine, quick bases: the three git-computed rows' presence and `submits` on
    repositories with and without an upstream and with one, two and four
    commits; they ride the `refs_seq` token of 7.4, so a reply from an earlier
