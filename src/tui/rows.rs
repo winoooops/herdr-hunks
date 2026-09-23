@@ -275,6 +275,7 @@ mod tests {
                 untracked: false,
             },
             Comparison::Worktree,
+            None,
             GetGitDiffResponse {
                 file_diff: FileDiff {
                     file_path: "src/f.rs".into(),

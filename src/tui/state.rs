@@ -12,6 +12,7 @@ pub enum FilesPanel {
 }
 
 pub struct ViewState {
+    pub drawn_head: Option<String>,
     pub requested_mode: ViewMode,
     pub mode: ViewMode,
     pub cursor: Option<usize>,
@@ -41,6 +42,7 @@ pub struct ViewState {
 impl ViewState {
     pub fn new(mode: ViewMode, files_panel: FilesPanel, mouse: bool) -> Self {
         Self {
+            drawn_head: None,
             requested_mode: mode,
             mode,
             cursor: None,
@@ -63,6 +65,15 @@ impl ViewState {
             width: 0,
             built_from: None,
         }
+    }
+
+    /// Record only a drawn body's id; any snapshot without an id clears the last one.
+    pub fn record_drawn(&mut self, snapshot: &Snapshot, drew_body: bool) {
+        self.drawn_head = if drew_body {
+            snapshot.head.clone()
+        } else {
+            self.drawn_head.take().filter(|_| snapshot.head.is_some())
+        };
     }
 
     /// Resolves the effective mode and clamps offsets before each frame.
@@ -253,6 +264,7 @@ pub(crate) mod tests {
         let loaded = LoadedDiff::build(
             key.clone(),
             Comparison::Worktree,
+            None,
             GetGitDiffResponse {
                 file_diff: FileDiff {
                     file_path: path.into(),
@@ -482,5 +494,29 @@ pub(crate) mod tests {
             "a new path starts at its first change"
         );
         assert_ne!(st.cursor, Some(3));
+    }
+
+    #[test]
+    fn a_frame_records_the_id_only_when_it_drew_the_body() {
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        snap.head = Some("a".repeat(40));
+        st.record_drawn(&snap, true);
+        assert_eq!(st.drawn_head.as_deref(), Some("a".repeat(40).as_str()));
+
+        // A modal frame leaves the last id alone, even as the snapshot's own moves on.
+        snap.head = Some("b".repeat(40));
+        st.record_drawn(&snap, false);
+        assert_eq!(st.drawn_head.as_deref(), Some("a".repeat(40).as_str()));
+
+        // A snapshot with no id clears it, drawn or not.
+        snap.head = None;
+        st.record_drawn(&snap, false);
+        assert_eq!(st.drawn_head, None);
+        snap.head = Some("c".repeat(40));
+        st.record_drawn(&snap, true);
+        snap.head = None;
+        st.record_drawn(&snap, true);
+        assert_eq!(st.drawn_head, None);
     }
 }

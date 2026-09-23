@@ -111,6 +111,7 @@ pub enum DiffState {
 pub struct LoadedDiff {
     pub key: FileKey,
     pub comparison: Comparison,
+    pub read_at: Option<String>,
     pub file_diff: FileDiff,
     pub raw_diff: String,
     pub targets: Vec<Target>,
@@ -119,13 +120,19 @@ pub struct LoadedDiff {
 }
 
 impl LoadedDiff {
-    pub fn build(key: FileKey, comparison: Comparison, response: GetGitDiffResponse) -> Self {
-        Self::build_with_cap(key, comparison, response, MAX_DIFF_LINES)
+    pub fn build(
+        key: FileKey,
+        comparison: Comparison,
+        read_at: Option<String>,
+        response: GetGitDiffResponse,
+    ) -> Self {
+        Self::build_with_cap(key, comparison, read_at, response, MAX_DIFF_LINES)
     }
 
     pub fn build_with_cap(
         key: FileKey,
         comparison: Comparison,
+        read_at: Option<String>,
         response: GetGitDiffResponse,
         cap: usize,
     ) -> Self {
@@ -152,6 +159,7 @@ impl LoadedDiff {
         Self {
             key,
             comparison,
+            read_at,
             file_diff,
             raw_diff: response.raw_diff,
             targets,
@@ -165,6 +173,10 @@ impl LoadedDiff {
 pub struct Snapshot {
     pub revision: u64,
     pub repo: RepoState,
+    /// The diff's commit, or the refresh's confirmed commit for an empty list.
+    pub head: Option<String>,
+    /// The id the last refresh observed, published as observed and never gated.
+    pub head_seen: Option<String>,
     /// `scope`, `base`, `files` and `rename_sources` always describe one comparison.
     pub scope: Scope,
     pub base: Option<Base>,
@@ -197,6 +209,8 @@ impl Snapshot {
             repo: RepoState::NotARepo {
                 cwd: cwd.to_string(),
             },
+            head: None,
+            head_seen: None,
             scope: Scope::Worktree,
             base: None,
             base_error: None,
@@ -284,6 +298,7 @@ mod tests {
         let loaded = LoadedDiff::build_with_cap(
             key(),
             Comparison::Worktree,
+            None,
             response(vec![hunk(1, 3), hunk(50, 2)]),
             10,
         );
@@ -299,6 +314,7 @@ mod tests {
         let loaded = LoadedDiff::build_with_cap(
             key(),
             Comparison::Worktree,
+            None,
             response(vec![hunk(1, 6), hunk(50, 6), hunk(90, 1)]),
             10,
         );
@@ -312,6 +328,7 @@ mod tests {
         let loaded = LoadedDiff::build_with_cap(
             key(),
             Comparison::Worktree,
+            None,
             response(vec![hunk(1, 25)]),
             10,
         );
@@ -361,7 +378,7 @@ mod tests {
         let branch = Comparison::Branch {
             merge_base: "1".repeat(40),
         };
-        let loaded = LoadedDiff::build(key(), branch.clone(), response(vec![hunk(1, 1)]));
+        let loaded = LoadedDiff::build(key(), branch.clone(), None, response(vec![hunk(1, 1)]));
         assert_eq!(loaded.comparison, branch);
         assert_ne!(loaded.comparison, Comparison::Worktree);
         let empty = Snapshot::empty("/r");

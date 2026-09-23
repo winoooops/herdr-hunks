@@ -49,6 +49,8 @@ pub struct EngineHandle {
     pub refs_answered: Arc<AtomicUsize>,
     /// Test hook: diff results discarded for a stale generation or comparison.
     pub diffs_discarded: Arc<AtomicUsize>,
+    /// Test hook: opening head samples taken by diff tasks.
+    pub head_samples: Arc<AtomicUsize>,
 }
 
 struct FrozenWatcher {
@@ -192,12 +194,40 @@ fn comparison_of(snapshot: &Snapshot) -> Comparison {
     }
 }
 
+/// The diff's commit, the confirmed commit for an empty list, or no loaded content.
+fn head_of(snapshot: &Snapshot, confirmed: Option<String>) -> Option<String> {
+    match &snapshot.diff {
+        DiffState::Ready(d) => d.read_at.clone(),
+        DiffState::Idle if snapshot.files.is_empty() => confirmed,
+        _ => None,
+    }
+}
+
+/// The commit this publication may be marked at.
+fn markable(
+    next: &Snapshot,
+    previous_head: Option<String>,
+    head_sampled: bool,
+    confirmed: Option<String>,
+) -> Option<String> {
+    if !head_sampled {
+        // A sample that could not run keeps the previous id for an empty list.
+        return head_of(next, previous_head);
+    }
+    // A successful sample with no commit invalidates even a retained diff's id.
+    next.head_seen.as_ref()?;
+    head_of(next, confirmed)
+}
+
 enum Done {
     GitCheck(Result<gitver::GitVersion, gitver::GitCheckError>),
     Watcher(Result<(), String>),
     Status {
         response: Result<GitStatusResponse, String>,
         head: Option<(Option<String>, Option<String>)>,
+        head_seen: Option<String>,
+        head_sampled: bool,
+        confirmed: Option<String>,
         /// `None` when the status failed or the directory is not a repository.
         loaded: Option<Result<Loaded, String>>,
         change: Option<Change>,
@@ -206,6 +236,7 @@ enum Done {
         generation: u64,
         key: FileKey,
         comparison: Comparison,
+        read_at: Option<String>,
         result: Result<GetGitDiffResponse, String>,
     },
     Refs {
@@ -220,6 +251,7 @@ async fn load_rows(
     job: &Job,
     status: &GitStatusResponse,
     head: Option<&(Option<String>, Option<String>)>,
+    head_id: Option<&str>,
 ) -> Result<Loaded, String> {
     let toplevel = status.repo_root.as_str();
     let branch_changed = matches!(head, Some((Some(b), _)) if Some(b) != job.known_branch.as_ref());
@@ -264,7 +296,8 @@ async fn load_rows(
             if matches!(job.base, BaseJob::Keep(_)) {
                 b.commit = base::verify(toplevel, &b.requested).await?;
             }
-            b.merge_base = Some(base::merge_base(toplevel, &b.commit).await?);
+            let head = head_id.ok_or_else(|| "no commit yet".to_string())?;
+            b.merge_base = Some(base::merge_base_of(toplevel, head, &b.commit).await?);
         }
     }
     let scope = if base.is_some() {
@@ -309,6 +342,7 @@ async fn load_rows(
 }
 
 async fn run_job(job: Job) -> Done {
+    let sampled = base::read_head(&job.cwd).await;
     let response = git::git_status_inner(job.cwd.clone()).await;
     let head = if job.with_head {
         let (branch, worktree) = tokio::join!(
@@ -319,15 +353,27 @@ async fn run_job(job: Job) -> Done {
     } else {
         None
     };
+    let sampled_head = match &sampled {
+        Ok(id) => id.clone(),
+        Err(_) => None,
+    };
     let loaded = match &response {
         Ok(status) if !status.repo_root.is_empty() => {
-            Some(load_rows(&job, status, head.as_ref()).await)
+            Some(load_rows(&job, status, head.as_ref(), sampled_head.as_deref()).await)
         }
+        _ => None,
+    };
+    // Only agreeing samples can make an empty list markable.
+    let confirmed = match (&sampled, base::read_head(&job.cwd).await) {
+        (Ok(first), Ok(second)) if *first == second => first.clone(),
         _ => None,
     };
     Done::Status {
         response,
         head,
+        head_seen: sampled_head,
+        head_sampled: sampled.is_ok(),
+        confirmed,
         loaded,
         change: job.change,
     }
@@ -384,6 +430,7 @@ impl State {
         delay: Option<Duration>,
         gate: Option<Arc<Semaphore>>,
         results: &UnboundedSender<Done>,
+        head_samples: &Arc<AtomicUsize>,
     ) {
         let comparison = comparison_of(&self.snapshot);
         if matches!(&self.diff_in_flight, Some((_, pending, under)) if pending == &key && under == &comparison)
@@ -402,7 +449,11 @@ impl State {
         let old = self.snapshot.rename_sources.get(&key.path).cloned();
         let cwd = cwd.to_string();
         let results = results.clone();
+        let head_samples = head_samples.clone();
         tokio::spawn(async move {
+            // Open the bracket before any delay or gate.
+            let before = base::read_head(&toplevel).await;
+            head_samples.fetch_add(1, Ordering::SeqCst);
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
@@ -419,10 +470,15 @@ impl State {
                         .await
                 }
             };
+            let read_at = match (before, base::read_head(&toplevel).await) {
+                (Ok(Some(a)), Ok(Some(b))) if a == b => Some(a),
+                _ => None,
+            };
             let _ = results.send(Done::Diff {
                 generation,
                 key,
                 comparison,
+                read_at,
                 result,
             });
         });
@@ -437,7 +493,7 @@ fn fingerprint(s: &Snapshot) -> String {
         DiffState::Ready(d) => format!("ready:{:p}", Arc::as_ptr(d)),
     };
     format!(
-        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}",
+        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}",
         s.repo,
         serde_json::to_string(&s.files).unwrap_or_default(),
         s.selected,
@@ -445,6 +501,8 @@ fn fingerprint(s: &Snapshot) -> String {
         s.status_error,
         s.watcher_error,
         s.refreshing,
+        s.head,
+        s.head_seen,
         s.scope,
         s.base,
         s.base_error,
@@ -548,6 +606,7 @@ async fn run(
     refreshes: Arc<AtomicUsize>,
     refs_answered: Arc<AtomicUsize>,
     diffs_discarded: Arc<AtomicUsize>,
+    head_samples: Arc<AtomicUsize>,
 ) {
     let mut state = State {
         snapshot: Snapshot::empty(&config.path.to_string_lossy()),
@@ -690,8 +749,9 @@ async fn run(
                             let mut next = state.snapshot.clone();
                             next.selected = Some(key.clone());
                             next.diff = DiffState::Loading;
+                            next.head = None;
                             publish(&mut state, next, &snapshots);
-                            state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx);
+                            state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx, &head_samples);
                         }
                     }
                 }
@@ -755,7 +815,7 @@ async fn run(
                         next.watcher_error = result.err();
                         publish(&mut state, next, &snapshots);
                     }
-                    Done::Status { response, head, loaded, change } => {
+                    Done::Status { response, head, head_seen, head_sampled, confirmed, loaded, change } => {
                         state.status_in_flight = false;
                         let before = comparison_of(&state.snapshot);
                         let mut succeeded = false;
@@ -838,6 +898,9 @@ async fn run(
                                 }
                             }
                         }
+                        if head_sampled {
+                            next.head_seen = head_seen;
+                        }
                         state.requested_scope = next.scope;
                         let comparison = comparison_of(&next);
                         if comparison != before {
@@ -849,6 +912,8 @@ async fn run(
                         if succeeded && !same {
                             next.diff = if next.selected.is_some() { DiffState::Loading } else { DiffState::Idle };
                         }
+                        let previous_head = next.head.clone();
+                        next.head = markable(&next, previous_head, head_sampled, confirmed.filter(|_| succeeded));
                         if matches!(change, Some(Change::Base(_))) {
                             state.pick_seq += 1;
                             next.pick_seq = state.pick_seq;
@@ -860,7 +925,7 @@ async fn run(
                         }
                         publish(&mut state, next, &snapshots);
                         if let Some(key) = selected {
-                            state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx);
+                            state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx, &head_samples);
                         }
                         if state.status_dirty || !state.changes.is_empty() {
                             state.status_dirty = false;
@@ -868,7 +933,7 @@ async fn run(
                             state.request_status(&cwd, with_head, &results_tx, &refreshes);
                         }
                     }
-                    Done::Diff { generation, key, comparison, result } => {
+                    Done::Diff { generation, key, comparison, read_at, result } => {
                         if generation != state.diff_generation || comparison != comparison_of(&state.snapshot) {
                             diffs_discarded.fetch_add(1, Ordering::SeqCst);
                             continue;
@@ -877,12 +942,16 @@ async fn run(
                         if Some(&key) == next.selected.as_ref() {
                             match result {
                                 Ok(response) => {
-                                    let unchanged = matches!(&next.diff, DiffState::Ready(d) if d.key == key && d.comparison == comparison && d.raw_diff == response.raw_diff);
+                                    let unchanged = matches!(&next.diff, DiffState::Ready(d) if d.key == key && d.comparison == comparison && d.raw_diff == response.raw_diff && d.read_at == read_at);
                                     if !unchanged {
-                                        next.diff = DiffState::Ready(Arc::new(LoadedDiff::build(key, comparison, response)));
+                                        next.diff = DiffState::Ready(Arc::new(LoadedDiff::build(key, comparison, read_at.clone(), response)));
                                     }
+                                    next.head = read_at;
                                 }
-                                Err(e) => next.diff = DiffState::Failed(e),
+                                Err(e) => {
+                                    next.diff = DiffState::Failed(e);
+                                    next.head = None;
+                                }
                             }
                             if !state.status_in_flight && !state.diff_dirty {
                                 next.refreshing = false;
@@ -891,7 +960,7 @@ async fn run(
                         }
                         if std::mem::take(&mut state.diff_dirty) {
                             if let Some(key) = state.snapshot.selected.clone() {
-                                state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx);
+                                state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx, &head_samples);
                             }
                         }
                     }
@@ -909,6 +978,7 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
     let refreshes = Arc::new(AtomicUsize::new(0));
     let refs_answered = Arc::new(AtomicUsize::new(0));
     let diffs_discarded = Arc::new(AtomicUsize::new(0));
+    let head_samples = Arc::new(AtomicUsize::new(0));
     runtime.spawn(run(
         config,
         commands_rx,
@@ -916,6 +986,7 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
         refreshes.clone(),
         refs_answered.clone(),
         diffs_discarded.clone(),
+        head_samples.clone(),
     ));
     EngineHandle {
         commands,
@@ -923,6 +994,7 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
         refreshes,
         refs_answered,
         diffs_discarded,
+        head_samples,
     }
 }
 
@@ -2271,5 +2343,140 @@ mod tests {
         assert_eq!(s.scope, Scope::Worktree);
         assert!(s.base.is_none() && s.files.is_empty() && s.selected.is_none());
         assert!(matches!(s.repo, RepoState::NotARepo { .. }));
+    }
+
+    #[test]
+    fn a_snapshot_carries_the_head_its_content_was_read_at() {
+        let dir = branch_fixture();
+        let (_rt, h) = start_with(dir.path(), Scope::Branch, None, None);
+        let s = wait_for(&h, "first branch diff", |s| ready(s).is_some());
+        let head = git_out(dir.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        assert_eq!(s.head_seen.as_deref(), Some(head.as_str()));
+        assert_eq!(s.head.as_deref(), Some(head.as_str()));
+        assert_eq!(ready(&s).unwrap().read_at.as_deref(), Some(head.as_str()));
+
+        // A snapshot whose diff is not loaded carries no markable id.
+        h.commands.send(Command::SelectNext).unwrap();
+        let loading = wait_for(&h, "loading", |s| matches!(s.diff, DiffState::Loading));
+        assert_eq!(loading.head, None);
+        assert_eq!(loading.head_seen.as_deref(), Some(head.as_str()));
+        wait_for(&h, "loaded again", |s| ready(s).is_some());
+    }
+
+    #[test]
+    fn an_empty_list_is_markable_and_an_unborn_branch_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        git(p, &["config", "user.email", "t@example.com"]);
+        git(p, &["config", "user.name", "t"]);
+        std::fs::write(p.join("a.txt"), "a\n").unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-q", "-m", "init"]);
+        let (_rt, h) = start_with(p, Scope::Worktree, None, None);
+        let head = git_out(p, &["rev-parse", "HEAD"]).trim().to_string();
+        let s = wait_for(&h, "clean tree", |s| {
+            matches!(s.repo, RepoState::Repo { .. }) && s.files.is_empty()
+        });
+        assert_eq!(
+            s.head.as_deref(),
+            Some(head.as_str()),
+            "an empty list is markable"
+        );
+
+        // An unborn branch clears both ids.
+        git(p, &["checkout", "-q", "--orphan", "fresh"]);
+        git(p, &["rm", "-q", "--cached", "a.txt"]);
+        std::fs::remove_file(p.join("a.txt")).unwrap();
+        h.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&h, "unborn", |s| s.head_seen.is_none());
+        assert_eq!(s.head, None);
+    }
+
+    #[test]
+    fn an_unborn_branch_is_unmarkable_with_a_diff_still_on_screen() {
+        let dir = branch_fixture();
+        let (_rt, h) = start_with(dir.path(), Scope::Branch, None, None);
+        let s = wait_for(&h, "first branch diff", |s| ready(s).is_some());
+        assert!(s.head.is_some());
+
+        // Branch scope's row load fails without a commit, so the rows and the diff stay on
+        // screen -- and the id that diff was read at belongs to the branch that was left.
+        git(dir.path(), &["checkout", "-q", "--orphan", "fresh"]);
+        h.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&h, "unborn", |s| s.head_seen.is_none());
+        assert!(ready(&s).is_some(), "the previous diff is still drawn");
+        assert_eq!(s.head, None, "and it no longer vouches for an id");
+    }
+
+    #[test]
+    fn a_diff_that_spans_a_head_move_reports_no_id() {
+        let dir = branch_fixture();
+        // Block the first diff after its opening sample.
+        let gate = Arc::new(Semaphore::new(0));
+        let (_rt, h) = start_with(dir.path(), Scope::Branch, None, Some(gate.clone()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.head_samples.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "no diff task reached its first sample"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::write(dir.path().join("late.txt"), "late\n").unwrap();
+        git(dir.path(), &["add", "late.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "late"]);
+        gate.add_permits(4);
+        let seen = wait_for(
+            &h,
+            "a diff with no id",
+            |s| matches!(&s.diff, DiffState::Ready(d) if d.read_at.is_none()),
+        );
+        assert_eq!(
+            seen.head, None,
+            "a snapshot whose diff spanned a move is unmarkable"
+        );
+        // Once the tree settles, a later diff brackets cleanly and the id comes back.
+        gate.add_permits(8);
+        let settled = wait_for(
+            &h,
+            "a clean bracket",
+            |s| matches!(&s.diff, DiffState::Ready(d) if d.read_at.is_some()),
+        );
+        assert!(settled.head.is_some());
+    }
+
+    #[test]
+    fn a_sample_that_could_not_run_keeps_the_previous_id() {
+        let mut snap = Snapshot::empty("/r");
+        let previous = "a".repeat(40);
+        let confirmed = "b".repeat(40);
+        // An empty list gets its id from the sample.
+        assert_eq!(
+            markable(&snap, Some(previous.clone()), true, Some(confirmed.clone())),
+            None,
+            "sampled, and there is no commit"
+        );
+        snap.head_seen = Some(confirmed.clone());
+        assert_eq!(
+            markable(&snap, Some(previous.clone()), true, Some(confirmed.clone())),
+            Some(confirmed.clone()),
+            "a confirmed sample is what the empty list is marked at"
+        );
+        assert_eq!(
+            markable(&snap, Some(previous.clone()), true, None),
+            None,
+            "sampled, but the two samples disagreed"
+        );
+        assert_eq!(
+            markable(&snap, Some(previous.clone()), false, None),
+            Some(previous.clone()),
+            "the sample could not run: 8.6 keeps the previous id"
+        );
+        // A loading diff cannot vouch for an id.
+        snap.diff = DiffState::Loading;
+        assert_eq!(markable(&snap, Some(previous.clone()), false, None), None);
     }
 }

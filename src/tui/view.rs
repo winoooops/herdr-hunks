@@ -551,6 +551,15 @@ fn body_line(row: &Row, columns: u16, hscroll: usize, _mode: ViewMode, cursor: b
     line
 }
 
+/// Whether the frame shows loaded content or an empty list without a covering modal.
+pub fn body_is_drawn(state: &ViewState, snapshot: &Snapshot, columns: u16, height: u16) -> bool {
+    columns >= 40
+        && height >= 10
+        && !state.help_open
+        && state.picker.is_none()
+        && (matches!(&snapshot.diff, DiffState::Ready(_)) || snapshot.files.is_empty())
+}
+
 pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16) -> Rendered {
     if columns < 40 || height < 10 {
         return Rendered {
@@ -1466,5 +1475,53 @@ mod tests {
         assert_eq!(r.hits.len(), 2);
         assert_eq!(r.hits[0].y, 3);
         assert_eq!(text.len(), 24);
+    }
+
+    #[test]
+    fn only_a_drawn_body_vouches_for_an_id() {
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        assert!(body_is_drawn(&st, &snap, 120, 24));
+        assert!(
+            !body_is_drawn(&st, &snap, 39, 24),
+            "too narrow: the size notice is drawn"
+        );
+        assert!(
+            !body_is_drawn(&st, &snap, 120, 9),
+            "too short: the size notice is drawn"
+        );
+        st.help_open = true;
+        assert!(
+            !body_is_drawn(&st, &snap, 120, 24),
+            "the key sheet covers the diff"
+        );
+        st.help_open = false;
+        st.picker = Some(crate::tui::picker::Picker::open(0));
+        assert!(
+            !body_is_drawn(&st, &snap, 120, 24),
+            "the picker covers the diff"
+        );
+        st.picker = None;
+        // Give the empty fixture a row before checking an unloaded diff.
+        snap.files = vec![crate::git::ChangedFile {
+            path: "a.rs".into(),
+            status: crate::git::ChangedFileStatus::Modified,
+            staged: false,
+            insertions: Some(1),
+            deletions: Some(0),
+        }];
+        snap.diff = crate::engine::DiffState::Loading;
+        assert!(
+            !body_is_drawn(&st, &snap, 120, 24),
+            "a row whose diff is not loaded"
+        );
+        snap.files.clear();
+        snap.diff = crate::engine::DiffState::Idle;
+        assert!(
+            body_is_drawn(&st, &snap, 120, 24),
+            "an empty list is a drawn body"
+        );
     }
 }

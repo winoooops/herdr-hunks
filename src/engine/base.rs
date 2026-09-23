@@ -44,9 +44,27 @@ pub(crate) async fn verify(toplevel: &str, text: &str) -> Result<String, String>
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// `git merge-base HEAD <commit>`; fails for unrelated histories.
-pub(crate) async fn merge_base(toplevel: &str, commit: &str) -> Result<String, String> {
-    let output = git(toplevel, &["merge-base", "HEAD", commit]).await?;
+/// `Ok(Some(id))` for a commit, `Ok(None)` when git found none, `Err` when it could not run.
+pub(crate) async fn read_head(toplevel: &str) -> Result<Option<String>, String> {
+    let output = git(
+        toplevel,
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    )
+    .await?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!id.is_empty()).then_some(id))
+}
+
+/// `git merge-base <head> <commit>`; fails for unrelated histories.
+pub(crate) async fn merge_base_of(
+    toplevel: &str,
+    head: &str,
+    commit: &str,
+) -> Result<String, String> {
+    let output = git(toplevel, &["merge-base", head, commit]).await?;
     if !output.status.success() {
         let short = &commit[..commit.len().min(7)];
         let err = stderr_of(&output);
@@ -298,7 +316,7 @@ mod tests {
             rt().block_on(verify(&top, "nope")).unwrap_err(),
             "not a commit: nope"
         );
-        assert_eq!(rt().block_on(merge_base(&top, &id)).unwrap(), id);
+        assert_eq!(rt().block_on(merge_base_of(&top, "HEAD", &id)).unwrap(), id);
     }
 
     #[test]

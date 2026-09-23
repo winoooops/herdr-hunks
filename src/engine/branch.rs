@@ -313,7 +313,7 @@ mod tests {
             .build()
             .unwrap();
         let merge_base = rt
-            .block_on(base::merge_base(&toplevel, "refs/heads/main"))
+            .block_on(base::merge_base_of(&toplevel, "HEAD", "refs/heads/main"))
             .unwrap();
         let rows = rt
             .block_on(rows(&toplevel, &merge_base, Vec::new()))

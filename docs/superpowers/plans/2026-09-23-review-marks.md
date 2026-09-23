@@ -124,14 +124,29 @@ Append to the `tests` module of `src/engine/session.rs`. `branch_fixture`, `star
         });
         assert_eq!(s.head.as_deref(), Some(head.as_str()), "an empty list is markable");
 
-        // An unborn branch clears both ids, and it clears them from branch scope too, where
-        // the row load fails and the previous `Ready` diff is kept on screen.
+        // An unborn branch clears both ids.
         git(p, &["checkout", "-q", "--orphan", "fresh"]);
         git(p, &["rm", "-q", "--cached", "a.txt"]);
         std::fs::remove_file(p.join("a.txt")).unwrap();
         h.commands.send(Command::Refresh).unwrap();
         let s = wait_for(&h, "unborn", |s| s.head_seen.is_none());
         assert_eq!(s.head, None);
+    }
+
+    #[test]
+    fn an_unborn_branch_is_unmarkable_with_a_diff_still_on_screen() {
+        let dir = branch_fixture();
+        let (_rt, h) = start_with(dir.path(), Scope::Branch, None, None);
+        let s = wait_for(&h, "first branch diff", |s| ready(s).is_some());
+        assert!(s.head.is_some());
+
+        // Branch scope's row load fails without a commit, so the rows and the diff stay on
+        // screen -- and the id that diff was read at belongs to the branch that was left.
+        git(dir.path(), &["checkout", "-q", "--orphan", "fresh"]);
+        h.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&h, "unborn", |s| s.head_seen.is_none());
+        assert!(ready(&s).is_some(), "the previous diff is still drawn");
+        assert_eq!(s.head, None, "and it no longer vouches for an id");
     }
 
     #[test]
@@ -173,6 +188,12 @@ Add one helper next to `git_out` if it is not already present (0.0.2 added it):
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 ```
+
+
+Worktree scope has no diff to retain, so clearing `head` there is trivial; the second test is
+the case 8.6 is really about. In branch scope the row load fails without a commit, every row and
+the `Ready` diff survive that refresh, and only the explicit clear keeps `M` from marking the
+commit of the branch that was left.
 
 - [ ] **Step 2: Run them to verify they fail**
 
