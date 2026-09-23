@@ -119,12 +119,13 @@ pub(crate) async fn rows(
                 .cmp(&matches!(b.status, ChangedFileStatus::Untracked))
         })
     });
-    // Status can precede a git add: an untracked row duplicating a tracked one is dropped,
-    // unless the tracked row is a deletion. Two tracked rows with the same displayed path stay.
+    // Rows must have distinct keys, or selection stalls. Status can precede a git add, and two
+    // paths that differ only in undecodable bytes display alike: both collapse to the first row.
+    // Only the deleted-plus-recreated-untracked pair keeps two rows, with distinct keys.
     files.dedup_by(|current, previous| {
         current.path == previous.path
-            && matches!(current.status, ChangedFileStatus::Untracked)
-            && !matches!(previous.status, ChangedFileStatus::Deleted)
+            && !(matches!(previous.status, ChangedFileStatus::Deleted)
+                && matches!(current.status, ChangedFileStatus::Untracked))
     });
     Ok(BranchRows {
         files,
@@ -275,10 +276,12 @@ pub(crate) async fn untracked_diff(
 mod tests {
     use super::*;
 
-    /// Two paths that differ only in bytes UTF-8 cannot represent display alike but stay two rows.
+    /// Two paths that differ only in undecodable bytes display alike; they become one row so
+    /// every key stays unique (the frozen `ChangedFile.path` is a `String`, so the raw bytes
+    /// cannot be kept). The limit is documented in the README.
     #[cfg(target_os = "linux")]
     #[test]
-    fn paths_that_are_not_utf8_are_shown_lossily_but_never_collapsed() {
+    fn paths_that_are_not_utf8_are_shown_lossily_as_one_row() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
         use std::process::Command as Proc;
@@ -318,13 +321,22 @@ mod tests {
         let names: Vec<&str> = rows.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(
             names,
-            ["n\u{fffd}.txt", "n\u{fffd}.txt"],
-            "both rows survive the sort and dedup"
+            ["n\u{fffd}.txt"],
+            "one displayed path, one row, one key"
         );
-        assert!(rows
-            .files
-            .iter()
-            .all(|f| matches!(f.status, ChangedFileStatus::Added)));
+        assert!(matches!(rows.files[0].status, ChangedFileStatus::Added));
+        // An untracked twin of a displayed path collapses too, except onto a deletion.
+        let twin = ChangedFile {
+            path: "n\u{fffd}.txt".into(),
+            status: ChangedFileStatus::Untracked,
+            staged: false,
+            insertions: None,
+            deletions: None,
+        };
+        let rows = rt
+            .block_on(super::rows(&toplevel, &merge_base, vec![twin]))
+            .unwrap();
+        assert_eq!(rows.files.len(), 1);
     }
 
     #[test]

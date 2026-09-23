@@ -275,7 +275,7 @@ async fn load_rows(
     if job.scope == Scope::Branch && base.is_none() {
         base_error = base_error.or_else(|| Some(NO_BASE_NOTICE.to_string()));
     }
-    let (files, rename_sources) = match (scope, &base) {
+    let (mut files, rename_sources) = match (scope, &base) {
         (Scope::Branch, Some(b)) => {
             let rows = branch::rows(
                 toplevel,
@@ -287,6 +287,9 @@ async fn load_rows(
         }
         _ => (status.files.clone(), BTreeMap::new()),
     };
+    // Selection relies on unique keys; paths that decode alike keep only their first row.
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|f| seen.insert(FileKey::of(f)));
     let persisted = match (&job.base, &job.inputs.state_dir) {
         (BaseJob::Pick(pick), Some(dir)) => {
             Some(base::save_pick(dir, toplevel, pick.as_deref()).map_err(|e| e.to_string()))
