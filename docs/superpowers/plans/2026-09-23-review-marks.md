@@ -420,13 +420,33 @@ block, immediately before the `pick_seq` bookkeeping:
 ```rust
                         // after `if succeeded && !same { next.diff = ... }`, so it reads the
                         // diff state this publication actually carries
-                        next.head = if head_sampled && next.head_seen.is_none() {
-                            // The sample ran and found no commit: whatever diff is still on
-                            // screen belongs to the branch that was left, and `M` must refuse.
-                            None
-                        } else {
-                            head_of(&next, confirmed.filter(|_| succeeded))
-                        };
+                        let previous_head = next.head.clone();
+                        next.head = markable(&next, previous_head, head_sampled, confirmed.filter(|_| succeeded));
+```
+
+with the decision beside `head_of`, so the three cases are one readable rule rather than a
+condition inside the publication:
+
+```rust
+/// 8.6: the id this publication may be marked at.
+fn markable(
+    next: &Snapshot,
+    previous_head: Option<String>,
+    head_sampled: bool,
+    confirmed: Option<String>,
+) -> Option<String> {
+    if !head_sampled {
+        // The sample could not run at all. 8.6 keeps both previous values rather than making
+        // a settled worktree unmarkable because one `rev-parse` could not be spawned.
+        return head_of(next, previous_head);
+    }
+    if next.head_seen.is_none() {
+        // The sample ran and found no commit: whatever diff is still on screen belongs to the
+        // branch that was left, and `M` must refuse.
+        return None;
+    }
+    head_of(next, confirmed)
+}
 ```
 
 A refresh that keeps a `Ready` diff therefore keeps that diff's id -- the background
@@ -527,6 +547,44 @@ list if it is not.
         snap.files.clear();
         snap.diff = crate::engine::DiffState::Idle;
         assert!(body_is_drawn(&st, &snap, 120, 24), "an empty list is a drawn body");
+    }
+```
+
+And `src/engine/session.rs` tests the publication rule itself, which no repository fixture can
+reach: `head_sampled` is false only when `rev-parse` could not be spawned at all.
+
+```rust
+    #[test]
+    fn a_sample_that_could_not_run_keeps_the_previous_id() {
+        let mut snap = Snapshot::empty();
+        let previous = "a".repeat(40);
+        let confirmed = "b".repeat(40);
+        // A clean worktree: an empty list with no diff to read, so the id can only come from
+        // the sample.
+        assert_eq!(
+            markable(&snap, Some(previous.clone()), true, Some(confirmed.clone())),
+            None,
+            "sampled, and there is no commit"
+        );
+        snap.head_seen = Some(confirmed.clone());
+        assert_eq!(
+            markable(&snap, Some(previous.clone()), true, Some(confirmed.clone())),
+            Some(confirmed.clone()),
+            "a confirmed sample is what the empty list is marked at"
+        );
+        assert_eq!(
+            markable(&snap, Some(previous.clone()), true, None),
+            None,
+            "sampled, but the two samples disagreed"
+        );
+        assert_eq!(
+            markable(&snap, Some(previous.clone()), false, None),
+            Some(previous.clone()),
+            "the sample could not run: 8.6 keeps the previous id"
+        );
+        // A loaded diff vouches for itself in every case; a loading one for none.
+        snap.diff = DiffState::Loading;
+        assert_eq!(markable(&snap, Some(previous.clone()), false, None), None);
     }
 ```
 
@@ -1105,7 +1163,7 @@ pub(crate) async fn classify(
     record: &base::MarkRecord,
     head: &str,
     previous: Option<&Mark>,
-    previous_unread: Option<&BTreeSet<String>>,   // `None` unless the previous snapshot was branch scope
+    previous_unread: Option<(&str, &BTreeSet<String>)>,   // the head that set was read at, and the set
 ) -> (Mark, BTreeSet<String>);
 
 // src/engine/types.rs
@@ -1230,7 +1288,7 @@ mod tests {
             &record,
             &head,
             Some(&mark),
-            Some(&set),
+            Some((head.as_str(), &set)),
         ));
         assert_eq!(cached.0, mark);
         assert_eq!(cached.1, set);
@@ -1248,9 +1306,24 @@ mod tests {
             &newer,
             &head,
             Some(&mark),
-            Some(&set),
+            Some((head.as_str(), &set)),
         ));
         assert_eq!(fresh.at, newer.at);
+
+        // A set read at another head is not reused, however well the classification matches:
+        // the dots must describe the head on screen.
+        let earlier = head_of(dir.path(), "HEAD~1");
+        let (other, other_set) = rt().block_on(classify(&top, &record, &earlier, None, None));
+        assert_ne!(other_set, set, "the two heads have different unread sets");
+        let (back, back_set) = rt().block_on(classify(
+            &top,
+            &record,
+            &head,
+            Some(&other),
+            Some((earlier.as_str(), &other_set)),
+        ));
+        assert_eq!(back_set, set, "the set for this head is recomputed, not carried over");
+        assert_eq!(back.classified_at.as_deref(), Some(head.as_str()));
     }
 
     #[test]
@@ -1282,11 +1355,33 @@ mod tests {
         );
         assert!(set.contains("c.txt"), "the rows come from the read that did answer");
 
-        // And the next refresh asks again: an undated pair is never served from the cache.
-        let (again, set_again) =
-            rt().block_on(classify(&top, &record, &head, Some(&mark), Some(&set)));
+        // And the next refresh asks again: a pair this head never classified is not served
+        // from the cache, even though the set beside it was read here.
+        let (again, set_again) = rt().block_on(classify(
+            &top,
+            &record,
+            &head,
+            Some(&mark),
+            Some((head.as_str(), &set)),
+        ));
         assert_eq!(again.classified_at.as_deref(), Some(second.as_str()));
         assert_eq!(set_again, set);
+
+        // Nor is that set reused back at the head the classification does name: it was read
+        // here, not there.
+        let (at_old, set_at_old) = rt().block_on(classify(
+            &top,
+            &record,
+            &second,
+            Some(&mark),
+            Some((head.as_str(), &set)),
+        ));
+        assert_eq!(
+            set_at_old,
+            rt().block_on(unread(&top, &tree, &second)).unwrap(),
+            "the older head's own rows, not the newer head's"
+        );
+        assert!(matches!(at_old.state, MarkState::Current));
     }
 
     #[test]
@@ -1400,15 +1495,19 @@ pub(crate) async fn classify(
     record: &base::MarkRecord,
     head: &str,
     previous: Option<&Mark>,
-    previous_unread: Option<&BTreeSet<String>>,
+    previous_unread: Option<(&str, &BTreeSet<String>)>,
 ) -> (Mark, BTreeSet<String>) {
     // An answered pair is not asked again: both commits are fixed, so neither the state nor
     // the set can change while they do. This is what keeps a settled repository at zero git
-    // processes per poll for this section. `previous_unread` is `None` unless the previous
-    // snapshot was itself in branch scope -- worktree scope publishes an empty set, and
-    // caching that would leave the dots gone after a scope switch and back.
-    if let (Some(p), Some(set)) = (previous, previous_unread) {
-        if p.commit == record.commit && p.classified_at.as_deref() == Some(head) {
+    // processes per poll for this section. The set carries the head it was read at, because
+    // the two dates can differ: the retry path below returns a set read at this head while
+    // leaving the classification dated at an earlier one. Reuse needs both to be this head --
+    // the state was decided here, and the set was read here.
+    if let (Some(p), Some((read_at, set))) = (previous, previous_unread) {
+        if p.commit == record.commit
+            && read_at == head
+            && p.classified_at.as_deref() == Some(head)
+        {
             // The timestamp comes from the record just read: another viewer may have marked
             // the same commit again, and the age shown must follow it.
             let mut mark = p.clone();
@@ -1491,7 +1590,9 @@ Expected: PASS (five tests).
                 record,
                 head,
                 job.previous_mark.as_ref(),
-                job.previous_unread.as_ref(),
+                job.previous_unread
+                    .as_ref()
+                    .map(|(at, set)| (at.as_str(), set)),
             )
             .await;
             (Some(mark), set)
@@ -1519,17 +1620,26 @@ Expected: PASS (five tests).
 ```
 
 with `Job` gaining `previous_mark: Option<Mark>` and
-`previous_unread: Option<BTreeSet<String>>`, filled in `request_status` from
-`self.snapshot.mark.clone()` and from the previous set *only when that snapshot was itself in
-branch scope*:
+`previous_unread: Option<(String, BTreeSet<String>)>` — the head the published set was read at,
+and the set — filled in `request_status`:
 
 ```rust
             previous_mark: self.snapshot.mark.clone(),
-            previous_unread: (self.snapshot.scope == Scope::Branch)
-                .then(|| (*self.snapshot.unread).clone()),
+            previous_unread: self
+                .unread_at
+                .clone()
+                .map(|at| (at, (*self.snapshot.unread).clone())),
 ```
 
-so a switch to worktree scope and back recomputes instead of caching an empty set.
+`Loaded` gains `unread_at: Option<String>`, which `load_rows` fills with the head it classified
+at (`head_id.map(str::to_string)` in the branch arm, `None` in the other two), and `State` gains
+`unread_at: Option<String>`, assigned beside `next.unread` on every publication. Routing the
+provenance through one field rather than reading `snapshot.scope` covers all three ways a
+published set can fail to describe the current head: worktree scope publishes an empty set, a
+refresh that could not sample the head publishes one too, and the retry path publishes a set
+read at a head the classification does not name. Any of them leaves `unread_at` unequal to the
+head (or `None`), and the next refresh recomputes instead of reusing dots that were never about
+this commit.
 
 A mark this refresh has just written is classified the same way, not assumed current: `M`
 submits `drawn_head`, which can be older than the `head_seen` this refresh observed, so an
@@ -1662,7 +1772,16 @@ A fresh mark never leaves the previous mark's set behind it.
         assert!(s.unread.is_empty(), "the view flags every row from the state, not the set");
         assert!(s.files.len() >= 4, "the rows and the base keep working");
 
-        let head = wait_for(&h, "markable", |s| s.head.is_some()).head.clone().unwrap();
+        // The dots and the `Rewritten` state arrive while the pre-amend diff is still on
+        // screen, whose id is the commit that was just replaced; marking that one repairs
+        // nothing. Wait for the amended commit's own diff.
+        let amended = git_out(dir.path(), &["rev-parse", "HEAD"]).trim().to_string();
+        let head = wait_for(&h, "markable at the amended commit", |s| {
+            s.head.as_deref() == Some(amended.as_str())
+        })
+        .head
+        .clone()
+        .unwrap();
         h.commands.send(Command::MarkReviewed(head)).unwrap();
         let s = wait_for(&h, "repaired", |s| s.mark_seq == 2);
         assert_eq!(s.mark.as_ref().map(|m| m.state.clone()), Some(crate::engine::MarkState::Current));
@@ -1914,8 +2033,18 @@ impl ViewState { pub fn notify(&mut self, text: impl Into<String>); pub fn warn(
             "the answer the user is owed is not overwritten"
         );
 
-        // The warning is not lost: its pair was never recorded, so the next snapshot of the
-        // same state says it.
+        // However many snapshots arrive before the next draw, the answer is still the one on
+        // screen: the warning is pending, not queued behind a single observation.
+        st.observe(&snap);
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.clone()).as_deref(),
+            Some("mark not remembered: no state directory"),
+        );
+
+        // The warning is not lost either: once a body key has cleared the answer, the next
+        // snapshot of the same state says it.
+        st.notice = None;
         st.observe(&snap);
         assert!(st.notice.as_ref().unwrap().text.contains("no longer on this branch"));
     }
@@ -1999,10 +2128,13 @@ Every existing assignment becomes a call: `state.notice = Some("split view needs
                 && m.state != crate::engine::MarkState::Current)
                 .then(|| (m.commit.clone(), at, m.state.clone()))
         });
-        // A mark answered in this same snapshot outranks the warning: `mark not remembered`
-        // is the more urgent of the two and its `mark_seq` is already consumed, while the
-        // warning keeps its unrecorded pair and speaks at the next snapshot.
-        if rewritten != self.seen_rewrite && !answered_mark {
+        // The warning never displaces an urgent notice the user has not acknowledged, and a
+        // mark answered in this same snapshot outranks it too. Its pair stays unrecorded, so
+        // it speaks at the first snapshot after a body key clears the notice -- 8.2's rule
+        // that an urgent answer stands until then, applied to the one thing that could
+        // quietly overwrite it between two draws.
+        let urgent_stands = self.notice.as_ref().is_some_and(|n| n.urgent);
+        if rewritten != self.seen_rewrite && !answered_mark && !urgent_stands {
             self.seen_rewrite = rewritten.clone();
             match rewritten.map(|(_, _, state)| state) {
                 Some(crate::engine::MarkState::Rewritten) => {
@@ -2662,20 +2794,36 @@ Expected: PASS, with the allow-list unchanged at ten subcommands.
             "pane", "wait-output", viewer_id, "--match", "as reviewed", "--source", "visible",
             "--timeout", "15000",
         ]);
-        // A commit after the mark must raise a marker, and the next mark must clear it.
-        std::fs::write(repo.join("later.txt"), "later\n").unwrap();
-        git(&["add", "later.txt"]);
+        // The dot is drawn in the files panel, which the viewer leaves hidden below 100
+        // columns -- and a split pane in the isolated host is often narrower than that. `E`
+        // pins it; press until the panel's own header is on screen, so a hidden panel fails
+        // as "no panel" rather than as "no marker".
+        wait_for("the files panel is shown", || {
+            let screen = iso
+                .herdr(&["pane", "read", viewer_id, "--source", "visible"])
+                .to_string();
+            if screen.contains("CHANGED ") {
+                return true;
+            }
+            iso.herdr(&["pane", "send-text", viewer_id, "E"]);
+            false
+        });
+
+        // A commit after the mark must raise a marker, and the next mark must clear it. It
+        // touches the selected file so the new diff is the one already on screen.
+        std::fs::write(repo.join("c.txt"), "c\nAFTER-THE-MARK\n").unwrap();
+        git(&["add", "c.txt"]);
         git(&["commit", "-q", "-m", "later"]);
         iso.herdr(&[
             "pane", "wait-output", viewer_id, "--match", "●", "--source", "visible",
             "--timeout", "15000",
         ]);
-        // The dot can appear while the previous commit's diff is still drawn, whose id is
-        // the one `M` would take; `r` and a loaded diff put the new state on screen first.
-        iso.herdr(&["pane", "send-text", viewer_id, "r"]);
+        // The dot can appear while the previous commit's diff is still drawn, whose id is the
+        // one `M` would take. This line exists only in the new commit, so seeing it proves
+        // the body on screen was read at the head that commit created.
         iso.herdr(&[
-            "pane", "wait-output", viewer_id, "--match", "@@", "--source", "visible",
-            "--timeout", "15000",
+            "pane", "wait-output", viewer_id, "--match", "AFTER-THE-MARK", "--source",
+            "visible", "--timeout", "15000",
         ]);
         iso.herdr(&["pane", "send-text", viewer_id, "M"]);
         wait_for("the marker clears", || {
