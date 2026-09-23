@@ -90,30 +90,42 @@ announces with its own notice, so the reviewer is told to mark again rather
 than silently losing a change. A third sample inside the diff task would buy
 only a smaller window of the same two outcomes, at one `rev-parse` per diff.
 
-**The boundary.** One thing cannot be pinned: the working tree is not a
-commit, and `git diff <M>` reads it live. A process that rewinds the tree and
-restores it while a refresh runs -- `reset --hard` to an ancestor and back
-inside one job -- can make a frame draw that other content under an id whose
-comparison is otherwise correct, with both samples agreeing and the mark still
-an ancestor, so nothing detects it. The viewer holds no lock on the repository
-and cannot close that window. What it does instead is bounded and stated here:
-every frame's comparison is derived from the id that frame carries, a frame
-without a loaded diff acknowledges nothing, and the next refresh redraws
-whatever the tree settled on. A rewind that does not come back is a rewrite,
-which the ancestry warning below reports; a rewind that comes back inside one
-refresh is the one case where 8.1's promise rests on no other process
-rewinding history under the reader.
+**The boundary.** Two things cannot be pinned. The working tree is not a
+commit, and `git diff <M>` reads it live; and worktree scope's rows and diffs
+come from the frozen path of 3.2, whose `git diff --cached` names live `HEAD`
+and takes no sampled commit, so the pinning above is branch scope's alone and
+worktree scope keeps the two samples as its only detector. A process that
+rewinds the tree and restores it while a refresh runs -- `reset --hard` to an
+ancestor and back inside one job -- can therefore make a frame draw other
+content, or an empty list, under an id whose comparison is otherwise correct,
+with both samples agreeing and the mark still an ancestor, so nothing detects
+it. The viewer holds no lock on the repository and cannot close that window.
+What it does instead is bounded and stated here: in branch scope every frame's
+comparison is derived from the id that frame carries, a frame whose diff never
+loaded acknowledges nothing, an invalidated id takes its pending candidate
+with it, and the next refresh redraws whatever the tree settled on. A rewind
+that does not come back is a rewrite, which the ancestry warning below
+reports. A rewind that comes back inside one refresh is the one case where
+8.1's promise rests on no other process rewinding history under the reader,
+and `M` pressed again after the next refresh corrects the mark.
 
-*Published last.* The sampled id is held by the session and becomes
-`Snapshot.head` only when a row's diff from that refresh has been loaded
-successfully and published. A diff that ends in `DiffState::Failed` -- a
-timeout, a git error -- leaves the previous id in place, because its hunks
-were never drawn, and so does a refresh whose row list is empty: there is
-nothing to read, so there is nothing to acknowledge. The consequence of the
-second rule is small and self-correcting -- on a branch that carries nothing
-against its base, `M` repeats the mark already in force, and the first refresh
-with a row again advances the id, so one further press settles it. Until then
-the snapshot carries the previous id. `refreshing` cannot carry this rule: it is published only by the
+*Published last.* The sampled id is held by the session as a candidate and
+becomes `Snapshot.head` when the refresh that sampled it is complete on
+screen: a row's diff from it has been loaded successfully and published, or it
+published no row at all. A diff that ends in `DiffState::Failed` -- a timeout,
+a git error -- leaves the previous id in place, because its hunks were never
+drawn; until one of the two happens the snapshot carries the previous id. The
+empty list has to count, or a clean repository would never advance the id
+again and `M` would be stuck at an old commit for good -- which is exactly the
+state the recovery of a rewritten mark leaves behind, where the base has just
+been reset and there is nothing to list. What an empty frame acknowledges is
+"there was nothing to read at this id", and the boundary below says when that
+can be untrue.
+
+A candidate is dropped, not published, when the id it belongs to is
+invalidated: if a later refresh reports no commit at all (below), the pending
+candidate goes with the published id, so a diff that was already running
+cannot promote it after the fact. `refreshing` cannot carry this rule: it is published only by the
 command paths (`r`, `b`, `B`), so a watcher- or poll-driven refresh -- exactly
 the one that follows an agent's commit -- runs with `refreshing` false
 throughout. Without the rule, such a refresh would publish the new rows and
@@ -126,11 +138,10 @@ that completed a refresh can be skipped when a newer one arrives inside the
 same 100 ms poll, and `head` -- a state field, not an event -- would survive
 into the frame that is drawn. The view therefore keeps the id it has drawn:
 `ViewState` gains `drawn_head: Option<String>`, assigned after a frame that
-actually showed the review body -- the snapshot's diff is `Ready`, *and* the
-frame was the ordinary body, not the "terminal too small" notice of 5.1, the
-key sheet of 4.3 or the picker of 7.4, each of which covers the diff
-completely. An empty list draws no diff and assigns nothing, matching the
-publication rule above. A frame showing `Loading` or `Failed`, and any
+actually showed the review body -- the snapshot's diff is `Ready` or its row
+list is empty, *and* the frame was the ordinary body, not the "terminal too
+small" notice of 5.1, the key sheet of 4.3 or the picker of 7.4, each of which
+covers the diff completely. A frame showing `Loading` or `Failed`, and any
 modal frame, leaves it alone. So a refresh that succeeds behind an open key
 sheet is not acknowledged, and `M` after closing it still marks the last
 commit whose hunks were on the terminal. `M` marks `drawn_head`, never
@@ -424,7 +435,7 @@ Additions to the tables of 5.1 and 7.8:
 | a rewrite leaves no common ancestor at all (an amended root commit) | 7.8's rule: the rows and the head both stay, with git's message as a status error; `B` and a working base restore the rows, and `M` marks again afterwards |
 | the selected row's diff fails during a refresh | `head` does not advance; `M` keeps marking the last commit whose hunks were drawn |
 | the head `rev-parse` cannot be run (spawn failure, timeout) | `head` keeps its previous value; `M` marks that older id, the safe direction of 8.2 |
-| the head `rev-parse` runs and finds no commit (unborn branch, not a repository) | `head` becomes `None` in the next publication, gate or no gate, and clears `drawn_head`; `M` then shows `nothing to mark: no commit yet` instead of marking a commit of the branch that was left |
+| the head `rev-parse` runs and finds no commit (unborn branch, not a repository) | `head` becomes `None` in the next publication, gate or no gate, taking any pending candidate with it, and clears `drawn_head`; `M` then shows `nothing to mark: no commit yet` instead of marking a commit of the branch that was left |
 | `M` fails to validate or its rows fail to load | the notice of 8.2, once per press; the base, the mark and the rows are unchanged |
 
 Cost. Two `rev-parse` runs per refresh for the head id -- one before the row
@@ -456,8 +467,10 @@ Test layers, added to 5.2 and 7.9:
    longer resolves answers `mark_error`, leaves `pick_seq` untouched and
    writes nothing; with no state directory the mark holds as the session mark
    and the notice says so.
-2. Engine, the published head: an empty row list never advances it, and
-   neither does a failed diff; the refresh's row commands carry the sampled id
+2. Engine, the published head: a failed diff does not advance it while an
+   empty row list does (the recovery of 8.2 needs it); a diff still running
+   when `head` is invalidated cannot promote its candidate afterwards; the
+   refresh's row commands carry the sampled id
    (`merge-base <head> <base>`), so the rows a frame shows are the comparison
    of the id it publishes even when `HEAD` leaves and returns during the job;
    a refresh during which `HEAD` moves -- a commit landing between the two
