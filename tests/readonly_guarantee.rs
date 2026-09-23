@@ -353,6 +353,7 @@ fn the_engine_never_mutates_the_repository() {
     );
     assert_eq!(tree_hash(p), tree_before, "worktree changed");
     // Writes to arbitrary absolute paths are outside what this test can see.
+    // A child under a restricted mount namespace or a syscall trace is not portable to macOS CI.
     assert!(
         std::fs::read_dir(scratch.path()).unwrap().next().is_none(),
         "the viewer wrote to cwd"

@@ -45,6 +45,10 @@ pub struct EngineHandle {
     pub snapshots: mpsc::Receiver<Arc<Snapshot>>,
     /// Status refreshes started by this session.
     pub refreshes: Arc<AtomicUsize>,
+    /// Test hook: ref replies handled, including discarded replies.
+    pub refs_answered: Arc<AtomicUsize>,
+    /// Test hook: diff results discarded for a stale generation or comparison.
+    pub diffs_discarded: Arc<AtomicUsize>,
 }
 
 struct FrozenWatcher {
@@ -539,6 +543,8 @@ async fn run(
     mut commands: UnboundedReceiver<Command>,
     snapshots: mpsc::Sender<Arc<Snapshot>>,
     refreshes: Arc<AtomicUsize>,
+    refs_answered: Arc<AtomicUsize>,
+    diffs_discarded: Arc<AtomicUsize>,
 ) {
     let mut state = State {
         snapshot: Snapshot::empty(&config.path.to_string_lossy()),
@@ -732,14 +738,14 @@ async fn run(
                         publish(&mut state, next, &snapshots);
                     }
                     Done::Refs { token, result } => {
-                        if token <= next.refs_seq {
-                            continue;
+                        if token > next.refs_seq {
+                            let (refs, overflow) = result.unwrap_or_default();
+                            next.refs = Some(Arc::new(refs));
+                            next.refs_overflow = overflow;
+                            next.refs_seq = token;
+                            publish(&mut state, next, &snapshots);
                         }
-                        let (refs, overflow) = result.unwrap_or_default();
-                        next.refs = Some(Arc::new(refs));
-                        next.refs_overflow = overflow;
-                        next.refs_seq = token;
-                        publish(&mut state, next, &snapshots);
+                        refs_answered.fetch_add(1, Ordering::SeqCst);
                     }
                     Done::Watcher(result) => {
                         state.watcher = if result.is_ok() { WatcherPhase::Running } else { WatcherPhase::Failed };
@@ -861,6 +867,7 @@ async fn run(
                     }
                     Done::Diff { generation, key, comparison, result } => {
                         if generation != state.diff_generation || comparison != comparison_of(&state.snapshot) {
+                            diffs_discarded.fetch_add(1, Ordering::SeqCst);
                             continue;
                         }
                         state.diff_in_flight = None;
@@ -897,11 +904,22 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
     let (commands, commands_rx) = unbounded_channel();
     let (snapshots_tx, snapshots) = mpsc::channel();
     let refreshes = Arc::new(AtomicUsize::new(0));
-    runtime.spawn(run(config, commands_rx, snapshots_tx, refreshes.clone()));
+    let refs_answered = Arc::new(AtomicUsize::new(0));
+    let diffs_discarded = Arc::new(AtomicUsize::new(0));
+    runtime.spawn(run(
+        config,
+        commands_rx,
+        snapshots_tx,
+        refreshes.clone(),
+        refs_answered.clone(),
+        diffs_discarded.clone(),
+    ));
     EngineHandle {
         commands,
         snapshots,
         refreshes,
+        refs_answered,
+        diffs_discarded,
     }
 }
 
@@ -2072,6 +2090,11 @@ mod tests {
         );
         gate.add_permits(1); // releases D1, whose result must be discarded
         gate.add_permits(1); // releases the branch diff of a.txt
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.diffs_discarded.load(Ordering::SeqCst) < 1 {
+            assert!(Instant::now() < deadline, "stale diff was not discarded");
+            std::thread::yield_now();
+        }
         let s = wait_for(&h, "branch diff", |s| ready(s).is_some());
         assert!(matches!(
             ready(&s).unwrap().comparison,
@@ -2079,7 +2102,6 @@ mod tests {
         ));
         assert_eq!(ready(&s).unwrap().key.path, "a.txt");
         // No snapshot after the switch carries a worktree-comparison diff.
-        std::thread::sleep(Duration::from_millis(200));
         while let Ok(s) = h.snapshots.try_recv() {
             assert!(ready(&s)
                 .map(|d| d.comparison != Comparison::Worktree)
@@ -2164,16 +2186,24 @@ mod tests {
         h.commands.send(Command::LoadRefs(2)).unwrap();
         let newest = wait_for(&h, "newer ref reply", |s| s.refs_seq == 2);
         h.commands.send(Command::LoadRefs(1)).unwrap();
-        let deadline = Instant::now() + Duration::from_millis(300);
-        while Instant::now() < deadline {
-            if let Ok(s) = h.snapshots.recv_timeout(Duration::from_millis(20)) {
-                assert_eq!(s.refs_seq, 2, "an older ref reply replaced the token");
-                assert!(Arc::ptr_eq(
-                    s.refs.as_ref().unwrap(),
-                    newest.refs.as_ref().unwrap()
-                ));
-            }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.refs_answered.load(Ordering::SeqCst) != 2 {
+            assert!(
+                Instant::now() < deadline,
+                "both ref replies were not handled"
+            );
+            std::thread::yield_now();
         }
+        let latest = h
+            .snapshots
+            .try_iter()
+            .last()
+            .unwrap_or_else(|| newest.clone());
+        assert_eq!(latest.refs_seq, 2, "an older ref reply replaced the token");
+        assert!(Arc::ptr_eq(
+            latest.refs.as_ref().unwrap(),
+            newest.refs.as_ref().unwrap()
+        ));
     }
 
     #[test]

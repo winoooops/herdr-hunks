@@ -3659,6 +3659,8 @@ git commit -m "docs: branch scope, acceptance rows 6 and 7, version 0.1.0"
 
 Resolved ambiguity: 7.4's prose "dropped before the view chip" versus its numbers (scope 2, view 3, higher drops first). The plan follows the numbers; the prose should be corrected with the plan-review findings.
 
+Resolved ambiguity: 7.4's "the wheel scrolls the list" is refined to moving the picker's cursor by three rows and scrolling the window with it, so Enter always picks the highlighted row. The dialog primitive draws from row 0 whenever a cursor is set; an independent scroll offset would either hide the cursor or be undone by the window that keeps it visible.
+
 Type consistency: `FileKey::of`, `ref_label`, `Comparison`, `NO_BASE_NOTICE`, `base::{check_text, verify, merge_base, resolve, ResolveInputs, load_picks, save_pick, note_problem, list_refs, REFS_CAP}`, `branch::{parse_name_status, rows, split_header, keep_sections, diff, untracked_diff}`, `Snapshot.{scope, base, base_error, default_base, rename_sources, refs, refs_overflow, refs_seq, pick_seq, pick_error}`, `Command::{SetScope, SetBase, LoadRefs}`, `KeyAction::{ToggleScope, PickBase}`, `Action::{ToggleScope, PickRow}`, `ViewState::{observe, picker}`, `Picker::{open, refs, rows, visible, window, panel, move_by, retarget, observe}`, `Config.{scope, base}`, `SessionConfig.{scope, base_ref, state_dir}` are the names used throughout.
 
 <!-- codex-reviewed: 2026-09-22T16:23:42Z -->
