@@ -10,6 +10,7 @@ use crate::git::run_git_with_timeout;
 
 pub const REFS_CAP: usize = 200;
 const PICKS_FILE: &str = "bases.json";
+const MARKS_FILE: &str = "marks.json";
 
 /// One git invocation in `toplevel` through the frozen runner (30 s timeout; the D3 variables are process-wide).
 pub(crate) async fn git(toplevel: &str, args: &[&str]) -> Result<std::process::Output, String> {
@@ -82,6 +83,8 @@ pub(crate) async fn merge_base_of(
 pub struct ResolveInputs {
     /// `Some(Some(ref))` a pick, `Some(None)` a reset, kept in memory when `bases.json` could not be written.
     pub session_pick: Option<Option<String>>,
+    /// A mark kept in memory when `marks.json` could not be written.
+    pub session_mark: Option<MarkRecord>,
     /// `[base] ref`.
     pub config: Option<String>,
     pub state_dir: Option<PathBuf>,
@@ -205,6 +208,59 @@ pub fn save_pick(state_dir: &Path, toplevel: &str, pick: Option<&str>) -> std::i
         let tmp = state_dir.join(format!("{PICKS_FILE}.{}.tmp", std::process::id()));
         std::fs::write(&tmp, serde_json::to_vec_pretty(&picks).unwrap_or_default())?;
         std::fs::rename(tmp, state_dir.join(PICKS_FILE))
+    })?
+}
+
+/// A commit id as `rev-parse` prints one: hexadecimal, 40 or 64 characters. Everything read
+/// back from a file is checked by shape before it can become an argument.
+pub fn is_object_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MarkRecord {
+    pub commit: String,
+    /// Seconds since the Unix epoch, recorded when the mark was written.
+    pub at: u64,
+}
+
+/// The remembered marks, keyed by canonical toplevel; a record whose commit is not an
+/// object id is dropped, as is an unreadable or malformed file, with the reason.
+pub fn load_marks(state_dir: &Path) -> (BTreeMap<String, MarkRecord>, Option<String>) {
+    let text = match std::fs::read_to_string(state_dir.join(MARKS_FILE)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (BTreeMap::new(), None),
+        Err(e) => return (BTreeMap::new(), Some(format!("{MARKS_FILE}: {e}"))),
+        Ok(text) => text,
+    };
+    let marks: BTreeMap<String, MarkRecord> = match serde_json::from_str(&text) {
+        Ok(marks) => marks,
+        Err(e) => return (BTreeMap::new(), Some(format!("{MARKS_FILE}: {e}"))),
+    };
+    let total = marks.len();
+    let kept: BTreeMap<String, MarkRecord> = marks
+        .into_iter()
+        .filter(|(_, m)| is_object_id(&m.commit))
+        .collect();
+    // Report every dropped record, even beside another worktree's valid record.
+    let dropped = total - kept.len();
+    let problem = (dropped > 0).then(|| format!("{MARKS_FILE}: {dropped} unusable record(s)"));
+    (kept, problem)
+}
+
+/// Read-modify-write under the same lock as the picks, then an atomic replace.
+pub fn save_mark(state_dir: &Path, toplevel: &str, record: &MarkRecord) -> std::io::Result<()> {
+    if !state_dir.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "state directory must be absolute",
+        ));
+    }
+    reuse::with_lock(state_dir, || {
+        let (mut marks, _) = load_marks(state_dir);
+        marks.insert(toplevel.to_string(), record.clone());
+        let tmp = state_dir.join(format!("{MARKS_FILE}.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&marks).unwrap_or_default())?;
+        std::fs::rename(tmp, state_dir.join(MARKS_FILE))
     })?
 }
 
@@ -530,5 +586,74 @@ mod tests {
             .into_owned();
         let (refs, overflow) = rt().block_on(list_refs(&top)).unwrap();
         assert!(refs.is_empty() && !overflow);
+    }
+
+    #[test]
+    fn object_ids_are_recognised_by_shape_alone() {
+        assert!(is_object_id(&"a".repeat(40)));
+        assert!(is_object_id(&"0".repeat(64)));
+        assert!(!is_object_id(&"a".repeat(39)));
+        assert!(!is_object_id(&"a".repeat(41)));
+        assert!(!is_object_id(""));
+        assert!(!is_object_id("--output=tracked.txt"));
+        assert!(!is_object_id("refs/heads/main"));
+        assert!(!is_object_id(&format!("{}z", "a".repeat(39))));
+    }
+
+    #[test]
+    fn marks_round_trip_and_a_bad_record_is_dropped() {
+        let state = tempfile::tempdir().unwrap();
+        assert_eq!(load_marks(state.path()).0.len(), 0);
+        let record = MarkRecord {
+            commit: "a".repeat(40),
+            at: 1_700_000_000,
+        };
+        save_mark(state.path(), "/r/one", &record).unwrap();
+        let (marks, problem) = load_marks(state.path());
+        assert_eq!(marks.get("/r/one"), Some(&record));
+        assert!(problem.is_none());
+
+        // A record whose commit is not an object id is dropped with a problem line.
+        std::fs::write(
+            state.path().join("marks.json"),
+            r#"{"/r/one":{"commit":"--output=x","at":1}}"#,
+        )
+        .unwrap();
+        let (marks, problem) = load_marks(state.path());
+        assert!(marks.is_empty());
+        assert!(problem.unwrap().starts_with("marks.json: "));
+
+        // A bad record is reported even when a neighboring record survives.
+        std::fs::write(
+            state.path().join("marks.json"),
+            format!(
+                r#"{{"/r/one":{{"commit":"{}","at":1}},"/r/two":{{"commit":"nope","at":2}}}}"#,
+                "a".repeat(40)
+            ),
+        )
+        .unwrap();
+        let (marks, problem) = load_marks(state.path());
+        assert_eq!(marks.len(), 1, "the valid record survives");
+        assert!(marks.contains_key("/r/one"));
+        assert!(problem.is_some(), "the dropped record is still reported");
+
+        // Malformed JSON degrades the same way, and the next save rewrites it.
+        std::fs::write(state.path().join("marks.json"), "{ not json").unwrap();
+        assert!(load_marks(state.path()).1.is_some());
+        save_mark(state.path(), "/r/two", &record).unwrap();
+        assert_eq!(load_marks(state.path()).0.len(), 1);
+        let mut names: Vec<_> = std::fs::read_dir(state.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["marks.json", "split-panes.lock"],
+            "no temp file is left behind"
+        );
+
+        // A relative state directory is refused, as for picks.
+        assert!(save_mark(std::path::Path::new("relative"), "/r/one", &record).is_err());
     }
 }

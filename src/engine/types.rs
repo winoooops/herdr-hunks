@@ -52,6 +52,27 @@ pub enum BaseSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkState {
+    /// An ancestor of `head_seen`: the unread set is the one the diff computed.
+    Current,
+    /// Still a commit, no longer on this branch: every row is flagged.
+    Rewritten,
+    /// The unread command failed; the string is git's reason. Every row is flagged.
+    Unreadable(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mark {
+    /// A full object id: hexadecimal only, of the length this repository's hash gives.
+    pub commit: String,
+    /// Seconds since the Unix epoch, recorded when the mark was written.
+    pub at: u64,
+    pub state: MarkState,
+    /// The `head_seen` this state was classified against; `None` while unclassified.
+    pub classified_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Base {
     /// Exactly what git is given: a qualified ref for a picked or resolved
     /// branch, the typed text for free text and config.
@@ -180,6 +201,7 @@ pub struct Snapshot {
     /// `scope`, `base`, `files` and `rename_sources` always describe one comparison.
     pub scope: Scope,
     pub base: Option<Base>,
+    pub mark: Option<Mark>,
     /// A skipped resolution step, a `bases.json` problem or a pick that was not remembered; shown once.
     pub base_error: Option<String>,
     /// What steps 2-5 of the resolution order name, for the picker's reset row.
@@ -200,6 +222,9 @@ pub struct Snapshot {
     /// Bumped once per answered `SetBase`; `pick_error` is that answer.
     pub pick_seq: u64,
     pub pick_error: Option<String>,
+    /// Bumped once per answered `MarkReviewed`; `mark_error` is that answer.
+    pub mark_seq: u64,
+    pub mark_error: Option<String>,
 }
 
 impl Snapshot {
@@ -213,6 +238,7 @@ impl Snapshot {
             head_seen: None,
             scope: Scope::Worktree,
             base: None,
+            mark: None,
             base_error: None,
             default_base: None,
             files: Vec::new(),
@@ -227,6 +253,8 @@ impl Snapshot {
             refs_seq: 0,
             pick_seq: 0,
             pick_error: None,
+            mark_seq: 0,
+            mark_error: None,
         }
     }
 }
@@ -241,6 +269,8 @@ pub enum Command {
     SetScope(Scope),
     /// `Some`: validate, load branch rows under it, persist, publish. `None`: forget the pick and re-resolve.
     SetBase(Option<String>),
+    /// Record this commit as reviewed for this worktree. It changes no comparison.
+    MarkReviewed(String),
     /// Answer with `refs` and this opening's token on the snapshot.
     LoadRefs(u64),
     Shutdown,

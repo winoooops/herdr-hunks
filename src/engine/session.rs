@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Semaphore;
 
-use super::base::{self, ResolveInputs};
+use super::base::{self, MarkRecord, ResolveInputs};
 use super::{
-    branch, gitver, Base, BaseSource, Command, Comparison, DiffState, FileKey, LoadedDiff,
-    RepoState, Scope, Snapshot, NO_BASE_NOTICE,
+    branch, gitver, Base, BaseSource, Command, Comparison, DiffState, FileKey, LoadedDiff, Mark,
+    MarkState, RepoState, Scope, Snapshot, NO_BASE_NOTICE,
 };
 use crate::git::{self, ChangedFile, GetGitDiffResponse, GitStatusResponse};
 use crate::runtime::EventSink;
@@ -123,6 +123,7 @@ enum WatcherPhase {
 enum Change {
     Scope(Scope),
     Base(Option<String>),
+    Mark(String),
 }
 
 /// How the refresh obtains the base: keep and re-verify, run the resolution steps, or verify a pick
@@ -142,6 +143,7 @@ struct Job {
     base: BaseJob,
     inputs: ResolveInputs,
     default_base: Option<String>,
+    previous_mark: Option<Mark>,
     change: Option<Change>,
 }
 
@@ -150,11 +152,14 @@ struct Loaded {
     scope: Scope,
     base: Option<Base>,
     default_base: Option<String>,
+    mark: Option<Mark>,
     base_error: Option<String>,
     files: Vec<ChangedFile>,
     rename_sources: BTreeMap<String, String>,
     /// `Some` after a pick or reset: whether `bases.json` took it.
     persisted: Option<Result<(), String>>,
+    /// The mark answered by this refresh and whether it was remembered.
+    marked: Option<(Mark, Result<(), String>)>,
 }
 
 struct State {
@@ -173,10 +178,12 @@ struct State {
     /// The scope the next refresh loads; equals the published scope except before the first rows.
     requested_scope: Scope,
     inputs: ResolveInputs,
+    session_mark: Option<MarkRecord>,
     /// Run the resolution steps in the next refresh (start, `r`, and after a pick).
     resolve_pending: bool,
     changes: VecDeque<Change>,
     pick_seq: u64,
+    mark_seq: u64,
 }
 
 fn comparison_of(snapshot: &Snapshot) -> Comparison {
@@ -229,7 +236,7 @@ enum Done {
         head_sampled: bool,
         confirmed: Option<String>,
         /// `None` when the status failed or the directory is not a repository.
-        loaded: Option<Result<Loaded, String>>,
+        loaded: Option<Result<Box<Loaded>, String>>,
         change: Option<Change>,
     },
     Diff {
@@ -330,14 +337,68 @@ async fn load_rows(
         (BaseJob::Pick(_), None) => Some(Err("no state directory".to_string())),
         _ => None,
     };
+    let marked = match &job.change {
+        Some(Change::Mark(commit)) => {
+            let id = base::verify(toplevel, commit).await.map_err(|_| {
+                format!(
+                    "not a commit: {}",
+                    commit.chars().take(7).collect::<String>()
+                )
+            })?;
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let record = MarkRecord { commit: id, at };
+            let written = match &job.inputs.state_dir {
+                Some(dir) => base::save_mark(dir, toplevel, &record).map_err(|e| e.to_string()),
+                None => Err("no state directory".to_string()),
+            };
+            Some((
+                Mark {
+                    commit: record.commit,
+                    at: record.at,
+                    state: MarkState::Current,
+                    classified_at: None,
+                },
+                written,
+            ))
+        }
+        _ => None,
+    };
+    let mark = if let Some((mark, _)) = &marked {
+        Some(mark.clone())
+    } else if matches!(job.base, BaseJob::Keep(_)) && !branch_changed {
+        job.previous_mark.clone()
+    } else {
+        let record = match (&job.inputs.session_mark, &job.inputs.state_dir) {
+            (Some(record), _) => Some(record.clone()),
+            (None, Some(dir)) => {
+                let (marks, problem) = base::load_marks(dir);
+                if let Some(problem) = problem {
+                    base::note_problem(dir, &problem);
+                }
+                marks.get(toplevel).cloned()
+            }
+            (None, None) => None,
+        };
+        record.map(|record| Mark {
+            commit: record.commit,
+            at: record.at,
+            state: MarkState::Current,
+            classified_at: None,
+        })
+    };
     Ok(Loaded {
         scope,
         base,
         default_base,
+        mark,
         base_error,
         files,
         rename_sources,
         persisted,
+        marked,
     })
 }
 
@@ -358,9 +419,11 @@ async fn run_job(job: Job) -> Done {
         Err(_) => None,
     };
     let loaded = match &response {
-        Ok(status) if !status.repo_root.is_empty() => {
-            Some(load_rows(&job, status, head.as_ref(), sampled_head.as_deref()).await)
-        }
+        Ok(status) if !status.repo_root.is_empty() => Some(
+            load_rows(&job, status, head.as_ref(), sampled_head.as_deref())
+                .await
+                .map(Box::new),
+        ),
         _ => None,
     };
     // Only agreeing samples can make an empty list markable.
@@ -399,13 +462,13 @@ impl State {
         let scope = match &change {
             Some(Change::Scope(scope)) => *scope,
             Some(Change::Base(_)) => Scope::Branch,
-            None => self.requested_scope,
+            Some(Change::Mark(_)) | None => self.requested_scope,
         };
         // Explicit changes resolve preferences; polls only re-verify ids.
         let base = match (&change, std::mem::take(&mut self.resolve_pending)) {
             (Some(Change::Base(pick)), _) => BaseJob::Pick(pick.clone()),
             (Some(Change::Scope(_)), _) | (None, true) => BaseJob::Resolve,
-            (None, false) => BaseJob::Keep(self.snapshot.base.clone()),
+            (Some(Change::Mark(_)), _) | (None, false) => BaseJob::Keep(self.snapshot.base.clone()),
         };
         let job = Job {
             cwd: cwd.to_string(),
@@ -413,8 +476,12 @@ impl State {
             known_branch: self.branch.clone(),
             scope,
             base,
-            inputs: self.inputs.clone(),
+            inputs: ResolveInputs {
+                session_mark: self.session_mark.clone(),
+                ..self.inputs.clone()
+            },
             default_base: self.snapshot.default_base.clone(),
+            previous_mark: self.snapshot.mark.clone(),
             change,
         };
         let results = results.clone();
@@ -493,7 +560,7 @@ fn fingerprint(s: &Snapshot) -> String {
         DiffState::Ready(d) => format!("ready:{:p}", Arc::as_ptr(d)),
     };
     format!(
-        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}",
+        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{}|{:?}",
         s.repo,
         serde_json::to_string(&s.files).unwrap_or_default(),
         s.selected,
@@ -512,7 +579,10 @@ fn fingerprint(s: &Snapshot) -> String {
         s.refs_overflow,
         s.refs_seq,
         s.pick_seq,
-        s.pick_error
+        s.pick_error,
+        s.mark,
+        s.mark_seq,
+        s.mark_error
     )
 }
 
@@ -624,12 +694,15 @@ async fn run(
         requested_scope: config.scope,
         inputs: ResolveInputs {
             session_pick: None,
+            session_mark: None,
             config: config.base_ref.clone(),
             state_dir: config.state_dir.clone(),
         },
+        session_mark: None,
         resolve_pending: true,
         changes: VecDeque::new(),
         pick_seq: 0,
+        mark_seq: 0,
     };
     let path = match config.path.canonicalize() {
         Ok(path) if path.is_dir() => path,
@@ -713,6 +786,13 @@ async fn run(
                     }
                     Command::SetBase(pick) => {
                         state.changes.push_back(Change::Base(pick));
+                        let mut next = state.snapshot.clone();
+                        next.refreshing = true;
+                        publish(&mut state, next, &snapshots);
+                        state.request_status(&cwd, false, &results_tx, &refreshes);
+                    }
+                    Command::MarkReviewed(commit) => {
+                        state.changes.push_back(Change::Mark(commit));
                         let mut next = state.snapshot.clone();
                         next.refreshing = true;
                         publish(&mut state, next, &snapshots);
@@ -820,8 +900,13 @@ async fn run(
                         let before = comparison_of(&state.snapshot);
                         let mut succeeded = false;
                         let mut change_error = None;
+                        let mut mark_answer = None;
+                        let mut mark_answered = false;
                         match response {
                             Err(e) => {
+                                if matches!(change, Some(Change::Mark(_))) {
+                                    mark_answer = Some(e.clone());
+                                }
                                 change_error = Some(e.clone());
                                 next.status_error = Some(e);
                             }
@@ -843,24 +928,30 @@ async fn run(
                                     None if matches!(change, Some(Change::Base(_))) => {
                                         change_error = Some("not a git repository".into());
                                     }
+                                    None if matches!(change, Some(Change::Mark(_))) => {
+                                        mark_answer = Some("not a git repository".into());
+                                    }
                                     Some(Err(e)) => match &change {
                                         // Failed picks and switches report notices; refresh errors keep the rows.
                                         Some(Change::Base(_)) => change_error = Some(e),
+                                        Some(Change::Mark(_)) => mark_answer = Some(e),
                                         Some(Change::Scope(_)) => next.base_error = Some(e),
                                         None => next.status_error = Some(e),
                                     },
                                     other => {
                                         next.status_error = None;
                                         let loaded = match other {
-                                            Some(Ok(loaded)) => loaded,
+                                            Some(Ok(loaded)) => *loaded,
                                             _ => Loaded {
                                                 scope: Scope::Worktree,
                                                 base: None,
                                                 default_base: None,
+                                                mark: None,
                                                 base_error: None,
                                                 files: response.files,
                                                 rename_sources: BTreeMap::new(),
                                                 persisted: None,
+                                                marked: None,
                                             },
                                         };
                                         let switched = loaded.scope != next.scope;
@@ -868,6 +959,7 @@ async fn run(
                                         let old_index = previous.as_ref().and_then(|key| next.files.iter().position(|f| &key_of(f) == key));
                                         next.scope = loaded.scope;
                                         next.base = loaded.base;
+                                        next.mark = loaded.mark;
                                         next.base_error = loaded.base_error;
                                         // `Keep` echoes the previous default; a resolution publishes its own, `None` included.
                                         next.default_base = loaded.default_base;
@@ -893,10 +985,34 @@ async fn run(
                                                 None => {}
                                             }
                                         }
+                                        if let Some((mark, written)) = loaded.marked {
+                                            mark_answered = true;
+                                            state.mark_seq += 1;
+                                            next.mark_seq = state.mark_seq;
+                                            next.mark = Some(mark.clone());
+                                            match written {
+                                                Ok(()) => {
+                                                    state.session_mark = None;
+                                                    next.mark_error = None;
+                                                }
+                                                Err(e) => {
+                                                    state.session_mark = Some(MarkRecord {
+                                                        commit: mark.commit,
+                                                        at: mark.at,
+                                                    });
+                                                    next.mark_error = Some(format!("mark not remembered: {e}"));
+                                                }
+                                            }
+                                        }
                                         succeeded = true;
                                     }
                                 }
                             }
+                        }
+                        if matches!(change, Some(Change::Mark(_))) && !mark_answered {
+                            state.mark_seq += 1;
+                            next.mark_seq = state.mark_seq;
+                            next.mark_error = mark_answer.or_else(|| Some("no answer".into()));
                         }
                         if head_sampled {
                             next.head_seen = head_seen;
@@ -2049,7 +2165,23 @@ mod tests {
     #[test]
     fn queued_base_picks_each_receive_an_answer_in_order() {
         let dir = branch_fixture();
-        let (_rt, h) = start_with(dir.path(), Scope::Worktree, None, None);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = spawn(
+            rt.handle(),
+            SessionConfig {
+                // Only the queued commands should contribute to the busy flag.
+                poll_interval: Duration::from_secs(60),
+                watcher: Arc::new(FlakyWatcher {
+                    allow: Arc::new(AtomicBool::new(true)),
+                }),
+                git_check: ok_git(),
+                ..SessionConfig::production(dir.path().to_path_buf())
+            },
+        );
         wait_for(&h, "first", |s| ready(s).is_some());
         let picks = ["missing-one", "missing-two", "missing-three"];
         for pick in picks {
@@ -2478,5 +2610,269 @@ mod tests {
         // A loading diff cannot vouch for an id.
         snap.diff = DiffState::Loading;
         assert_eq!(markable(&snap, Some(previous.clone()), false, None), None);
+    }
+
+    #[test]
+    fn marking_writes_the_record_and_answers_on_its_own_channel() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        let head = s.head.clone().expect("a markable id");
+
+        h.commands
+            .send(Command::MarkReviewed(head.clone()))
+            .unwrap();
+        let s = wait_for(&h, "answered", |s| s.mark_seq == 1);
+        assert!(s.mark_error.is_none());
+        assert_eq!(s.pick_seq, 0, "a mark is not a pick");
+        let mark = s.mark.clone().expect("the mark is published");
+        assert_eq!(mark.commit, head);
+        assert!(mark.at > 1_600_000_000, "a real timestamp");
+        assert_eq!(mark.state, crate::engine::MarkState::Current);
+        assert_eq!(
+            s.base.as_ref().map(|b| b.requested.as_str()),
+            Some("refs/heads/main"),
+            "the base is untouched"
+        );
+
+        let toplevel = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let (marks, _) = crate::engine::base::load_marks(state.path());
+        assert_eq!(
+            marks.get(&toplevel).map(|m| m.commit.clone()),
+            Some(head.clone())
+        );
+        assert!(
+            !state.path().join("bases.json").exists(),
+            "no base was written"
+        );
+
+        // A second mark replaces the record.
+        std::fs::write(dir.path().join("more.txt"), "more\n").unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-q", "-m", "more"]);
+        let s = wait_for(&h, "the new head is markable", |s| {
+            s.head.as_deref().is_some_and(|h| h != head)
+        });
+        let head2 = s.head.clone().unwrap();
+        h.commands
+            .send(Command::MarkReviewed(head2.clone()))
+            .unwrap();
+        let s = wait_for(&h, "second answer", |s| s.mark_seq == 2);
+        assert_eq!(
+            s.mark.as_ref().map(|m| m.commit.clone()),
+            Some(head2.clone())
+        );
+        let (marks, _) = crate::engine::base::load_marks(state.path());
+        assert_eq!(marks.get(&toplevel).map(|m| m.commit.clone()), Some(head2));
+    }
+
+    #[test]
+    fn a_mark_that_cannot_be_validated_or_written_says_so() {
+        let dir = branch_fixture();
+        let (_rt, h) = start_with(dir.path(), Scope::Branch, None, None);
+        wait_for(&h, "first", |s| ready(s).is_some());
+
+        // An id that is not a commit: answered, nothing written, previous mark untouched.
+        h.commands
+            .send(Command::MarkReviewed("b".repeat(40)))
+            .unwrap();
+        let s = wait_for(&h, "rejected", |s| s.mark_seq == 1);
+        assert_eq!(s.mark_error.as_deref(), Some("not a commit: bbbbbbb"));
+        assert!(s.mark.is_none());
+
+        // With no state directory the mark holds for the session and says so.
+        let head = s.head.clone().expect("a markable id");
+        h.commands
+            .send(Command::MarkReviewed(head.clone()))
+            .unwrap();
+        let s = wait_for(&h, "session mark", |s| s.mark_seq == 2);
+        assert_eq!(
+            s.mark.as_ref().map(|m| m.commit.clone()),
+            Some(head.clone())
+        );
+        assert!(
+            s.mark_error
+                .as_deref()
+                .unwrap()
+                .starts_with("mark not remembered: "),
+            "{:?}",
+            s.mark_error
+        );
+        assert_eq!(s.pick_seq, 0, "a mark never answers on the pick channel");
+        // It survives an ordinary refresh, like the session pick of 7.3.
+        let revision = s.revision;
+        h.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&h, "after refresh", |s| {
+            s.revision > revision && !s.refreshing
+        });
+        assert_eq!(
+            s.mark.as_ref().map(|m| m.commit.clone()),
+            Some(head.clone())
+        );
+
+        // Rejections preserve a previous mark and cannot panic on Unicode input.
+        for (index, invalid) in ["--output=x", "猫猫猫猫"].into_iter().enumerate() {
+            h.commands
+                .send(Command::MarkReviewed(invalid.into()))
+                .unwrap();
+            let s = wait_for(&h, "rejected replacement", |s| {
+                s.mark_seq == index as u64 + 3
+            });
+            assert_eq!(s.mark.as_ref().map(|m| &m.commit), Some(&head));
+            assert_eq!(s.pick_seq, 0);
+            assert_eq!(
+                s.mark_error,
+                Some(format!(
+                    "not a commit: {}",
+                    invalid.chars().take(7).collect::<String>()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn marks_are_reloaded_on_resolution_and_failed_writes_keep_the_session_mark() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let previous = MarkRecord {
+            commit: git_out(dir.path(), &["rev-parse", "HEAD~1"]).trim().into(),
+            at: 1,
+        };
+        let current = MarkRecord {
+            commit: git_out(dir.path(), &["rev-parse", "HEAD"]).trim().into(),
+            at: 2,
+        };
+        base::save_mark(state.path(), &top, &previous).unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Worktree,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "stored mark", |s| ready(s).is_some());
+        assert_eq!(s.mark.as_ref().map(|m| &m.commit), Some(&previous.commit));
+        assert_eq!(s.mark.as_ref().unwrap().classified_at, None);
+
+        base::save_mark(state.path(), &top, &current).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "polled edit\n").unwrap();
+        let s = wait_for(&h, "polled edit", |s| {
+            ready(s).is_some_and(|d| d.raw_diff.contains("polled edit"))
+        });
+        assert_eq!(s.mark.as_ref().map(|m| &m.commit), Some(&previous.commit));
+        h.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&h, "another viewer's mark", |s| {
+            s.mark.as_ref().is_some_and(|m| m.at == 2)
+        });
+        assert_eq!(s.mark.as_ref().map(|m| &m.commit), Some(&current.commit));
+        assert_eq!(s.mark_seq, 0);
+
+        base::save_mark(state.path(), &top, &previous).unwrap();
+        let lock = state.path().join("split-panes.lock");
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        h.commands
+            .send(Command::MarkReviewed(current.commit.clone()))
+            .unwrap();
+        let s = wait_for(&h, "failed save", |s| s.mark_seq == 1);
+        assert!(s
+            .mark_error
+            .as_deref()
+            .unwrap()
+            .starts_with("mark not remembered: "));
+        assert!(s.base_error.is_none());
+        assert_eq!(s.scope, Scope::Worktree);
+        assert_eq!(base::load_marks(state.path()).0.get(&top), Some(&previous));
+        let revision = s.revision;
+        h.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&h, "session override", |s| {
+            s.revision > revision && !s.refreshing
+        });
+        assert_eq!(s.mark.as_ref().map(|m| &m.commit), Some(&current.commit));
+
+        std::fs::remove_dir(&lock).unwrap();
+        h.commands
+            .send(Command::MarkReviewed(current.commit.clone()))
+            .unwrap();
+        let s = wait_for(&h, "save recovered", |s| s.mark_seq == 2);
+        assert!(s.mark_error.is_none());
+        base::save_mark(state.path(), &top, &previous).unwrap();
+        h.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&h, "override cleared", |s| {
+            s.mark.as_ref().is_some_and(|m| m.at == 1)
+        });
+        assert_eq!(s.mark.as_ref().map(|m| &m.commit), Some(&previous.commit));
+        assert_eq!((s.mark_seq, s.pick_seq), (2, 0));
+
+        std::fs::write(
+            state.path().join("marks.json"),
+            r#"{"/r/bad":{"commit":"--output=x","at":1}}"#,
+        )
+        .unwrap();
+        h.commands.send(Command::Refresh).unwrap();
+        wait_for(&h, "bad record absent", |s| s.mark.is_none());
+        assert!(
+            std::fs::read_to_string(state.path().join("config-problems.log"))
+                .unwrap()
+                .contains("marks.json: 1 unusable record(s)")
+        );
+    }
+
+    #[test]
+    fn queued_marks_answer_once_even_without_a_repository_or_a_successful_status() {
+        for broken_status in [false, true] {
+            let dir = if broken_status {
+                branch_fixture()
+            } else {
+                tempfile::tempdir().unwrap()
+            };
+            let (_rt, h) = start_with(dir.path(), Scope::Worktree, None, None);
+            wait_for(&h, "first", |s| {
+                if broken_status {
+                    ready(s).is_some()
+                } else {
+                    s.revision > 0
+                }
+            });
+            if broken_status {
+                std::fs::write(dir.path().join(".git/index"), "broken index").unwrap();
+            }
+            for _ in 0..2 {
+                h.commands
+                    .send(Command::MarkReviewed("b".repeat(40)))
+                    .unwrap();
+            }
+            for seq in 1..=2 {
+                let s = wait_for(&h, "mark error", |s| s.mark_seq == seq);
+                assert!(s.mark.is_none());
+                assert_eq!(s.pick_seq, 0);
+                if broken_status {
+                    assert_eq!(s.mark_error, s.status_error);
+                    assert!(s
+                        .mark_error
+                        .as_deref()
+                        .unwrap()
+                        .starts_with("git status failed:"));
+                } else {
+                    assert_eq!(s.mark_error.as_deref(), Some("not a git repository"));
+                }
+            }
+        }
     }
 }
