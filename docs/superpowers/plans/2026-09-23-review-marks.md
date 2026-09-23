@@ -2234,6 +2234,13 @@ without new engine state, and it is where the regression test presses. The three
 form a queue: each acknowledging key shows the next thing that was waiting, and each speaks
 exactly once.
 
+The seventh round added the one exception the rule needs. A mark answer *is* shown over an unread
+warning -- it answers the key the user just pressed, and delaying it was the one thing rounds four
+and five ruled out -- so displacing one forgets that the warning was shown (`seen_rewrite = None`)
+and it queues again behind the answer. If the answer resolved what it warned about, the branch
+below finds nothing to say and nothing comes back. `Notice` therefore has exactly one rule with
+exactly one exception, and the tests in `state.rs` pin both.
+
 `src/tui/view.rs`'s `notice` puts an urgent one first:
 
 ```rust

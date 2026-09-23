@@ -179,6 +179,13 @@ impl ViewState {
         if snapshot.mark_seq != self.seen_mark_seq {
             self.seen_mark_seq = snapshot.mark_seq;
             answered_mark = true;
+            // The answer to the key the user just pressed is shown at once, even over an
+            // unread warning -- but displacing one forgets that it was shown, so it speaks
+            // again once this answer is read. If the answer resolved what it warned about,
+            // the branch below simply finds nothing to say.
+            if self.notice.as_ref().is_some_and(|n| n.urgent) {
+                self.seen_rewrite = None;
+            }
             match (&snapshot.mark_error, &snapshot.mark) {
                 (Some(error), _) => self.warn(crate::tui::sanitize::sanitize(error)),
                 (None, Some(mark)) => {
@@ -671,6 +678,62 @@ pub(crate) mod tests {
             st.notice.as_ref().map(|n| n.text.as_str()),
             Some("remembered pick: not a commit: gone")
         );
+    }
+
+    #[test]
+    fn a_mark_answer_over_an_unread_warning_lets_it_speak_again() {
+        use crate::engine::{Mark, MarkState};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        snap.head_seen = Some("h1".repeat(20));
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Rewritten,
+            classified_at: snap.head_seen.clone(),
+        });
+        st.observe(&snap);
+        assert!(st
+            .notice
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("no longer on this branch"));
+
+        // A mark requested before the warning appeared now answers, and fails: the answer is
+        // shown, but the dots it does not explain are still on screen.
+        snap.mark_seq = 1;
+        snap.mark_error = Some("not a commit: bbbbbbb".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("not a commit: bbbbbbb"),
+            "the answer to the key just pressed is not delayed"
+        );
+
+        // Reading it brings the warning back, because the classification still stands.
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st
+            .notice
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("no longer on this branch"));
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none(), "and then it rests again");
+
+        // An answer that resolves the classification leaves nothing behind it.
+        st.observe(&snap);
+        snap.mark_seq = 2;
+        snap.mark_error = None;
+        snap.mark.as_mut().unwrap().state = MarkState::Current;
+        st.observe(&snap);
+        assert!(st.notice.as_ref().unwrap().text.contains("as reviewed"));
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none(), "nothing was queued behind it");
     }
 
     #[test]
