@@ -69,6 +69,10 @@ Implements spec 8.2, the three paragraphs "Which commit is marked", "The markabl
 /// not a repository), `Err` when git could not be run.
 pub(crate) async fn read_head(toplevel: &str) -> Result<Option<String>, String>;
 
+// src/engine/session.rs
+// EngineHandle gains, beside `refreshes` and `diffs_discarded`:
+pub head_samples: Arc<AtomicUsize>,   // opening samples taken by diff tasks
+
 // src/engine/types.rs
 // LoadedDiff gains: pub read_at: Option<String>
 // build(key, comparison, read_at, response) / build_with_cap(key, comparison, read_at, response, cap)
@@ -141,8 +145,16 @@ Append to the `tests` module of `src/engine/session.rs`. `branch_fixture`, `star
         // samples disagree, so the result carries no id and the snapshot is unmarkable.
         h.commands.send(Command::Refresh).unwrap();
         wait_for(&h, "diff blocked", |s| !matches!(s.diff, DiffState::Ready(_)) || s.refreshing);
+        // Wait until the blocked diff has taken its opening sample, then move HEAD: the
+        // closing sample must then disagree with it.
+        let samples = h.head_samples.load(Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.head_samples.load(Ordering::SeqCst) == samples {
+            assert!(Instant::now() < deadline, "no diff task reached its first sample");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         std::fs::write(dir.path().join("late.txt"), "late\n").unwrap();
-        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["add", "late.txt"]);
         git(dir.path(), &["commit", "-q", "-m", "late"]);
         gate.add_permits(4);
         let seen = wait_for(&h, "a diff with no id", |s| {
@@ -236,13 +248,14 @@ async fn run_job(job: Job) -> Done {
     } else {
         None
     };
-    let seen = match &sampled {
+    // `seen` is taken by a local in `load_rows` (the row dedup of 7.2); this one is the head.
+    let sampled_head = match &sampled {
         Ok(id) => id.clone(),
         Err(_) => None,
     };
     let loaded = match &response {
         Ok(status) if !status.repo_root.is_empty() => {
-            Some(load_rows(&job, status, head.as_ref(), seen.as_deref()).await)
+            Some(load_rows(&job, status, head.as_ref(), sampled_head.as_deref()).await)
         }
         _ => None,
     };
@@ -267,7 +280,8 @@ async fn run_job(job: Job) -> Done {
 }
 ```
 
-`Done::Status` gains the three fields (`head_seen: Option<String>`, `head_sampled: bool`, `confirmed: Option<String>`). `load_rows` takes `seen: Option<&str>` and uses it instead of the symbol `HEAD` in the merge-base call:
+`Done::Status` gains the three fields (`head_seen: Option<String>`, `head_sampled: bool`, `confirmed: Option<String>`). `load_rows` takes `head_id: Option<&str>` — not `seen`, which `load_rows` already uses for the
+row dedup of 7.2 — and uses it instead of the symbol `HEAD` in the merge-base call:
 
 ```rust
     if job.scope == Scope::Branch {
@@ -275,7 +289,7 @@ async fn run_job(job: Job) -> Done {
             if matches!(job.base, BaseJob::Keep(_)) {
                 b.commit = base::verify(toplevel, &b.requested).await?;
             }
-            let head = seen.ok_or_else(|| "no commit yet".to_string())?;
+            let head = head_id.ok_or_else(|| "no commit yet".to_string())?;
             b.merge_base = Some(base::merge_base_of(toplevel, head, &b.commit).await?);
         }
     }
@@ -315,6 +329,9 @@ In `request_diff`, wrap the diff call:
             // The bracket opens before the delay and the gate, so a HEAD move during either
             // also costs the acknowledgement; only a still HEAD across the whole read counts.
             let before = base::read_head(&toplevel).await;
+            // Test hook, like `refreshes` and `diffs_discarded`: a test that wants to move
+            // HEAD *between* the samples waits for this before doing so.
+            head_samples.fetch_add(1, Ordering::SeqCst);
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
@@ -351,6 +368,8 @@ In `request_diff`, wrap the diff call:
 ```rust
                     Done::Diff { generation, key, comparison, read_at, result } => {
                         if generation != state.diff_generation || comparison != comparison_of(&state.snapshot) {
+                            // The counter an existing regression waits on; keep it.
+                            diffs_discarded.fetch_add(1, Ordering::SeqCst);
                             continue;
                         }
                         state.diff_in_flight = None;
@@ -386,13 +405,21 @@ fn head_of(snapshot: &Snapshot, confirmed: Option<String>) -> Option<String> {
 }
 ```
 
-In the `Done::Status` arm, after `next.diff` has been decided and right before
-`state.requested_scope = next.scope;`:
+In the `Done::Status` arm, `next.diff` is decided *after* `state.requested_scope = next.scope;`
+— the comparison check and the `if succeeded && !same { next.diff = ... }` block follow it — so
+`head_seen` is set where the other snapshot fields are, and the head assignment goes after that
+block, immediately before the `pick_seq` bookkeeping:
 
 ```rust
+                        // with the other fields, before `state.requested_scope = next.scope;`
                         if head_sampled {
                             next.head_seen = head_seen;
                         }
+```
+
+```rust
+                        // after `if succeeded && !same { next.diff = ... }`, so it reads the
+                        // diff state this publication actually carries
                         next.head = head_of(&next, confirmed.filter(|_| succeeded));
 ```
 
@@ -718,8 +745,9 @@ Append to `src/engine/session.rs`'s tests:
         h.commands.send(Command::MarkReviewed(head.clone())).unwrap();
         let s = wait_for(&h, "session mark", |s| s.mark_seq == 2);
         assert_eq!(s.mark.as_ref().map(|m| m.commit.clone()), Some(head.clone()));
-        assert!(s.base_error.as_deref().unwrap().starts_with("mark not remembered: "),
-            "{:?}", s.base_error);
+        assert!(s.mark_error.as_deref().unwrap().starts_with("mark not remembered: "),
+            "{:?}", s.mark_error);
+        assert_eq!(s.pick_seq, 0, "a mark never answers on the pick channel");
         // It survives an ordinary refresh, like the session pick of 7.3.
         h.commands.send(Command::Refresh).unwrap();
         let s = wait_for(&h, "after refresh", |s| s.revision > 3 && !s.refreshing);
@@ -889,6 +917,7 @@ A failed write is reported on the same channel as the mark itself, not through
 
 ```rust
                                         if let Some((mark, written)) = loaded.marked {
+                                            mark_answered = true;
                                             state.mark_seq += 1;
                                             next.mark_seq = state.mark_seq;
                                             next.mark = Some(mark.clone());
@@ -920,7 +949,9 @@ has already taken the change:
 ```rust
                                     Some(Err(e)) => match &change {
                                         Some(Change::Base(_)) => change_error = Some(e),
-                                        Some(Change::Mark(_)) => mark_answer = Some(e),
+                                        Some(Change::Mark(_)) => {
+                                            mark_answer = Some(e);
+                                        }
                                         Some(Change::Scope(_)) => next.base_error = Some(e),
                                         None => next.status_error = Some(e),
                                     },
@@ -933,14 +964,16 @@ mark, the `loaded: None` fallback setting
 the match that answers whatever is left:
 
 ```rust
-                        if matches!(change, Some(Change::Mark(_))) && next.mark_seq == state.mark_seq {
+                        if matches!(change, Some(Change::Mark(_))) && !mark_answered {
                             state.mark_seq += 1;
                             next.mark_seq = state.mark_seq;
                             next.mark_error = mark_answer.or_else(|| Some("no answer".to_string()));
                         }
 ```
 
-so exactly one `mark_seq` advance follows every `MarkReviewed` the queue consumed.
+with `let mut mark_answered = false;` beside `mark_answer`, set to `true` by the success block
+above — comparing the two counters cannot work, because the success block has already made them
+equal. Exactly one `mark_seq` advance then follows every `MarkReviewed` the queue consumed.
 
 - [ ] **Step 9: Load the record on every resolution**
 
@@ -1002,6 +1035,7 @@ pub(crate) async fn classify(
     record: &base::MarkRecord,
     head: &str,
     previous: Option<&Mark>,
+    previous_unread: Option<&BTreeSet<String>>,   // `None` unless the previous snapshot was branch scope
 ) -> (Mark, BTreeSet<String>);
 
 // src/engine/types.rs
@@ -1117,19 +1151,36 @@ mod tests {
         let head = head_of(dir.path(), "HEAD");
         let second = head_of(dir.path(), "HEAD~2");
         let record = base::MarkRecord { commit: second, at: 1 };
-        let (mark, set) = rt().block_on(classify(&top, &record, &head, None, &BTreeSet::new()));
+        let (mark, set) = rt().block_on(classify(&top, &record, &head, None, None));
         assert!(set.contains("c.txt"));
         // Point the repository at a git that would fail if it were called: the cached pair
         // must be returned without running anything.
         let cached = rt().block_on(classify(
-            &"/nonexistent-toplevel".to_string(),
+            "/nonexistent-toplevel",
             &record,
             &head,
             Some(&mark),
-            &set,
+            Some(&set),
         ));
         assert_eq!(cached.0, mark);
         assert_eq!(cached.1, set);
+
+        // Without a previous branch-scope set there is no cache: a scope switch and back
+        // must recompute rather than keep worktree scope's empty set.
+        let (again, set_again) = rt().block_on(classify(&top, &record, &head, Some(&mark), None));
+        assert_eq!(again.state, MarkState::Current);
+        assert_eq!(set_again, set);
+
+        // A newer record for the same commit keeps the classification and takes its time.
+        let newer = base::MarkRecord { commit: record.commit.clone(), at: record.at + 60 };
+        let (fresh, _) = rt().block_on(classify(
+            "/nonexistent-toplevel",
+            &newer,
+            &head,
+            Some(&mark),
+            Some(&set),
+        ));
+        assert_eq!(fresh.at, newer.at);
     }
 
     #[test]
@@ -1139,7 +1190,7 @@ mod tests {
         let second = head_of(dir.path(), "HEAD~2");
         let record = base::MarkRecord { commit: second.clone(), at: 1 };
 
-        let (mark, set) = rt().block_on(classify(&top, &record, &head, None, &BTreeSet::new()));
+        let (mark, set) = rt().block_on(classify(&top, &record, &head, None, None));
         assert_eq!(mark.state, MarkState::Current);
         assert_eq!(mark.classified_at.as_deref(), Some(head.as_str()));
         assert!(set.contains("c.txt") && !set.contains("b.txt"));
@@ -1152,7 +1203,7 @@ mod tests {
         run(dir.path(), &["commit", "-q", "-m", "side"]);
         let side = head_of(dir.path(), "HEAD");
         let record = base::MarkRecord { commit: head.clone(), at: 1 };
-        let (mark, set) = rt().block_on(classify(&top, &record, &side, None, &BTreeSet::new()));
+        let (mark, set) = rt().block_on(classify(&top, &record, &side, None, None));
         assert_eq!(mark.state, MarkState::Rewritten);
         assert!(set.is_empty());
 
@@ -1165,14 +1216,14 @@ mod tests {
             state: MarkState::Current,
             classified_at: Some("old".into()),
         };
-        let (mark, set) = rt().block_on(classify(&top, &gone, &side, Some(&previous), &BTreeSet::new()));
+        let (mark, set) = rt().block_on(classify(&top, &gone, &side, Some(&previous), None));
         assert!(matches!(mark.state, MarkState::Unreadable(_)));
         assert_eq!(mark.classified_at.as_deref(), Some(side.as_str()), "a dated answer, so it warns");
         assert!(set.is_empty());
 
         // A mark equal to the head needs no command and is Current.
         let same = base::MarkRecord { commit: side.clone(), at: 1 };
-        let (mark, set) = rt().block_on(classify(&top, &same, &side, None, &BTreeSet::new()));
+        let (mark, set) = rt().block_on(classify(&top, &same, &side, None, None));
         assert_eq!(mark.state, MarkState::Current);
         assert!(set.is_empty());
     }
@@ -1243,14 +1294,20 @@ pub(crate) async fn classify(
     record: &base::MarkRecord,
     head: &str,
     previous: Option<&Mark>,
-    previous_unread: &BTreeSet<String>,
+    previous_unread: Option<&BTreeSet<String>>,
 ) -> (Mark, BTreeSet<String>) {
     // An answered pair is not asked again: both commits are fixed, so neither the state nor
     // the set can change while they do. This is what keeps a settled repository at zero git
-    // processes per poll for this section.
-    if let Some(p) = previous {
+    // processes per poll for this section. `previous_unread` is `None` unless the previous
+    // snapshot was itself in branch scope -- worktree scope publishes an empty set, and
+    // caching that would leave the dots gone after a scope switch and back.
+    if let (Some(p), Some(set)) = (previous, previous_unread) {
         if p.commit == record.commit && p.classified_at.as_deref() == Some(head) {
-            return (p.clone(), previous_unread.clone());
+            // The timestamp comes from the record just read: another viewer may have marked
+            // the same commit again, and the age shown must follow it.
+            let mut mark = p.clone();
+            mark.at = record.at;
+            return (mark, set.clone());
         }
     }
     let mut mark = Mark {
@@ -1321,10 +1378,16 @@ Expected: PASS (four tests).
 (`Arc::new(BTreeSet::new())` in `empty`, and in `fingerprint`). `Loaded` gains `unread: BTreeSet<String>`, and `load_rows` fills both it and the mark:
 
 ```rust
-    let (mark, unread) = match (&mark_record, seen) {
+    let (mark, unread) = match (&mark_record, head_id) {
         (Some(record), Some(head)) if scope == Scope::Branch => {
-            let previous = job.previous_mark.as_ref();
-            let (mark, set) = marks::classify(toplevel, record, head, previous).await;
+            let (mark, set) = marks::classify(
+                toplevel,
+                record,
+                head,
+                job.previous_mark.as_ref(),
+                job.previous_unread.as_ref(),
+            )
+            .await;
             (Some(mark), set)
         }
         (Some(record), _) => (
@@ -1349,9 +1412,18 @@ Expected: PASS (four tests).
     };
 ```
 
-with `Job` gaining `previous_mark: Option<Mark>` and `previous_unread: BTreeSet<String>`,
-filled from `self.snapshot.mark.clone()` and `(*self.snapshot.unread).clone()` in
-`request_status`.
+with `Job` gaining `previous_mark: Option<Mark>` and
+`previous_unread: Option<BTreeSet<String>>`, filled in `request_status` from
+`self.snapshot.mark.clone()` and from the previous set *only when that snapshot was itself in
+branch scope*:
+
+```rust
+            previous_mark: self.snapshot.mark.clone(),
+            previous_unread: (self.snapshot.scope == Scope::Branch)
+                .then(|| (*self.snapshot.unread).clone()),
+```
+
+so a switch to worktree scope and back recomputes instead of caching an empty set.
 
 A mark this refresh has just written is classified the same way, not assumed current: `M`
 submits `drawn_head`, which can be older than the `head_seen` this refresh observed, so an
@@ -1359,9 +1431,9 @@ amend between the frame and the press leaves a fresh mark that is already off th
 Replace Task 2's construction in the `marked` block with
 
 ```rust
-            let (mark, set) = match seen {
+            let (mark, set) = match head_id {
                 Some(head) if scope == Scope::Branch => {
-                    marks::classify(toplevel, &record, head, None, &BTreeSet::new()).await
+                    marks::classify(toplevel, &record, head, None, None).await
                 }
                 _ => (
                     Mark {
@@ -1433,6 +1505,27 @@ A fresh mark never leaves the previous mark's set behind it.
         h.commands.send(Command::MarkReviewed(head)).unwrap();
         let s = wait_for(&h, "marked again", |s| s.mark_seq == 2);
         assert!(s.unread.is_empty(), "M clears every dot even with a dirty worktree");
+    }
+
+    #[test]
+    fn a_scope_switch_and_back_keeps_the_dots() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(dir.path(), Scope::Branch, Some(state.path().to_path_buf()), None);
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        h.commands.send(Command::MarkReviewed(s.head.clone().unwrap())).unwrap();
+        wait_for(&h, "marked", |s| s.mark_seq == 1);
+        std::fs::write(dir.path().join("fresh.txt"), "fresh\n").unwrap();
+        git(dir.path(), &["add", "fresh.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "fresh"]);
+        wait_for(&h, "a dot", |s| s.unread.contains("fresh.txt"));
+
+        h.commands.send(Command::SetScope(Scope::Worktree)).unwrap();
+        let s = wait_for(&h, "worktree", |s| s.scope == Scope::Worktree);
+        assert!(s.unread.is_empty(), "worktree scope publishes no set");
+        h.commands.send(Command::SetScope(Scope::Branch)).unwrap();
+        let s = wait_for(&h, "branch again", |s| s.scope == Scope::Branch);
+        assert!(s.unread.contains("fresh.txt"), "the dots come back: {:?}", s.unread);
     }
 
     #[test]
