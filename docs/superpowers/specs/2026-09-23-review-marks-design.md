@@ -529,7 +529,7 @@ rows, the diffs and the base untouched, because a mark is not a base:
 | the mark has been picked as the base and its object is pruned | not a mark failure but a base failure: 7.3's verification fails and 7.8 keeps the last rows with a status error; `r` or the reset row recovers, `M` does not |
 
 | the head `rev-parse` cannot be run (spawn failure, timeout) | `head` and `head_seen` keep their previous values; `M` marks the older id, the safe direction of 8.2 |
-| the head `rev-parse` runs and finds no commit (unborn branch, not a repository) | both ids become `None` in the next publication, taking any pending candidate with them, and `drawn_head` clears; `M` then refuses instead of marking a commit of the branch that was left |
+| the head `rev-parse` runs and finds no commit (unborn branch, not a repository) | `head_seen` becomes `None`, the snapshot carries `head = None`, and the frame that draws it clears `drawn_head`; `M` then refuses instead of marking a commit of the branch that was left |
 | the selected row's diff fails, or `HEAD` moves while it runs | that snapshot carries `head = None`, the frame that draws it clears `drawn_head`, and `M` refuses until a diff is drawn again |
 | `@{upstream}`, `HEAD~1` or `HEAD~3` do not resolve | that quick row is not offered; the others are |
 
@@ -586,11 +586,10 @@ Test layers, added to 5.2 and 7.9:
    --hard` to the parent -- reports nothing and leaves that snapshot
    unmarkable, whatever any other refresh has seen; a diff requested before a
    commit and completed after it reports where it read, so no generation
-   bookkeeping is needed; a diff issued before the rows were published never
-   promotes a candidate, even when it completes afterwards; the refresh's row
-   commands carry the sampled id, so the rows a frame shows are the rows of
+   bookkeeping is needed; the refresh's row commands carry the sampled id, so the rows a frame shows are the rows of
    the id it publishes even when `HEAD` leaves and returns during the job; a
-   refresh during which `HEAD` moves offers no id and the next one settles it;
+   refresh during which `HEAD` moves makes its empty list unmarkable and the
+   next one settles it;
    with a watcher that never emits, an ordinary commit still advances `head`
    within one poll (the case a `with_head`-only rule would miss); switching to
    an unborn branch publishes `None`, while a failed spawn keeps the previous
@@ -656,4 +655,4 @@ Success criteria, in addition to 1.5 and 7.9:
 12. `docs/acceptance-p1.md` gains row 8 with the same evidence columns; the
     release guard is unchanged.
 
-<!-- codex-reviewed: 2026-09-23T15:29:21Z -->
+<!-- codex-reviewed: 2026-09-23T15:29:35Z -->
