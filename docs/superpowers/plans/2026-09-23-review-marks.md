@@ -467,11 +467,21 @@ with `let mut drew_body = false;` declared before the closure, and immediately a
 `terminal.draw(...)?;` call:
 
 ```rust
-            state.drawn_head = if drew_body {
-                snapshot.head.clone()
-            } else {
-                state.drawn_head.take().filter(|_| snapshot.head.is_some())
-            };
+            state.record_drawn(&snapshot, drew_body);
+```
+
+with the rule itself on `ViewState`, where it can be tested without a terminal:
+
+```rust
+    /// After a frame: a body frame vouches for its snapshot's id, a modal or unloaded one
+    /// leaves the last one alone, and a snapshot with no id clears it.
+    pub fn record_drawn(&mut self, snapshot: &Snapshot, drew_body: bool) {
+        self.drawn_head = if drew_body {
+            snapshot.head.clone()
+        } else {
+            self.drawn_head.take().filter(|_| snapshot.head.is_some())
+        };
+    }
 ```
 
 `DiffState` is already imported in `shell.rs` through `crate::engine`; add it to the import
@@ -517,6 +527,34 @@ sh scripts/port-check-selftest.sh "$VIMEFLOW"
 ```
 
 Expected: all pass, the three new engine tests and the state test included. Run `cargo test --locked --lib engine::session -- --test-threads=1` three times and report any flake rather than widening a wait.
+
+Add its own test in `src/tui/state.rs`:
+
+```rust
+    #[test]
+    fn a_frame_records_the_id_only_when_it_drew_the_body() {
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        snap.head = Some("a".repeat(40));
+        st.record_drawn(&snap, true);
+        assert_eq!(st.drawn_head.as_deref(), Some("a".repeat(40).as_str()));
+
+        // A modal frame leaves the last id alone, even as the snapshot's own moves on.
+        snap.head = Some("b".repeat(40));
+        st.record_drawn(&snap, false);
+        assert_eq!(st.drawn_head.as_deref(), Some("a".repeat(40).as_str()));
+
+        // A snapshot with no id clears it, drawn or not.
+        snap.head = None;
+        st.record_drawn(&snap, false);
+        assert_eq!(st.drawn_head, None);
+        snap.head = Some("c".repeat(40));
+        st.record_drawn(&snap, true);
+        snap.head = None;
+        st.record_drawn(&snap, true);
+        assert_eq!(st.drawn_head, None);
+    }
+```
 
 - [ ] **Step 9: Commit (orchestrator)**
 
@@ -2109,6 +2147,10 @@ Append to `src/engine/base.rs`'s tests:
             run(dir.path(), &["add", "-A"]);
             run(dir.path(), &["commit", "-q", "-m", &format!("c{n}")]);
         }
+        // `--set-upstream-to` needs origin to be a configured remote with a fetch mapping;
+        // creating the remote-tracking ref alone is not enough.
+        run(dir.path(), &["remote", "add", "origin", "."]);
+        run(dir.path(), &["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
         run(dir.path(), &["update-ref", "refs/remotes/origin/main", "HEAD~1"]);
         run(dir.path(), &["branch", "--set-upstream-to=origin/main", "main"]);
 
@@ -2212,7 +2254,7 @@ pub struct QuickBase {
             QuickBase { label: "last commit".into(), detail: "9ffc8fd".into(), submits: "HEAD~1".into() },
         ]));
         s.mark = Some(Mark { commit: "a".repeat(40), at: now() - 7_200, state: MarkState::Current, classified_at: None });
-        let p = Picker::open(0);
+        let p = Picker::open(1); // the token `snap` publishes as refs_seq
         let shown = labels(&p.rows(&s));
         assert_eq!(&shown[0], "default (main)");
         assert_eq!(&shown[1], "reviewed (aaaaaaa · 2 h ago)");
@@ -2239,7 +2281,7 @@ pub struct QuickBase {
             label: "upstream".into(), detail: "origin/main".into(), submits: "refs/remotes/origin/main".into(),
         }]));
         s.mark = Some(Mark { commit: "a".repeat(40), at: now(), state: MarkState::Current, classified_at: None });
-        let mut p = Picker::open(0);
+        let mut p = Picker::open(1);
         p.input = "orig".into();
         assert!(labels(&p.rows(&s)).iter().any(|l| l.starts_with("upstream")));
         p.input = "rev".into();
@@ -2258,7 +2300,7 @@ pub struct QuickBase {
         s.quick = Some(std::sync::Arc::new(vec![QuickBase {
             label: "upstream".into(), detail: "origin/main".into(), submits: "refs/remotes/origin/main".into(),
         }]));
-        let mut p = Picker::open(0);
+        let mut p = Picker::open(1);
         p.observe(&s); // consume this opening's refs_seq, so the move below is not undone
         p.move_by(1, p.rows(&s).len(), 10); // onto `upstream`
         let before = p.rows(&s)[p.cursor].submit();
@@ -2329,10 +2371,15 @@ whose `submit()` returns `Some(submits.clone())`. `rows()` inserts them after th
 
 with the token guard beside `refs`:
 
+The guard is the one `refs()` already uses — `snapshot.refs_seq == self.token`, the token this
+opening sent with its `LoadRefs` — not a comparison against an earlier value, and `observe`
+keeps its existing `snapshot.refs_seq == self.token && self.seen_refs_seq != self.token`
+condition so a reply belonging to another opening never repositions the cursor:
+
 ```rust
     /// This opening's quick rows; empty until its own `LoadRefs` is answered.
     pub fn quick<'a>(&self, snapshot: &'a Snapshot) -> &'a [QuickBase] {
-        if snapshot.refs_seq > self.refs_after {
+        if snapshot.refs_seq == self.token {
             snapshot.quick.as_deref().map(Vec::as_slice).unwrap_or(&[])
         } else {
             &[]
@@ -2342,10 +2389,13 @@ with the token guard beside `refs`:
 
 Two rules of 0.0.2's `rows()` and `follow_input` extend to the new rows, each one line:
 
-- the typed row is suppressed when the input is exactly a quick row's label as well as
-  exactly a listed ref label, so `listed` becomes
-  `refs.iter().any(|r| ref_label(r) == self.input) || self.input == "reviewed"
-  || self.quick(snapshot).iter().any(|q| q.label == self.input)`;
+- the typed row is suppressed when the input is exactly the label of a row that is actually
+  offered, so `listed` becomes
+  `refs.iter().any(|r| ref_label(r) == self.input)
+  || (self.input == "reviewed" && snapshot.mark.is_some())
+  || self.quick(snapshot).iter().any(|q| q.label == self.input)` — without the
+  `mark.is_some()` term, typing `reviewed` in a repository with no mark would suppress the
+  typed row while adding no row to pick, leaving the reset row under the cursor;
 - `follow_input` puts the cursor on the first row that submits a revision *in display
   order*, which now means `matches!(r, PickerRow::Quick { .. } | PickerRow::Ref { .. })`
   before falling back to the typed row. Without it, typing `reviewed` or `last commit` and
@@ -2362,7 +2412,7 @@ Their test:
             label: "last commit".into(), detail: "9ffc8fd".into(), submits: "HEAD~1".into(),
         }]));
         s.mark = Some(Mark { commit: "a".repeat(40), at: now(), state: MarkState::Current, classified_at: None });
-        let mut p = Picker::open(0);
+        let mut p = Picker::open(1);
         p.input = "last commit".into();
         p.retarget(&s);
         assert_eq!(p.rows(&s)[p.cursor].submit().as_deref(), Some("HEAD~1"));
@@ -2373,6 +2423,15 @@ Their test:
         p.input = "reviewed".into();
         p.retarget(&s);
         assert_eq!(p.rows(&s)[p.cursor].submit().as_deref(), Some("a".repeat(40).as_str()));
+
+        // With no mark there is no reviewed row, so the typed row must still be offered.
+        s.mark = None;
+        p.retarget(&s);
+        assert!(
+            labels(&p.rows(&s)).iter().any(|l| l == "use \"reviewed\""),
+            "{:?}",
+            labels(&p.rows(&s))
+        );
     }
 ```
 
@@ -2412,7 +2471,7 @@ The panel draws a `Quick` row as `label (detail)` in its label column with no ma
                 .position(|r| r.submit() == wanted)
                 .unwrap_or_else(|| rows.len().saturating_sub(1));
         }
-        if snapshot.refs_seq != self.seen_refs_seq {
+        if snapshot.refs_seq == self.token && self.seen_refs_seq != self.token {
             self.seen_refs_seq = snapshot.refs_seq;
             self.follow_input(snapshot);
         }
@@ -2480,14 +2539,37 @@ Expected: PASS, with the allow-list unchanged at ten subcommands.
 `tests/e2e_real_herdr.rs`, after the existing `b` and `n` steps:
 
 ```rust
-        iso.herdr(&["pane", "send-text", viewer_id, "M"]);
+        // The body must be loaded before marking: the file name appears in the toolbar while
+        // the diff is still `Loading`, and a mark taken then acknowledges nothing.
         iso.herdr(&[
-            "pane", "wait-output", viewer_id, "--match", "marked", "--source", "visible",
+            "pane", "wait-output", viewer_id, "--match", "@@", "--source", "visible",
             "--timeout", "15000",
         ]);
+        iso.herdr(&["pane", "send-text", viewer_id, "M"]);
+        iso.herdr(&[
+            "pane", "wait-output", viewer_id, "--match", "as reviewed", "--source", "visible",
+            "--timeout", "15000",
+        ]);
+        // A commit after the mark must raise a marker, and the next mark must clear it.
+        std::fs::write(repo.join("later.txt"), "later\n").unwrap();
+        git(&["add", "later.txt"]);
+        git(&["commit", "-q", "-m", "later"]);
+        iso.herdr(&[
+            "pane", "wait-output", viewer_id, "--match", "●", "--source", "visible",
+            "--timeout", "15000",
+        ]);
+        iso.herdr(&["pane", "send-text", viewer_id, "M"]);
+        wait_for("the marker clears", || {
+            let screen = iso
+                .herdr(&["pane", "read", viewer_id, "--source", "visible"])
+                .to_string();
+            !screen.contains('●')
+        });
 ```
 
-The notice `marked <7 hex> as reviewed` is the observable the host can wait for; the panel marker is a single character and not worth matching through a terminal snapshot. The test stays `#[ignore]`; the orchestrator runs it against both hosts.
+Waiting for the notice alone would pass with marker clearing broken, which is what 8.7 item 9
+asks about; the sequence above sees a marker appear and go. The test stays `#[ignore]`; the
+orchestrator runs it against both hosts.
 
 - [ ] **Step 8: Documentation, in three languages**
 
