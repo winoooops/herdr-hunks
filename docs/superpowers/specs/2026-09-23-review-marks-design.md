@@ -97,14 +97,20 @@ reissues, the `diff_dirty` rule of 3.3 reissues once the running diff
 completes, so the generation the candidate waits for always arrives. A
 candidate is dropped, never published, when its id is invalidated (below).
 
-A pending candidate is never replaced by a later refresh's id; it only adopts
-the generation of the newest diff request issued. Replacing it would let a
-repository whose diffs take longer than its poll interval move the generation
-the candidate waits for ahead of every completing diff, so diffs would keep
-being drawn and `head` would never advance. Keeping the id and moving the
-generation promotes the oldest unacknowledged id at the next completed diff --
-the safe direction of the promise above -- after which the next refresh's id
-becomes the candidate in the ordinary way.
+What a later refresh does to a pending candidate depends on what that refresh
+saw. **Same id:** the candidate keeps it and adopts the generation of the
+newest diff request issued. Replacing it would let a repository whose diffs
+take longer than its poll interval move the generation the candidate waits for
+ahead of every completing diff, so diffs would keep being drawn and `head`
+would never advance; keeping the id and moving the generation promotes the
+oldest unacknowledged id at the next completed diff, the safe direction of the
+promise above. **Different id:** the candidate is dropped, not carried and not
+promoted, and that refresh's own id becomes the candidate. This is what covers
+a rewind that the two samples of one job could not see -- both samples read
+`C`, a reset to `B` lands before the diff reads the tree, and the diff then
+draws `B`'s content; the next refresh observes `B`, the candidate `C` is
+dropped, and the late diff promotes nothing. A candidate is therefore promoted
+only while every refresh since has kept observing the id it names.
 
 *What the terminal drew is what can be marked.* Publication is still not the
 terminal: the shell drains every queued snapshot and draws only the last, so a
@@ -366,11 +372,20 @@ quick rows of this section; then the ref rows, the current base first.
 | `last commit (<7 hex>)` | `HEAD~1` | `git rev-parse --verify --quiet HEAD~1^{commit}` succeeds |
 | `last 3 commits (<7 hex>)` | `HEAD~3` | the same for `HEAD~3^{commit}` |
 
-Choosing `reviewed` is the narrowing of 8.1: the base becomes the marked
-commit, so the rows are what the working tree now differs from the mark by --
-the commits made since, the uncommitted edits, and the untracked files, by
-7.2's ordinary rules -- and an empty list means the tree matches what was
-read. It is a comparison, not a filter of the dotted rows: a file the agent
+Choosing `reviewed` is the narrowing of 8.1, and it is an ordinary pick, so
+7.2's ordinary rule applies: the rows are the working tree against
+`merge-base(HEAD, mark)`. While the mark is `Current` -- an ancestor of the
+head, which is what it is for as long as nobody rewrites history -- that
+merge-base *is* the mark, so the rows are what the working tree now differs
+from the mark by: the commits made since, the uncommitted edits, and the
+untracked files, and an empty list means the tree matches what was read. That
+is the guarantee, and it is limited to `Current` marks on purpose. A
+`Rewritten` mark is still offered and still picks -- comparing against a
+commit that has left the branch is a legitimate thing to ask for -- but its
+baseline is then the common ancestor of the two histories, so the list can
+hold rows the mark's tree already contained, and an amend that changed nothing
+but the message can leave it non-empty. The rewrite warning of 8.3 is what
+tells the reviewer they are in that case; one `M` ends it. It is a comparison, not a filter of the dotted rows: a file the agent
 edited without committing has no dot but is listed, and a file reverted to its
 marked content has neither. It is an ordinary pick -- remembered in `bases.json`, shown as
 `vs reviewed` by the chip of 8.5, cleared by the reset row -- and the mark
@@ -555,8 +570,10 @@ Test layers, added to 5.2 and 7.9:
    `rename_sources`; the set is empty in worktree scope and with no mark.
 3. Engine, the published head: a failed diff does not advance it while an
    empty row list does; with diffs slower than the poll interval it still
-   advances, because a pending candidate keeps its id and only adopts the
-   newest generation; a diff issued before the rows were published never
+   advances, because a pending candidate at an unchanged id keeps that id and
+   only adopts the newest generation; a refresh that observes a different id
+   drops the candidate instead, so a reset landing between a job's last sample
+   and its diff read cannot be acknowledged by the diff that follows it; a diff issued before the rows were published never
    promotes a candidate, even when it completes afterwards; the refresh's row
    commands carry the sampled id, so the rows a frame shows are the rows of
    the id it publishes even when `HEAD` leaves and returns during the job; a
@@ -616,9 +633,10 @@ Success criteria, in addition to 1.5 and 7.9:
     none.
 11. The mark survives closing and reopening the viewer on the same worktree,
     and a second viewer on the same worktree shows the same markers at its
-    next resolution; picking `reviewed` in the picker lists what the working
-    tree differs from the mark by -- the new commits' files, plus uncommitted
-    and untracked ones -- and `default (...)` returns to the whole branch with
-    the markers intact.
+    next resolution; with a `Current` mark, picking `reviewed` in the picker
+    lists what the working tree differs from the mark by -- the new commits'
+    files, plus uncommitted and untracked ones -- while a `Rewritten` mark
+    compares against the common ancestor instead, and `default (...)` returns
+    to the whole branch with the markers intact.
 12. `docs/acceptance-p1.md` gains row 8 with the same evidence columns; the
     release guard is unchanged.
