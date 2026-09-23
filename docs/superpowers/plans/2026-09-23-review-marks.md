@@ -124,7 +124,8 @@ Append to the `tests` module of `src/engine/session.rs`. `branch_fixture`, `star
         });
         assert_eq!(s.head.as_deref(), Some(head.as_str()), "an empty list is markable");
 
-        // An unborn branch clears both ids.
+        // An unborn branch clears both ids, and it clears them from branch scope too, where
+        // the row load fails and the previous `Ready` diff is kept on screen.
         git(p, &["checkout", "-q", "--orphan", "fresh"]);
         git(p, &["rm", "-q", "--cached", "a.txt"]);
         std::fs::remove_file(p.join("a.txt")).unwrap();
@@ -136,20 +137,13 @@ Append to the `tests` module of `src/engine/session.rs`. `branch_fixture`, `star
     #[test]
     fn a_diff_that_spans_a_head_move_reports_no_id() {
         let dir = branch_fixture();
+        // No permits at all: the very first diff takes its opening sample and then blocks,
+        // which is the only moment in the test where a diff is waiting, so no later refresh
+        // can race the setup.
         let gate = Arc::new(Semaphore::new(0));
         let (_rt, h) = start_with(dir.path(), Scope::Branch, None, Some(gate.clone()));
-        gate.add_permits(1);
-        let s = wait_for(&h, "first diff", |s| ready(s).is_some());
-        assert!(s.head.is_some());
-        // Block the next diff, move HEAD while it waits, then let it run: its two
-        // samples disagree, so the result carries no id and the snapshot is unmarkable.
-        h.commands.send(Command::Refresh).unwrap();
-        wait_for(&h, "diff blocked", |s| !matches!(s.diff, DiffState::Ready(_)) || s.refreshing);
-        // Wait until the blocked diff has taken its opening sample, then move HEAD: the
-        // closing sample must then disagree with it.
-        let samples = h.head_samples.load(Ordering::SeqCst);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while h.head_samples.load(Ordering::SeqCst) == samples {
+        while h.head_samples.load(Ordering::SeqCst) == 0 {
             assert!(Instant::now() < deadline, "no diff task reached its first sample");
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -161,6 +155,12 @@ Append to the `tests` module of `src/engine/session.rs`. `branch_fixture`, `star
             matches!(&s.diff, DiffState::Ready(d) if d.read_at.is_none())
         });
         assert_eq!(seen.head, None, "a snapshot whose diff spanned a move is unmarkable");
+        // Once the tree settles, a later diff brackets cleanly and the id comes back.
+        gate.add_permits(8);
+        let settled = wait_for(&h, "a clean bracket", |s| {
+            matches!(&s.diff, DiffState::Ready(d) if d.read_at.is_some())
+        });
+        assert!(settled.head.is_some());
     }
 ```
 
@@ -420,7 +420,13 @@ block, immediately before the `pick_seq` bookkeeping:
 ```rust
                         // after `if succeeded && !same { next.diff = ... }`, so it reads the
                         // diff state this publication actually carries
-                        next.head = head_of(&next, confirmed.filter(|_| succeeded));
+                        next.head = if head_sampled && next.head_seen.is_none() {
+                            // The sample ran and found no commit: whatever diff is still on
+                            // screen belongs to the branch that was left, and `M` must refuse.
+                            None
+                        } else {
+                            head_of(&next, confirmed.filter(|_| succeeded))
+                        };
 ```
 
 A refresh that keeps a `Ready` diff therefore keeps that diff's id -- the background
@@ -507,8 +513,17 @@ list if it is not.
         st.picker = Some(crate::tui::picker::Picker::open(0));
         assert!(!body_is_drawn(&st, &snap, 120, 24), "the picker covers the diff");
         st.picker = None;
+        // `snapshot(..)` leaves `files` empty, which is itself a drawn body; give it a row
+        // before asserting that an unloaded diff is not one.
+        snap.files = vec![crate::git::ChangedFile {
+            path: "a.rs".into(),
+            status: crate::git::ChangedFileStatus::Modified,
+            staged: false,
+            insertions: Some(1),
+            deletions: Some(0),
+        }];
         snap.diff = crate::engine::DiffState::Loading;
-        assert!(!body_is_drawn(&st, &snap, 120, 24), "nothing is loaded");
+        assert!(!body_is_drawn(&st, &snap, 120, 24), "a row whose diff is not loaded");
         snap.files.clear();
         snap.diff = crate::engine::DiffState::Idle;
         assert!(body_is_drawn(&st, &snap, 120, 24), "an empty list is a drawn body");
@@ -633,6 +648,21 @@ Append to the `tests` module of `src/engine/base.rs`:
         assert!(marks.is_empty());
         assert!(problem.unwrap().starts_with("marks.json: "));
 
+        // A bad record beside a good one still reports: the file needs repairing even
+        // though this worktree's own record survives.
+        std::fs::write(
+            state.path().join("marks.json"),
+            format!(
+                r#"{{"/r/one":{{"commit":"{}","at":1}},"/r/two":{{"commit":"nope","at":2}}}}"#,
+                "a".repeat(40)
+            ),
+        )
+        .unwrap();
+        let (marks, problem) = load_marks(state.path());
+        assert_eq!(marks.len(), 1, "the valid record survives");
+        assert!(marks.contains_key("/r/one"));
+        assert!(problem.is_some(), "the dropped record is still reported");
+
         // Malformed JSON degrades the same way, and the next save rewrites it.
         std::fs::write(state.path().join("marks.json"), "{ not json").unwrap();
         assert!(load_marks(state.path()).1.is_some());
@@ -687,13 +717,15 @@ pub fn load_marks(state_dir: &Path) -> (BTreeMap<String, MarkRecord>, Option<Str
         Ok(marks) => marks,
         Err(e) => return (BTreeMap::new(), Some(format!("{MARKS_FILE}: {e}"))),
     };
+    let total = marks.len();
     let kept: BTreeMap<String, MarkRecord> = marks
         .into_iter()
         .filter(|(_, m)| is_object_id(&m.commit))
         .collect();
-    let problem = kept
-        .is_empty()
-        .then(|| format!("{MARKS_FILE}: no usable record"));
+    // A record we refuse to hand to git is worth a line even when another worktree's
+    // record survives beside it.
+    let dropped = total - kept.len();
+    let problem = (dropped > 0).then(|| format!("{MARKS_FILE}: {dropped} unusable record(s)"));
     (kept, problem)
 }
 
@@ -715,7 +747,7 @@ pub fn save_mark(state_dir: &Path, toplevel: &str, record: &MarkRecord) -> std::
 }
 ```
 
-The `problem` rule deserves its one-line comment in the code: a file that parsed but held nothing usable is worth a line in `config-problems.log`, while a file that simply has no entry for this worktree is not — `kept.is_empty()` is only reached when the file existed and parsed.
+The `problem` rule deserves its one-line comment in the code: every record the filter refuses is worth a line in `config-problems.log`, because `marks.json` holds one record per worktree and a corrupt entry beside a healthy one is still a file someone has to repair. A file that simply has no entry for *this* worktree is not a problem — the count is of records dropped, not of records missing.
 
 - [ ] **Step 4: Run the persistence tests**
 
@@ -1222,6 +1254,42 @@ mod tests {
     }
 
     #[test]
+    fn an_unanswered_ancestry_keeps_the_previous_classification_and_retries() {
+        let (dir, top) = fixture();
+        let head = head_of(dir.path(), "HEAD");
+        let second = head_of(dir.path(), "HEAD~2");
+        // Failure injection with nothing but git: a tree id is a real object that
+        // `--is-ancestor` refuses to answer for (`not a valid commit name`, exit 128) while
+        // `diff` reads it as a tree-ish quite happily. Ancestry fails, the read succeeds --
+        // the one combination 8.7(4) is about.
+        let tree = head_of(dir.path(), "HEAD~2^{tree}");
+        assert!(rt().block_on(is_ancestor(&top, &tree, &head)).is_err());
+        assert!(rt().block_on(unread(&top, &tree, &head)).unwrap().contains("c.txt"));
+
+        let record = base::MarkRecord { commit: tree.clone(), at: 1 };
+        let previous = Mark {
+            commit: tree.clone(),
+            at: 1,
+            state: MarkState::Current,
+            classified_at: Some(second.clone()),
+        };
+        let (mark, set) = rt().block_on(classify(&top, &record, &head, Some(&previous), None));
+        assert_eq!(mark.state, MarkState::Current, "the previous classification survives");
+        assert_eq!(
+            mark.classified_at.as_deref(),
+            Some(second.as_str()),
+            "the pair is left undated, so nothing warns about an answer nobody gave"
+        );
+        assert!(set.contains("c.txt"), "the rows come from the read that did answer");
+
+        // And the next refresh asks again: an undated pair is never served from the cache.
+        let (again, set_again) =
+            rt().block_on(classify(&top, &record, &head, Some(&mark), Some(&set)));
+        assert_eq!(again.classified_at.as_deref(), Some(second.as_str()));
+        assert_eq!(set_again, set);
+    }
+
+    #[test]
     fn classify_reports_current_rewritten_and_unreadable() {
         let (dir, top) = fixture();
         let head = head_of(dir.path(), "HEAD");
@@ -1400,7 +1468,7 @@ pub(crate) async fn classify(
 - [ ] **Step 4: Run the module tests**
 
 Run: `cargo test --locked --lib engine::marks`
-Expected: PASS (four tests).
+Expected: PASS (five tests).
 
 - [ ] **Step 5: Publish the set from the session**
 
@@ -1528,7 +1596,12 @@ A fresh mark never leaves the previous mark's set behind it.
         std::fs::write(dir.path().join("fresh.txt"), "fresh\n").unwrap();
         git(dir.path(), &["add", "fresh.txt"]);
         git(dir.path(), &["commit", "-q", "-m", "fresh"]);
-        let s = wait_for(&h, "the new commit is unread", |s| s.unread.contains("fresh.txt"));
+        // The dots can arrive while the previous diff is still on screen, whose id is the
+        // older commit; wait for the new commit's own diff before marking again.
+        let fresh_head = git_out(dir.path(), &["rev-parse", "HEAD"]).trim().to_string();
+        let s = wait_for(&h, "the new commit is unread and drawn", |s| {
+            s.unread.contains("fresh.txt") && s.head.as_deref() == Some(fresh_head.as_str())
+        });
         assert!(!s.unread.contains("a.txt"), "{:?}", s.unread);
         assert!(!s.unread.contains("u.txt"), "untracked rows are never in the set");
         assert_eq!(s.mark.as_ref().map(|m| m.state.clone()), Some(crate::engine::MarkState::Current));
@@ -1539,7 +1612,12 @@ A fresh mark never leaves the previous mark's set behind it.
             s.files.iter().any(|f| f.path == "a.txt")
         });
         assert!(!s.unread.contains("a.txt"), "an uncommitted edit is not a dot");
-        let head = wait_for(&h, "markable again", |s| s.head.is_some()).head.clone().unwrap();
+        let head = wait_for(&h, "markable again", |s| {
+            s.head.as_deref() == Some(fresh_head.as_str())
+        })
+        .head
+        .clone()
+        .unwrap();
         h.commands.send(Command::MarkReviewed(head)).unwrap();
         let s = wait_for(&h, "marked again", |s| s.mark_seq == 2);
         assert!(s.unread.is_empty(), "M clears every dot even with a dirty worktree");
@@ -1812,6 +1890,35 @@ impl ViewState { pub fn notify(&mut self, text: impl Into<String>); pub fn warn(
         st.observe(&snap);
         assert!(st.notice.is_some(), "a new pair warns again");
     }
+
+    #[test]
+    fn a_mark_answer_outranks_a_rewrite_warning_in_the_same_snapshot() {
+        use crate::engine::{Mark, MarkState};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        snap.head_seen = Some("h1".repeat(20));
+        // Marking a stale drawn commit while storage is unwritable: the answer and the
+        // classification arrive together.
+        snap.mark_seq = 1;
+        snap.mark_error = Some("mark not remembered: no state directory".into());
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Rewritten,
+            classified_at: snap.head_seen.clone(),
+        });
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.clone()).as_deref(),
+            Some("mark not remembered: no state directory"),
+            "the answer the user is owed is not overwritten"
+        );
+
+        // The warning is not lost: its pair was never recorded, so the next snapshot of the
+        // same state says it.
+        st.observe(&snap);
+        assert!(st.notice.as_ref().unwrap().text.contains("no longer on this branch"));
+    }
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
@@ -1869,8 +1976,10 @@ Every existing assignment becomes a call: `state.notice = Some("split view needs
                 self.picker = None;
             }
         }
+        let mut answered_mark = false;
         if snapshot.mark_seq != self.seen_mark_seq {
             self.seen_mark_seq = snapshot.mark_seq;
+            answered_mark = true;
             match (&snapshot.mark_error, &snapshot.mark) {
                 // A mark that was taken but not written reports both: the mark is in force
                 // for this session, and the reason it will not outlive it.
@@ -1890,7 +1999,10 @@ Every existing assignment becomes a call: `state.notice = Some("split view needs
                 && m.state != crate::engine::MarkState::Current)
                 .then(|| (m.commit.clone(), at, m.state.clone()))
         });
-        if rewritten != self.seen_rewrite {
+        // A mark answered in this same snapshot outranks the warning: `mark not remembered`
+        // is the more urgent of the two and its `mark_seq` is already consumed, while the
+        // warning keeps its unrecorded pair and speaks at the next snapshot.
+        if rewritten != self.seen_rewrite && !answered_mark {
             self.seen_rewrite = rewritten.clone();
             match rewritten.map(|(_, _, state)| state) {
                 Some(crate::engine::MarkState::Rewritten) => {
@@ -2556,6 +2668,13 @@ Expected: PASS, with the allow-list unchanged at ten subcommands.
         git(&["commit", "-q", "-m", "later"]);
         iso.herdr(&[
             "pane", "wait-output", viewer_id, "--match", "●", "--source", "visible",
+            "--timeout", "15000",
+        ]);
+        // The dot can appear while the previous commit's diff is still drawn, whose id is
+        // the one `M` would take; `r` and a loaded diff put the new state on screen first.
+        iso.herdr(&["pane", "send-text", viewer_id, "r"]);
+        iso.herdr(&[
+            "pane", "wait-output", viewer_id, "--match", "@@", "--source", "visible",
             "--timeout", "15000",
         ]);
         iso.herdr(&["pane", "send-text", viewer_id, "M"]);
