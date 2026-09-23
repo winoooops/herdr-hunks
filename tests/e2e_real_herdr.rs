@@ -90,6 +90,21 @@ impl Isolated {
             .unwrap_or_else(|error| panic!("host {args:?} returned invalid JSON: {error}"))
     }
 
+    /// `pane read` prints the pane's own text, not a JSON envelope.
+    fn herdr_text(&self, args: &[&str]) -> String {
+        let out = self
+            .host_command()
+            .args(args)
+            .output()
+            .expect("run isolated host");
+        assert!(
+            out.status.success(),
+            "host {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
     fn viewers(&self) -> Vec<Value> {
         self.herdr(&["pane", "list"])["result"]["panes"]
             .as_array()
@@ -311,9 +326,7 @@ fn open_split_creates_one_viewer_and_reuses_it() {
         ]);
         // Pin the files panel even in a narrow split pane.
         wait_for("the files panel is shown", || {
-            let screen = iso
-                .herdr(&["pane", "read", viewer_id, "--source", "visible"])
-                .to_string();
+            let screen = iso.herdr_text(&["pane", "read", viewer_id, "--source", "visible"]);
             if screen.contains("CHANGED ") {
                 return true;
             }
@@ -350,9 +363,7 @@ fn open_split_creates_one_viewer_and_reuses_it() {
         ]);
         iso.herdr(&["pane", "send-text", viewer_id, "M"]);
         wait_for("the marker clears", || {
-            let screen = iso
-                .herdr(&["pane", "read", viewer_id, "--source", "visible"])
-                .to_string();
+            let screen = iso.herdr_text(&["pane", "read", viewer_id, "--source", "visible"]);
             !screen.contains('●')
         });
         assert_eq!(

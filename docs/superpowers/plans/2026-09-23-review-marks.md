@@ -2828,9 +2828,8 @@ Expected: PASS, with the allow-list unchanged at ten subcommands.
         // pins it; press until the panel's own header is on screen, so a hidden panel fails
         // as "no panel" rather than as "no marker".
         wait_for("the files panel is shown", || {
-            let screen = iso
-                .herdr(&["pane", "read", viewer_id, "--source", "visible"])
-                .to_string();
+            let screen =
+                iso.herdr_text(&["pane", "read", viewer_id, "--source", "visible"]);
             if screen.contains("CHANGED ") {
                 return true;
             }
@@ -2856,11 +2855,31 @@ Expected: PASS, with the allow-list unchanged at ten subcommands.
         ]);
         iso.herdr(&["pane", "send-text", viewer_id, "M"]);
         wait_for("the marker clears", || {
-            let screen = iso
-                .herdr(&["pane", "read", viewer_id, "--source", "visible"])
-                .to_string();
+            let screen =
+                iso.herdr_text(&["pane", "read", viewer_id, "--source", "visible"]);
             !screen.contains('●')
         });
+
+`pane read` prints the pane's own text rather than a JSON envelope, so it cannot go through the
+`iso.herdr` helper, which parses stdout as JSON and panics otherwise. Give `Isolated` a second
+helper beside it:
+
+```rust
+    /// `pane read` prints the pane's own text, not a JSON envelope.
+    fn herdr_text(&self, args: &[&str]) -> String {
+        let out = self
+            .host_command()
+            .args(args)
+            .output()
+            .expect("run isolated host");
+        assert!(
+            out.status.success(),
+            "host {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+```
 ```
 
 Waiting for the notice alone would pass with marker clearing broken, which is what 8.7 item 9
