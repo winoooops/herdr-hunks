@@ -21,9 +21,12 @@ separates the rows that are new from the rows that were read an hour ago.
 
 A review mark is one commit, remembered per worktree: the commit the reviewer
 had read up to when they pressed `M`. The viewer then marks, in the files
-panel, every row that changed after it. The branch list stays whole -- the
-reviewer keeps the context of everything the branch carries -- and the dots
-say where to look. Pressing `M` again clears them.
+panel, every row that a commit has touched since -- the branch list stays
+whole, so the reviewer keeps the context of everything the branch carries, and
+the dots say where to look. Pressing `M` again clears every one of them,
+because a mark is a commit and the dots count commits: uncommitted work the
+agent is still doing does not raise a dot (8.3 says why), and is read where it
+always was, in the row's own diff.
 
 Narrowing to only the new rows stays available and stays optional: the picker
 of 7.4 offers the mark as a base (`reviewed (a1b2c3d · 12 min ago)`), and
@@ -245,69 +248,83 @@ modal is read when the modal closes.
 
 ### 8.3 Unread rows
 
-With a mark, every refresh in branch scope computes which of its rows changed
-after it. The engine publishes
+With a mark, every refresh in branch scope computes which of its rows a commit
+has touched since it. The engine publishes
 
 ```rust
 // Snapshot gains:
-pub unread: Arc<BTreeSet<String>>,   // row paths changed since the mark
+pub unread: Arc<BTreeSet<String>>,   // paths a commit changed after the mark
 ```
 
 next to `rename_sources`, from one command per refresh:
 
 ```
-git -C <toplevel> diff <mark.commit> --name-only -z --
+git -C <toplevel> diff <mark.commit> <head_seen> --name-only --no-renames -z --
 ```
 
-Names only, no content, no numstat: the set answers "did this path change",
-and the row's own diff is unchanged (it is still the working tree against the
-base's merge-base, 7.2). Rename detection is deliberately off here, unlike
-every other command of 7.2. With `-M`, git reports a detected rename by its
-destination alone, so a file that was modified before the mark and renamed
-after it would flag the new name and leave the deletion of the old one -- a
-row of its own in the base comparison -- unflagged and read as old. Without
-`-M` both endpoints appear as ordinary paths and both are flagged. Erring
-toward one flag too many is the direction this section errs in everywhere. Untracked rows are in the set whatever it says,
-because a path that is in no commit cannot have been read at one. The set is
-empty in worktree scope: every row there is an uncommitted change, which is
-new by construction, and dots that are always on say nothing. It is also empty
-with no mark.
+Two commits, no working tree. That is the whole semantics of a dot: *a commit
+made after your mark touched this file*. Uncommitted work does not raise one,
+which is what makes `M` mean something -- the comparison of a mark against the
+working tree would leave a dot on every file the agent is still editing, and
+no number of presses could clear it, because uncommitted content is in no
+commit and a mark is a commit. Those edits are not hidden: they are in the
+row's own diff, which is still the working tree against the base's merge-base
+(7.2), and in worktree scope they are the rows. The dot answers the one
+question the row list cannot: which of these files did the agent *commit*
+something to since I last looked. Untracked rows are in no commit and
+therefore never carry one, for the same reason.
+
+Rename detection is off, explicitly: `--no-renames`, because git turns it on
+by default (`diff.renames`) and a detected rename is reported by its
+destination alone, which would leave the deletion of the source -- a row of
+its own in the base comparison -- unmarked and read as old. With
+`--no-renames` both endpoints are ordinary paths and both are in the set.
+
+A row is marked when *its path or its rename source* is in the set (8.5).
+7.2's rows name a rename by its destination and keep the source in
+`rename_sources`, so the branch list can show `R new.txt` for a row whose only
+change after the mark was the deletion of `old.txt`; matching the destination
+alone would leave that row without a dot.
 
 **When the mark is not an ancestor.** The mark classifies the pair
 `(mark.commit, head_seen)` with
 `git merge-base --is-ancestor <mark.commit> <head_seen>`, computed when a mark
-is first seen and again when either half changes -- another viewer's mark read
-by a resolution at an unchanged head counts, and so does a head change while
-the gated id stands still. The command is skipped only when the marked commit *is* `head_seen`, where the
-pair is trivially true; a successful `M` does not get that exemption by being
-a mark, because it submits `drawn_head` (8.2), which can lag -- after an amend
-whose diff then failed, the stale id still resolves, so validation succeeds
-and the mark would claim to be current while the branch has moved past it. Only two exit statuses are
-answers: `0` is true, `1` is false, and anything else -- `128` for a missing
-object, a signal, a failure to spawn -- leaves the state as it was; the frozen
-runner returns `Ok(Output)` for every exit status, so the three cases are told
-apart by the code, not by `Result`.
+is first seen and again when either half changes. The command is skipped only
+when the marked commit *is* `head_seen`, where the pair is trivially true; a
+successful `M` does not get that exemption by being a mark, because it submits
+`drawn_head` (8.2), which can lag -- after an amend whose diff then failed,
+the stale id still resolves, so validation succeeds and the mark would claim
+to be current while the branch has moved past it. Only two exit statuses are
+answers: `0` is true and `1` is false. Anything else -- `128` for a missing
+object, a signal, a failure to spawn -- is not cached: the pair stays
+unclassified and the next refresh tries again, so a classification that timed
+out once cannot leave a rewritten mark labelled `Current` for as long as the
+pair happens not to change. Until an answer arrives the previous state stands
+and no warning is shown; the frozen runner returns `Ok(Output)` for every exit
+status, so the three cases are told apart by the code, not by `Result`.
 
 When the answer is false -- `commit --amend`, a rebase, a reset away from the
 marked commit -- the mark no longer divides this branch's history, so the
 unread set is not computed and **every row is flagged**, which is the truthful
 reading: nothing on this branch can be said to have been read at that commit.
-The urgent notice `the marked commit is no longer on this branch; press M
-again` appears once per classified pair -- the view remembers the
-`(mark.commit, head_seen)` it last warned about, so the warning follows every
-head the refresh observed rather than every head it published -- and the
-picker's row reads `reviewed (a1b2c3d · rewritten)`. One `M` repairs it
-completely, because the mark is not the base: the rows, the diffs and the
-picker never stopped working. A failure of the `--name-only` command itself -- the marked object pruned, a
+The state is `MarkState::Rewritten`, the urgent notice `the marked commit is
+no longer on this branch; press M again` appears once per classified pair --
+the view remembers the `(mark.commit, head_seen)` it last warned about, so the
+warning follows every head the refresh observed rather than every head it
+published -- and the picker's row reads `reviewed (a1b2c3d · rewritten)`. One
+`M` repairs it completely, because the mark is not the base: the rows, the
+diffs and the picker never stopped working.
+
+A failure of the `--name-only` command itself -- the marked object pruned, a
 timeout, an unreadable object store -- is `MarkState::Unreadable(reason)`: it
 also flags every row, and its urgent notice is `the mark cannot be read:
 <reason>`, git's own message, which is what tells a pruned object from a
-timeout. It takes precedence over the ancestry flag, whose `--is-ancestor`
-would have exited `128` on the same object and kept its previous value by the
-rule above; the picker's row then reads `reviewed (a1b2c3d · unreadable)`. The
-view distinguishes the three states by `Mark::state`, never by the size of the
-unread set, which is all-paths in the ordinary case where every row did change
-after the mark.
+timeout. It takes precedence over the ancestry answer, whose `--is-ancestor`
+would have exited `128` on the same object and left the pair unclassified; the
+picker's row then reads `reviewed (a1b2c3d · unreadable)`. The view
+distinguishes the three states by `Mark::state`, never by the size of the
+unread set, which is all-paths in the ordinary case where every row was
+touched after the mark.
 
 ### 8.4 Quick rows in the picker
 
@@ -399,7 +416,7 @@ ref. Quick rows are never disabled, and the reset row is never filtered out.
 **The marker.** In branch scope the files panel draws `●` in the two columns
 it reserves at the end of a row for the `S` of a staged row (4.4). Those
 columns are free there, because every branch row has `staged = false` (7.2),
-so nothing moves and no name loses a cell. A row is marked when its path is in
+so nothing moves and no name loses a cell. A row is marked when its path, or its entry in `rename_sources` (7.2), is in
 `Snapshot.unread`:
 
 ```
@@ -413,9 +430,9 @@ CHANGED 6
 
 The marker is drawn with the accent of 4.4 and no background, so it reads on
 any terminal theme and stays legible under the selected row's reverse video.
-With no mark, in worktree scope, or on a row that is not in the set, those
-columns stay blank -- there is no "read" glyph, because absence is the quiet
-state and the panel is 18 columns wide.
+With no mark, in worktree scope, on an untracked row, or on a row no commit
+touched after the mark, those columns stay blank -- there is no "read" glyph,
+because absence is the quiet state and the panel is 18 columns wide.
 
 **The key.** One key is added to the table of 4.3, which 7.4 last extended:
 
@@ -453,8 +470,9 @@ rows, the diffs and the base untouched, because a mark is not a base:
 | `marks.json` cannot be written | the mark holds for this session (8.2's session mark) and flags rows normally; the urgent notice `mark not remembered: <reason>` |
 | the marked commit is no longer an ancestor of `head_seen` (amend, rebase, reset) | `MarkState::Rewritten`; every row is flagged; the urgent notice `the marked commit is no longer on this branch; press M again` once per classified pair; the picker row reads `rewritten`; one `M` repairs it |
 | the `--name-only` command fails (pruned object, timeout, unreadable store) | `MarkState::Unreadable(reason)`; every row is flagged; the urgent notice `the mark cannot be read: <reason>`; the picker row reads `unreadable`; one `M` repairs it |
+| `merge-base --is-ancestor` gives no answer | the pair stays unclassified, the previous state stands with no warning, and the next refresh retries |
 | the mark has been picked as the base and its object is pruned | not a mark failure but a base failure: 7.3's verification fails and 7.8 keeps the last rows with a status error; `r` or the reset row recovers, `M` does not |
-| `merge-base --is-ancestor` exits other than `0` or `1`, or cannot be run | the state keeps its previous value and no notice is shown: failing to classify is not a reason to distrust the rows |
+
 | the head `rev-parse` cannot be run (spawn failure, timeout) | `head` and `head_seen` keep their previous values; `M` marks the older id, the safe direction of 8.2 |
 | the head `rev-parse` runs and finds no commit (unborn branch, not a repository) | both ids become `None` in the next publication, taking any pending candidate with them, and `drawn_head` clears; `M` then refuses instead of marking a commit of the branch that was left |
 | the selected row's diff fails during a refresh | `head` does not advance; `M` keeps marking the last commit whose hunks were drawn |
@@ -462,8 +480,8 @@ rows, the diffs and the base untouched, because a mark is not a base:
 
 Cost. Two `rev-parse` runs per refresh for the head id -- one before the row
 commands, one after, which must agree -- in both scopes, on top of what 3.3
-and 7.5 already run; one `diff --name-only` per refresh in branch scope while
-a mark exists and is an ancestor; one `merge-base --is-ancestor` per changed
+and 7.5 already run; one `diff --name-only` between two commits per refresh in
+branch scope while a mark exists and is an ancestor; one `merge-base --is-ancestor` per changed
 `(mark.commit, head_seen)` pair; three `rev-parse` runs each time the picker
 opens. No further quick-row command runs while the picker is open -- the
 refreshes of 3.3 and 7.5 continue as always -- and the poll interval is
@@ -494,12 +512,15 @@ Test layers, added to 5.2 and 7.9:
    mark, flags rows, and the notice says so; a mark equal to `head_seen` skips
    the ancestry command while a stale `drawn_head` mark does not.
 2. Engine, the unread set: on a fixture whose branch carries four commits, a
-   mark at the second flags exactly the paths of the third and fourth plus the
-   untracked rows, and not the paths only the first two touched; a path
-   changed both before and after the mark is flagged; a file modified before
-   the mark and renamed after it flags both the old and the new name, which
-   `-M` would have reduced to one; the set is empty in worktree scope and with
-   no mark.
+   mark at the second flags exactly the paths the third and fourth touched and
+   nothing else; a path changed both before and after the mark is flagged;
+   uncommitted edits to a file the mark already covers raise no flag, and a
+   second `M` on a dirty worktree leaves the set empty; untracked rows are
+   never in it; a file modified before the mark and renamed after it yields
+   both the old and the new name, which rename detection -- on by default
+   without `--no-renames` -- would have reduced to one; a row whose only
+   post-mark change is the deletion of its rename source is flagged through
+   `rename_sources`; the set is empty in worktree scope and with no mark.
 3. Engine, the published head: a failed diff does not advance it while an
    empty row list does; a diff issued before the rows were published never
    promotes a candidate, even when it completes afterwards; the refresh's row
@@ -515,7 +536,9 @@ Test layers, added to 5.2 and 7.9:
    once per classified pair, and one `M` restores both; a mark loaded from
    another viewer at an unchanged head is classified on arrival; an
    `--is-ancestor` exit of `1` is a negative answer while `128` and a spawn
-   failure leave the state and show no notice; a pruned marked object is
+   failure leave the pair unclassified and are retried by the next refresh,
+   which a rewrite immediately after a timed-out classification proves; a
+   pruned marked object is
    `Unreadable`, flags every row, warns with git's reason rather than the
    rewrite wording, and leaves the rows, diffs and base working; the same mark
    picked as the base instead fails 7.3's verification and is recovered by `r`
@@ -551,9 +574,10 @@ Test layers, added to 5.2 and 7.9:
 Success criteria, in addition to 1.5 and 7.9:
 
 10. On a branch where an agent has committed, reading the rows and pressing
-    `M` clears every marker while the list keeps its rows; when the agent
-    commits again, exactly the paths of the new commit carry a marker, and the
-    untracked rows carry one throughout.
+    `M` clears every marker while the list keeps its rows, and it clears them
+    on a dirty worktree too; when the agent commits again, exactly the paths
+    of the new commit carry a marker, and uncommitted edits in between carry
+    none.
 11. The mark survives closing and reopening the viewer on the same worktree,
     and a second viewer on the same worktree shows the same markers at its
     next resolution; picking `reviewed` in the picker narrows the list to the
