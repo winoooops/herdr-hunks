@@ -256,7 +256,7 @@ async fn run_job(job: Job) -> Done {
         response,
         head,
         head_seen: match &sampled {
-            Ok(id) => Some(id.clone()),
+            Ok(id) => id.clone(),
             Err(_) => None,
         },
         head_sampled: sampled.is_ok(),
@@ -312,13 +312,15 @@ In `request_diff`, wrap the diff call:
 
 ```rust
         tokio::spawn(async move {
+            // The bracket opens before the delay and the gate, so a HEAD move during either
+            // also costs the acknowledgement; only a still HEAD across the whole read counts.
+            let before = base::read_head(&toplevel).await;
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
             if let Some(gate) = gate {
                 gate.acquire().await.expect("diff gate closed").forget();
             }
-            let before = base::read_head(&toplevel).await;
             let result = match &comparison {
                 Comparison::Branch { merge_base } if !key.untracked => {
                     branch::diff(&toplevel, merge_base, &key.path, old.as_deref()).await
@@ -368,61 +370,111 @@ In `request_diff`, wrap the diff call:
                             }
 ```
 
-In the `Done::Status` arm, set `next.head_seen` from the job and give the snapshot its content id: an empty row list takes `confirmed`, anything else waits for its diff.
+A snapshot's `head` is a function of that snapshot, never a value left over from an
+earlier one, so it is assigned at every site that publishes a diff state. Add one helper
+next to `comparison_of`:
+
+```rust
+/// The commit this snapshot's content corresponds to: what its diff reported, the refresh's
+/// confirmed id when there is no row to load, and nothing while no content is loaded.
+fn head_of(snapshot: &Snapshot, confirmed: Option<String>) -> Option<String> {
+    match &snapshot.diff {
+        DiffState::Ready(d) => d.read_at.clone(),
+        DiffState::Idle if snapshot.files.is_empty() => confirmed,
+        _ => None,
+    }
+}
+```
+
+In the `Done::Status` arm, after `next.diff` has been decided and right before
+`state.requested_scope = next.scope;`:
 
 ```rust
                         if head_sampled {
                             next.head_seen = head_seen;
                         }
-                        next.head = if next.files.is_empty() && succeeded {
-                            confirmed
-                        } else {
-                            None
-                        };
+                        next.head = head_of(&next, confirmed.filter(|_| succeeded));
 ```
 
-(place this right before `state.requested_scope = next.scope;`). A `Loading` publication therefore always carries `head = None`, which is what Step 1's second assertion checks.
+A refresh that keeps a `Ready` diff therefore keeps that diff's id -- the background
+refreshes of 3.3 do not flap it to `None` -- while one that moved the diff to `Loading`
+publishes `None`. In the selection arm (`Command::Select`/`SelectNext`/`SelectPrev`), which
+publishes `DiffState::Loading` before requesting the diff, add `next.head = None;` next to
+`next.diff = DiffState::Loading;`: the body is about to show another file's hunks, and
+nothing on screen vouches for the id until they load. That is what Step 1's second
+assertion checks.
 
 - [ ] **Step 7: Record the drawn id in the view**
 
 `src/tui/state.rs`: `ViewState` gains `pub drawn_head: Option<String>,` initialised `None` in `new`.
 
-`src/tui/shell.rs`, in `run_terminal`, right after `terminal.draw(...)?;`:
+The decision belongs next to `render`, which owns the thresholds that replace the body, so
+the shell cannot drift from it. In `src/tui/view.rs`:
 
 ```rust
-            // Only a frame that showed the body vouches for an id; a modal covers the diff.
-            let body_drawn = !state.help_open
-                && state.picker.is_none()
-                && width >= 40
-                && (matches!(&snapshot.diff, DiffState::Ready(_)) || snapshot.files.is_empty());
-            state.drawn_head = if body_drawn {
+/// Whether `render` at this size draws the review body: not the "terminal too small" notice
+/// of 5.1, and not under a modal that covers it. The shell asks this before believing a
+/// frame's id; the thresholds live here, with the check `render` itself makes.
+pub fn body_is_drawn(state: &ViewState, snapshot: &Snapshot, columns: u16, height: u16) -> bool {
+    columns >= 40
+        && height >= 10
+        && !state.help_open
+        && state.picker.is_none()
+        && (matches!(&snapshot.diff, DiffState::Ready(_)) || snapshot.files.is_empty())
+}
+```
+
+`render`'s own first lines become `if !(columns >= 40 && height >= 10) { .. }` unchanged in
+behaviour; leave them as they are and keep the two numbers in one place by having
+`body_is_drawn` be the only other reader of them.
+
+`src/tui/shell.rs`, inside the `terminal.draw(|frame| { .. })` closure, after
+`rendered = view::render(..)`, record the decision for the size that was actually drawn:
+
+```rust
+                // Only a frame that showed the body vouches for an id.
+                drew_body = view::body_is_drawn(&state, &snapshot, width, area.height);
+```
+
+with `let mut drew_body = false;` declared before the closure, and immediately after the
+`terminal.draw(...)?;` call:
+
+```rust
+            state.drawn_head = if drew_body {
                 snapshot.head.clone()
             } else {
                 state.drawn_head.take().filter(|_| snapshot.head.is_some())
             };
 ```
 
-`DiffState` is already imported in `shell.rs` through `crate::engine`; add it to the import list if it is not. The `width >= 40` term is the "terminal too small" screen of 5.1, which `render` draws instead of the body; `view::render` uses the same threshold, so the two cannot disagree.
+`DiffState` is already imported in `shell.rs` through `crate::engine`; add it to the import
+list if it is not.
 
 - [ ] **Step 8: Write the view test and run everything**
 
-`src/tui/state.rs` tests:
+`src/tui/view.rs` tests — the production predicate, not a copy of the shell's assignment:
 
 ```rust
     #[test]
-    fn a_modal_or_unloaded_frame_never_vouches_for_an_id() {
+    fn only_a_drawn_body_vouches_for_an_id() {
         let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
-        snap.head = Some("a".repeat(40));
         let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
-        st.drawn_head = Some("b".repeat(40));
-        // The shell's rule, exercised directly: a Ready body frame adopts the id.
-        assert!(matches!(snap.diff, DiffState::Ready(_)));
-        st.drawn_head = snap.head.clone();
-        assert_eq!(st.drawn_head.as_deref(), Some("a".repeat(40).as_str()));
-        // A snapshot with no id clears it.
-        snap.head = None;
-        st.drawn_head = st.drawn_head.take().filter(|_| snap.head.is_some());
-        assert_eq!(st.drawn_head, None);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        assert!(body_is_drawn(&st, &snap, 120, 24));
+        assert!(!body_is_drawn(&st, &snap, 39, 24), "too narrow: the size notice is drawn");
+        assert!(!body_is_drawn(&st, &snap, 120, 9), "too short: the size notice is drawn");
+        st.help_open = true;
+        assert!(!body_is_drawn(&st, &snap, 120, 24), "the key sheet covers the diff");
+        st.help_open = false;
+        st.picker = Some(crate::tui::picker::Picker::open(0));
+        assert!(!body_is_drawn(&st, &snap, 120, 24), "the picker covers the diff");
+        st.picker = None;
+        snap.diff = crate::engine::DiffState::Loading;
+        assert!(!body_is_drawn(&st, &snap, 120, 24), "nothing is loaded");
+        snap.files.clear();
+        snap.diff = crate::engine::DiffState::Idle;
+        assert!(body_is_drawn(&st, &snap, 120, 24), "an empty list is a drawn body");
     }
 ```
 
@@ -784,12 +836,15 @@ In `load_rows`, after the rows are built, answer a mark:
                 Some(dir) => base::save_mark(dir, toplevel, &record).map_err(|e| e.to_string()),
                 None => Err("no state directory".to_string()),
             };
+            // Task 3 replaces this construction with `marks::classify`, which is what
+            // decides the state: `drawn_head` can lag `head_seen`, so a fresh mark is not
+            // automatically an ancestor of the head this refresh observed.
             Some((
                 Mark {
                     commit: record.commit.clone(),
                     at: record.at,
                     state: MarkState::Current,
-                    classified_at: seen.map(str::to_string),
+                    classified_at: None,
                 },
                 written,
             ))
@@ -828,20 +883,64 @@ In `load_rows`, after the rows are built, answer a mark:
                                         }
 ```
 
-and a failed load whose change was a mark answers on the mark channel:
+A failed write is reported on the same channel as the mark itself, not through
+`base_error`: the picker can be open, and `observe` suppresses a `base_error` while it is
+(7.4). So the success branch above becomes
+
+```rust
+                                        if let Some((mark, written)) = loaded.marked {
+                                            state.mark_seq += 1;
+                                            next.mark_seq = state.mark_seq;
+                                            next.mark = Some(mark.clone());
+                                            match written {
+                                                Ok(()) => {
+                                                    state.session_mark = None;
+                                                    next.mark_error = None;
+                                                }
+                                                Err(e) => {
+                                                    state.session_mark = Some(base::MarkRecord {
+                                                        commit: mark.commit.clone(),
+                                                        at: mark.at,
+                                                    });
+                                                    next.mark_error =
+                                                        Some(format!("mark not remembered: {e}"));
+                                                }
+                                            }
+                                        }
+```
+
+-- `mark` is `Some` and `mark_error` is `Some` together exactly when the mark was taken but
+not persisted, which is what 8.2 describes and what Task 4's `observe` reads.
+
+A failed load whose change was a mark answers on the mark channel, and so does every other
+way a consumed mark can end without an answer -- a status command that failed, or a
+directory that is not a repository, both of which leave `loaded` at `None` after the queue
+has already taken the change:
 
 ```rust
                                     Some(Err(e)) => match &change {
                                         Some(Change::Base(_)) => change_error = Some(e),
-                                        Some(Change::Mark(_)) => {
-                                            state.mark_seq += 1;
-                                            next.mark_seq = state.mark_seq;
-                                            next.mark_error = Some(e);
-                                        }
+                                        Some(Change::Mark(_)) => mark_answer = Some(e),
                                         Some(Change::Scope(_)) => next.base_error = Some(e),
                                         None => next.status_error = Some(e),
                                     },
 ```
+
+with `let mut mark_answer: Option<String> = None;` declared beside `change_error`, the
+`Err(e)` arm of `response` setting `mark_answer = Some(e.clone())` when the change was a
+mark, the `loaded: None` fallback setting
+`mark_answer = Some("not a git repository".to_string())` for one, and a single block after
+the match that answers whatever is left:
+
+```rust
+                        if matches!(change, Some(Change::Mark(_))) && next.mark_seq == state.mark_seq {
+                            state.mark_seq += 1;
+                            next.mark_seq = state.mark_seq;
+                            next.mark_error = mark_answer.or_else(|| Some("no answer".to_string()));
+                        }
+```
+
+so exactly one `mark_seq` advance follows every `MarkReviewed` the queue consumed.
 
 - [ ] **Step 9: Load the record on every resolution**
 
@@ -1013,13 +1112,34 @@ mod tests {
     }
 
     #[test]
+    fn an_answered_pair_is_not_asked_again() {
+        let (dir, top) = fixture();
+        let head = head_of(dir.path(), "HEAD");
+        let second = head_of(dir.path(), "HEAD~2");
+        let record = base::MarkRecord { commit: second, at: 1 };
+        let (mark, set) = rt().block_on(classify(&top, &record, &head, None, &BTreeSet::new()));
+        assert!(set.contains("c.txt"));
+        // Point the repository at a git that would fail if it were called: the cached pair
+        // must be returned without running anything.
+        let cached = rt().block_on(classify(
+            &"/nonexistent-toplevel".to_string(),
+            &record,
+            &head,
+            Some(&mark),
+            &set,
+        ));
+        assert_eq!(cached.0, mark);
+        assert_eq!(cached.1, set);
+    }
+
+    #[test]
     fn classify_reports_current_rewritten_and_unreadable() {
         let (dir, top) = fixture();
         let head = head_of(dir.path(), "HEAD");
         let second = head_of(dir.path(), "HEAD~2");
         let record = base::MarkRecord { commit: second.clone(), at: 1 };
 
-        let (mark, set) = rt().block_on(classify(&top, &record, &head, None));
+        let (mark, set) = rt().block_on(classify(&top, &record, &head, None, &BTreeSet::new()));
         assert_eq!(mark.state, MarkState::Current);
         assert_eq!(mark.classified_at.as_deref(), Some(head.as_str()));
         assert!(set.contains("c.txt") && !set.contains("b.txt"));
@@ -1032,12 +1152,12 @@ mod tests {
         run(dir.path(), &["commit", "-q", "-m", "side"]);
         let side = head_of(dir.path(), "HEAD");
         let record = base::MarkRecord { commit: head.clone(), at: 1 };
-        let (mark, set) = rt().block_on(classify(&top, &record, &side, None));
+        let (mark, set) = rt().block_on(classify(&top, &record, &side, None, &BTreeSet::new()));
         assert_eq!(mark.state, MarkState::Rewritten);
         assert!(set.is_empty());
 
-        // An id that no longer exists cannot be classified; the previous state stands and
-        // classified_at keeps the pair it last answered for.
+        // An id that no longer exists: `--is-ancestor` gives no answer and the read fails,
+        // which is conclusive about this pair, so the state becomes Unreadable and is dated.
         let gone = base::MarkRecord { commit: "b".repeat(40), at: 1 };
         let previous = Mark {
             commit: gone.commit.clone(),
@@ -1045,14 +1165,14 @@ mod tests {
             state: MarkState::Current,
             classified_at: Some("old".into()),
         };
-        let (mark, set) = rt().block_on(classify(&top, &gone, &side, Some(&previous)));
+        let (mark, set) = rt().block_on(classify(&top, &gone, &side, Some(&previous), &BTreeSet::new()));
         assert!(matches!(mark.state, MarkState::Unreadable(_)));
-        assert_eq!(mark.classified_at.as_deref(), Some("old"));
+        assert_eq!(mark.classified_at.as_deref(), Some(side.as_str()), "a dated answer, so it warns");
         assert!(set.is_empty());
 
         // A mark equal to the head needs no command and is Current.
         let same = base::MarkRecord { commit: side.clone(), at: 1 };
-        let (mark, set) = rt().block_on(classify(&top, &same, &side, None));
+        let (mark, set) = rt().block_on(classify(&top, &same, &side, None, &BTreeSet::new()));
         assert_eq!(mark.state, MarkState::Current);
         assert!(set.is_empty());
     }
@@ -1123,7 +1243,16 @@ pub(crate) async fn classify(
     record: &base::MarkRecord,
     head: &str,
     previous: Option<&Mark>,
+    previous_unread: &BTreeSet<String>,
 ) -> (Mark, BTreeSet<String>) {
+    // An answered pair is not asked again: both commits are fixed, so neither the state nor
+    // the set can change while they do. This is what keeps a settled repository at zero git
+    // processes per poll for this section.
+    if let Some(p) = previous {
+        if p.commit == record.commit && p.classified_at.as_deref() == Some(head) {
+            return (p.clone(), previous_unread.clone());
+        }
+    }
     let mut mark = Mark {
         commit: record.commit.clone(),
         at: record.at,
@@ -1158,12 +1287,14 @@ pub(crate) async fn classify(
             mark.classified_at = Some(head.to_string());
             (mark, BTreeSet::new())
         }
-        // No answer: the pair stays unclassified, the previous state stands, and the next
-        // refresh tries again. A pruned object reaches Unreadable through the read below.
+        // No answer from `--is-ancestor`: the pair stays unclassified and the next refresh
+        // tries again -- unless the read below fails too, which is a conclusive answer about
+        // this pair (a pruned object) and is dated like any other.
         Err(_) => match unread(toplevel, &record.commit, head).await {
             Ok(set) => (mark, set),
             Err(reason) => {
                 mark.state = MarkState::Unreadable(reason);
+                mark.classified_at = Some(head.to_string());
                 (mark, BTreeSet::new())
             }
         },
@@ -1218,14 +1349,53 @@ Expected: PASS (four tests).
     };
 ```
 
-with `Job` gaining `previous_mark: Option<Mark>` filled from `self.snapshot.mark.clone()` in `request_status`. When this refresh answered a mark (Task 2's `marked`), that `Mark` replaces the one computed here — it was just written at the head, so it is `Current` with an empty set. Publish both in the `Done::Status` arm:
+with `Job` gaining `previous_mark: Option<Mark>` and `previous_unread: BTreeSet<String>`,
+filled from `self.snapshot.mark.clone()` and `(*self.snapshot.unread).clone()` in
+`request_status`.
+
+A mark this refresh has just written is classified the same way, not assumed current: `M`
+submits `drawn_head`, which can be older than the `head_seen` this refresh observed, so an
+amend between the frame and the press leaves a fresh mark that is already off the branch.
+Replace Task 2's construction in the `marked` block with
+
+```rust
+            let (mark, set) = match seen {
+                Some(head) if scope == Scope::Branch => {
+                    marks::classify(toplevel, &record, head, None, &BTreeSet::new()).await
+                }
+                _ => (
+                    Mark {
+                        commit: record.commit.clone(),
+                        at: record.at,
+                        state: MarkState::Current,
+                        classified_at: None,
+                    },
+                    BTreeSet::new(),
+                ),
+            };
+            Some((mark, set, written))
+```
+
+so `Loaded.marked` becomes `Option<(Mark, BTreeSet<String>, Result<(), String>)>` and the
+publication carries the pair together. Publish the refresh's own pair first:
 
 ```rust
                                         next.mark = loaded.mark;
                                         next.unread = Arc::new(loaded.unread);
 ```
 
-right after `next.rename_sources` is assigned, and keep Task 2's `marked` block *after* it so a fresh mark wins.
+right after `next.rename_sources` is assigned, and keep Task 2's `marked` block *after* it,
+now setting both:
+
+```rust
+                                        if let Some((mark, set, written)) = loaded.marked {
+                                            next.mark = Some(mark.clone());
+                                            next.unread = Arc::new(set);
+                                            // ... the mark_seq and session_mark handling of Task 2
+                                        }
+```
+
+A fresh mark never leaves the previous mark's set behind it.
 
 - [ ] **Step 6: Write the failing session test for the published set**
 
@@ -1243,8 +1413,10 @@ right after `next.rename_sources` is assigned, and keep Task 2's `marked` block 
         let s = wait_for(&h, "marked", |s| s.mark_seq == 1);
         assert!(s.unread.is_empty(), "marking the head leaves nothing unread");
 
+        // Only `fresh.txt` is committed: `branch_fixture` leaves an edited `a.txt` and an
+        // untracked `u.txt`, and the assertions below are about exactly those staying out.
         std::fs::write(dir.path().join("fresh.txt"), "fresh\n").unwrap();
-        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["add", "fresh.txt"]);
         git(dir.path(), &["commit", "-q", "-m", "fresh"]);
         let s = wait_for(&h, "the new commit is unread", |s| s.unread.contains("fresh.txt"));
         assert!(!s.unread.contains("a.txt"), "{:?}", s.unread);
@@ -1272,7 +1444,9 @@ right after `next.rename_sources` is assigned, and keep Task 2's `marked` block 
         h.commands.send(Command::MarkReviewed(s.head.clone().unwrap())).unwrap();
         wait_for(&h, "marked", |s| s.mark_seq == 1);
 
-        git(dir.path(), &["commit", "-q", "--amend", "--no-edit"]);
+        // A changed message guarantees a different object id; `--no-edit` inside one second
+        // can reproduce the same commit.
+        git(dir.path(), &["commit", "-q", "--amend", "-m", "amended"]);
         let s = wait_for(&h, "rewritten", |s| {
             matches!(s.mark.as_ref().map(|m| m.state.clone()), Some(crate::engine::MarkState::Rewritten))
         });
@@ -1354,19 +1528,25 @@ impl ViewState { pub fn notify(&mut self, text: impl Into<String>); pub fn warn(
         let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Pinned, true);
         st.resize(120, 20);
         st.reconcile(&snap);
+        // Only the panel's own columns: line 0 is the toolbar, which also names the file.
+        let panel = |text: &[String], name: &str| -> String {
+            text.iter()
+                .skip(1)
+                .map(|l| l.chars().take(usize::from(FILES_WIDTH)).collect::<String>())
+                .find(|l| l.contains(name))
+                .unwrap_or_default()
+        };
         let text = render(&snap, &st, 120, 24).plain();
-        let row = |name: &str| text.iter().find(|l| l.contains(name)).cloned().unwrap_or_default();
-        assert!(row("a.rs").contains('●'), "{}", row("a.rs"));
-        assert!(!row("b.rs").contains('●'), "{}", row("b.rs"));
-        assert!(!row("u.rs").contains('●'), "untracked rows never carry one");
+        assert!(panel(&text, "a.rs").contains('●'), "{}", panel(&text, "a.rs"));
+        assert!(!panel(&text, "b.rs").contains('●'), "{}", panel(&text, "b.rs"));
+        assert!(!panel(&text, "u.rs").contains('●'), "untracked rows never carry one");
 
         // A rewritten mark flags every row, from the state and not from the set.
         snap.mark.as_mut().unwrap().state = MarkState::Rewritten;
         snap.unread = std::sync::Arc::new(Default::default());
         let text = render(&snap, &st, 120, 24).plain();
         for name in ["a.rs", "b.rs"] {
-            let line = text.iter().find(|l| l.contains(name)).unwrap();
-            assert!(line.contains('●'), "{line}");
+            assert!(panel(&text, name).contains('●'), "{}", panel(&text, name));
         }
 
         // Worktree scope never marks, whatever the set says.
@@ -1374,7 +1554,7 @@ impl ViewState { pub fn notify(&mut self, text: impl Into<String>); pub fn warn(
         snap.mark.as_mut().unwrap().state = MarkState::Current;
         snap.unread = std::sync::Arc::new(["a.rs".to_string()].into_iter().collect());
         let text = render(&snap, &st, 120, 24).plain();
-        assert!(!text.iter().any(|l| l.contains('●')));
+        assert!(!text.iter().skip(1).any(|l| l.contains('●')));
     }
 
     #[test]
@@ -1437,12 +1617,31 @@ impl ViewState { pub fn notify(&mut self, text: impl Into<String>); pub fn warn(
             st.notice.as_ref().map(|n| (n.text.clone(), n.urgent)),
             Some(("not a commit: abcdef1".to_string(), true))
         );
-        // A key the modal consumes leaves it; the first body key afterwards clears it.
+        // A key the modal consumes leaves it, and so does closing the modal; the first body
+        // key afterwards clears it.
         handle_key(&mut st, &snap, key("j"), 120);
         assert!(st.notice.is_some(), "the key sheet's own key does not clear it");
         handle_key(&mut st, &snap, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 120);
+        assert!(st.notice.is_some(), "closing the sheet does not clear an urgent notice");
         handle_key(&mut st, &snap, key("t"), 120);
         assert!(st.notice.is_none());
+
+        // The same holds behind the picker, and for a mark that was taken but not written.
+        handle_key(&mut st, &snap, key("B"), 120);
+        snap.mark_seq = 3;
+        snap.mark_error = Some("mark not remembered: no state directory".into());
+        snap.mark = Some(crate::engine::Mark {
+            commit: "d".repeat(40),
+            at: 1,
+            state: crate::engine::MarkState::Current,
+            classified_at: None,
+        });
+        st.observe(&snap);
+        handle_key(&mut st, &snap, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 120);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.clone()).as_deref(),
+            Some("mark not remembered: no state directory")
+        );
         // The same error answered twice shows twice.
         snap.mark_seq = 2;
         st.observe(&snap);
@@ -1541,14 +1740,23 @@ Every existing assignment becomes a call: `state.notice = Some("split view needs
         }
         if snapshot.mark_seq != self.seen_mark_seq {
             self.seen_mark_seq = snapshot.mark_seq;
-            if let Some(error) = &snapshot.mark_error {
-                self.warn(crate::tui::sanitize::sanitize(error));
+            match (&snapshot.mark_error, &snapshot.mark) {
+                // A mark that was taken but not written reports both: the mark is in force
+                // for this session, and the reason it will not outlive it.
+                (Some(error), _) => self.warn(crate::tui::sanitize::sanitize(error)),
+                (None, Some(mark)) => {
+                    let short = &mark.commit[..mark.commit.len().min(7)];
+                    self.notify(format!("marked {short} as reviewed"));
+                }
+                (None, None) => {}
             }
         }
-        // The rewrite warning speaks only for a pair the engine actually classified.
+        // The warning speaks only for a pair the engine actually classified, which
+        // `classify` dates for every conclusive answer -- a rewrite and a failed read alike.
         let rewritten = snapshot.mark.as_ref().and_then(|m| {
             let at = m.classified_at.clone()?;
-            (at == *snapshot.head_seen.as_ref()? && m.state != crate::engine::MarkState::Current)
+            (Some(&at) == snapshot.head_seen.as_ref()
+                && m.state != crate::engine::MarkState::Current)
                 .then(|| (m.commit.clone(), at, m.state.clone()))
         });
         if rewritten != self.seen_rewrite {
@@ -1640,6 +1848,55 @@ and the staged column becomes the marker column:
         });
 ```
 
+The chip says `vs reviewed` while the base in force *is* the mark, which is a comparison
+made at render time and not a label the pick remembered. In `toolbar_items`, where 7.4
+builds the scope chip:
+
+```rust
+    let scope_chip = match (snapshot.scope, &snapshot.base) {
+        (Scope::Branch, Some(base)) => {
+            let names_mark = snapshot
+                .mark
+                .as_ref()
+                .is_some_and(|m| m.commit == base.requested);
+            let label = if names_mark {
+                "reviewed".to_string()
+            } else {
+                truncate(&sanitize(base.label()), 16)
+            };
+            format!("vs {label}")
+        }
+        _ => "worktree".to_string(),
+    };
+```
+
+and the hover hint of 7.4 substitutes the same label, so it reads
+`switch scope · b · reviewed @ a1b2c3d`. The hint already formats
+`<label> @ <7 hex of base.commit>`; give it the same `names_mark` label rather than
+`Base::label()`.
+
+Its test:
+
+```rust
+    #[test]
+    fn the_chip_says_reviewed_only_while_the_base_is_the_mark() {
+        use crate::engine::{Base, BaseSource, Mark, MarkState, Scope};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let commit = "a".repeat(40);
+        snap.scope = Scope::Branch;
+        snap.base = Some(Base { requested: commit.clone(), commit: commit.clone(), merge_base: Some(commit.clone()), source: BaseSource::Picked });
+        snap.mark = Some(Mark { commit: commit.clone(), at: 1, state: MarkState::Current, classified_at: None });
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        assert!(render(&snap, &st, 120, 24).plain()[0].contains("vs reviewed"));
+        // A later mark leaves the base where it was: the alias stops, the id is shown.
+        snap.mark.as_mut().unwrap().commit = "b".repeat(40);
+        let top = render(&snap, &st, 120, 24).plain()[0].clone();
+        assert!(top.contains("vs aaaaaaa"), "{top}");
+    }
+```
+
 `state_message`'s empty case names the base in branch scope:
 
 ```rust
@@ -1673,7 +1930,35 @@ and the staged column becomes the marker column:
         }
 ```
 
-`apply_action` already clears the notice before `act` runs, which is what makes the refusal notice stick until the next handled body key. Modal paths never reach `apply_action`, so an urgent notice survives them; confirm that in the test of Step 1 rather than adding a guard.
+`apply_action` clears the notice before `act` runs, which is what makes the refusal notice
+stick until the next handled body key. Modal paths mostly avoid `apply_action`, but one does
+not: `handle_key`'s `help_open` branch sets `state.notice = None` when the sheet closes.
+Change that line to keep an urgent one:
+
+```rust
+            state.help_open = false;
+            state.help_offset = 0;
+            // An answer that arrived behind the sheet is read after it closes.
+            state.notice = state.notice.take().filter(|n| n.urgent);
+            return Outcome::Redraw;
+```
+
+and in `apply_action`, clear only what a body key should clear -- an urgent notice is cleared
+by the *next* body key rather than the one that was already in flight when it arrived:
+
+```rust
+fn apply_action(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction, width: u16) -> Outcome {
+    let cleared_notice = state.notice.take().is_some();
+    let outcome = act(state, snapshot, action, width);
+    if cleared_notice && outcome == Outcome::Inert {
+        Outcome::Redraw
+    } else {
+        outcome
+    }
+}
+```
+
+is already that rule and needs no change; the only edit is the `help_open` branch above.
 
 - [ ] **Step 7: Run everything**
 
