@@ -1,7 +1,7 @@
 //! Pure view: snapshot + view state in, styled lines and hit regions out.
 use crate::engine::nav::ViewMode;
 use crate::engine::{DiffState, FileKey, RepoState, Scope, Snapshot};
-use crate::git::ChangedFileStatus;
+use crate::git::{ChangedFile, ChangedFileStatus};
 use crate::tui::format::{pad, truncate, width};
 use crate::tui::rows::Row;
 use crate::tui::sanitize::sanitize;
@@ -91,6 +91,9 @@ impl Rendered {
 
 /// The one-line notice above the footer, by priority.
 pub fn notice(state: &ViewState, snapshot: &Snapshot) -> Option<String> {
+    if let Some(notice) = state.notice.as_ref().filter(|n| n.urgent) {
+        return Some(notice.text.clone());
+    }
     if let (Some(error), false) = (&snapshot.status_error, snapshot.files.is_empty()) {
         return Some(format!(
             "status failed: {} · showing the last good list · r retries",
@@ -103,7 +106,7 @@ pub fn notice(state: &ViewState, snapshot: &Snapshot) -> Option<String> {
             sanitize(reason)
         ));
     }
-    state.notice.clone()
+    state.notice.as_ref().map(|n| n.text.clone())
 }
 
 pub fn body_height(state: &ViewState, snapshot: &Snapshot, height: u16) -> u16 {
@@ -173,7 +176,14 @@ fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Ve
         "⟳"
     };
     let scope_chip = match (snapshot.scope, &snapshot.base) {
-        (Scope::Branch, Some(base)) => format!("vs {}", truncate(&sanitize(base.label()), 16)),
+        (Scope::Branch, Some(base)) => {
+            let names_mark = snapshot
+                .mark
+                .as_ref()
+                .is_some_and(|mark| mark.commit == base.requested);
+            let label = if names_mark { "reviewed" } else { base.label() };
+            format!("vs {}", truncate(&sanitize(label), 16))
+        }
         _ => "worktree".to_string(),
     };
     let mut items: Vec<ToolbarItem> = vec![
@@ -311,13 +321,16 @@ fn state_message(snapshot: &Snapshot) -> Option<String> {
         RepoState::Repo { .. } => {}
     }
     if snapshot.files.is_empty() {
-        return Some(
-            snapshot
-                .status_error
-                .as_ref()
-                .map(|e| sanitize(e))
-                .unwrap_or_else(|| "working tree clean".into()),
-        );
+        if let Some(error) = &snapshot.status_error {
+            return Some(sanitize(error));
+        }
+        return Some(match (snapshot.scope, &snapshot.base) {
+            (Scope::Branch, Some(base)) => format!(
+                "nothing on this branch since {}",
+                truncate(&sanitize(base.label()), 16)
+            ),
+            _ => "working tree clean".into(),
+        });
     }
     match &snapshot.diff {
         DiffState::Loading => Some("loading…".into()),
@@ -331,6 +344,25 @@ fn state_message(snapshot: &Snapshot) -> Option<String> {
             .into(),
         ),
         _ => None,
+    }
+}
+
+/// Flag unread paths, or every tracked row when the mark cannot divide this history.
+fn unread_marker(snapshot: &Snapshot, file: &ChangedFile) -> bool {
+    use crate::engine::MarkState;
+    if snapshot.scope != Scope::Branch || matches!(file.status, ChangedFileStatus::Untracked) {
+        return false;
+    }
+    match snapshot.mark.as_ref().map(|mark| &mark.state) {
+        None => false,
+        Some(MarkState::Current) => {
+            snapshot.unread.contains(&file.path)
+                || snapshot
+                    .rename_sources
+                    .get(&file.path)
+                    .is_some_and(|old| snapshot.unread.contains(old))
+        }
+        Some(_) => true,
     }
 }
 
@@ -376,7 +408,11 @@ fn files_lines(snapshot: &Snapshot, state: &ViewState, height: u16) -> (Vec<Line
             line.push(Span::label(format!(" {}/", sanitize(dir))));
         }
         let mut line = fit_line(line, usize::from(FILES_WIDTH - 2));
-        line.push(Span::body(if file.staged { "S " } else { "  " }));
+        line.push(if unread_marker(snapshot, file) {
+            Span::new("● ", Style::semantic(Role::Emphasis, Semantic::Accent))
+        } else {
+            Span::body(if file.staged { "S " } else { "  " })
+        });
         let hit = Hit {
             y: lines.len() as u16 + 1,
             x0: 0,
@@ -643,11 +679,12 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
             if binding.action == keys::KeyAction::ToggleScope {
                 if let Some(base) = &snapshot.base {
                     let commit: String = base.commit.chars().take(7).collect();
-                    return format!(
-                        "{hint} · {} @ {}",
-                        sanitize(base.label()),
-                        sanitize(&commit)
-                    );
+                    let names_mark = snapshot
+                        .mark
+                        .as_ref()
+                        .is_some_and(|mark| mark.commit == base.requested);
+                    let label = if names_mark { "reviewed" } else { base.label() };
+                    return format!("{hint} · {} @ {}", sanitize(label), sanitize(&commit));
                 }
             }
             hint
@@ -1523,5 +1560,218 @@ mod tests {
             body_is_drawn(&st, &snap, 120, 24),
             "an empty list is a drawn body"
         );
+    }
+    #[test]
+    fn the_panel_marks_unread_rows_in_branch_scope_only() {
+        use crate::engine::{Base, BaseSource, Mark, MarkState, Scope};
+        use crate::git::{ChangedFile, ChangedFileStatus};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        snap.files = vec![
+            ChangedFile {
+                path: "a.rs".into(),
+                status: ChangedFileStatus::Modified,
+                staged: false,
+                insertions: Some(1),
+                deletions: Some(0),
+            },
+            ChangedFile {
+                path: "b.rs".into(),
+                status: ChangedFileStatus::Added,
+                staged: false,
+                insertions: Some(1),
+                deletions: Some(0),
+            },
+            ChangedFile {
+                path: "u.rs".into(),
+                status: ChangedFileStatus::Untracked,
+                staged: false,
+                insertions: None,
+                deletions: None,
+            },
+        ];
+        snap.scope = Scope::Branch;
+        snap.base = Some(Base {
+            requested: "refs/heads/main".into(),
+            commit: "0".repeat(40),
+            merge_base: Some("1".repeat(40)),
+            source: BaseSource::Default,
+        });
+        snap.mark = Some(Mark {
+            commit: "2".repeat(40),
+            at: 1,
+            state: MarkState::Current,
+            classified_at: Some("3".repeat(40)),
+        });
+        snap.unread = std::sync::Arc::new(["a.rs".into(), "u.rs".into()].into_iter().collect());
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Pinned, true);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        // Only the panel's own columns: line 0 is the toolbar, which also names the file.
+        let panel = |text: &[String], name: &str| -> String {
+            text.iter()
+                .skip(1)
+                .map(|l| l.chars().take(usize::from(FILES_WIDTH)).collect::<String>())
+                .find(|l| l.contains(name))
+                .unwrap_or_default()
+        };
+        let rendered = render(&snap, &st, 120, 24);
+        let dot = rendered.lines[2].iter().find(|s| s.text == "● ").unwrap();
+        assert_eq!(dot.style, Style::semantic(Role::Emphasis, Semantic::Accent));
+        let text = rendered.plain();
+        assert!(
+            panel(&text, "a.rs").contains('●'),
+            "{}",
+            panel(&text, "a.rs")
+        );
+        assert!(
+            !panel(&text, "b.rs").contains('●'),
+            "{}",
+            panel(&text, "b.rs")
+        );
+        assert!(
+            !panel(&text, "u.rs").contains('●'),
+            "untracked rows never carry one"
+        );
+
+        std::sync::Arc::make_mut(&mut snap.rename_sources).insert("b.rs".into(), "old.rs".into());
+        snap.unread = std::sync::Arc::new(["old.rs".to_string()].into_iter().collect());
+        let text = render(&snap, &st, 120, 24).plain();
+        assert!(!panel(&text, "a.rs").contains('●'));
+        assert!(panel(&text, "b.rs").contains('●'));
+
+        // An unusable mark flags every tracked row, regardless of the unread set.
+        snap.unread = std::sync::Arc::new(Default::default());
+        for state in [MarkState::Rewritten, MarkState::Unreadable("gone".into())] {
+            snap.mark.as_mut().unwrap().state = state;
+            let text = render(&snap, &st, 120, 24).plain();
+            for name in ["a.rs", "b.rs"] {
+                assert!(panel(&text, name).contains('●'), "{}", panel(&text, name));
+            }
+            assert!(!panel(&text, "u.rs").contains('●'));
+        }
+
+        // Worktree scope never marks, whatever the set says.
+        snap.scope = Scope::Worktree;
+        snap.mark.as_mut().unwrap().state = MarkState::Current;
+        snap.unread = std::sync::Arc::new(["a.rs".to_string()].into_iter().collect());
+        let text = render(&snap, &st, 120, 24).plain();
+        assert!(!text.iter().skip(1).any(|l| l.contains('●')));
+
+        snap.files[0].staged = true;
+        let text = render(&snap, &st, 120, 24).plain();
+        assert!(panel(&text, "a.rs").ends_with("S "));
+
+        snap.scope = Scope::Branch;
+        snap.files[0].staged = false;
+        snap.mark = None;
+        let text = render(&snap, &st, 120, 24).plain();
+        assert!(!text.iter().skip(1).any(|l| l.contains('●')));
+    }
+
+    #[test]
+    fn an_urgent_notice_outranks_the_watcher_line_and_an_ordinary_one_does_not() {
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        snap.watcher_error = Some("inotify limit".into());
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        st.notify("marked 1234567 as reviewed");
+        assert!(notice(&st, &snap)
+            .unwrap()
+            .contains("live refresh degraded"));
+        st.warn("the mark cannot be read: gone");
+        assert_eq!(
+            notice(&st, &snap).as_deref(),
+            Some("the mark cannot be read: gone")
+        );
+        snap.files.push(ChangedFile {
+            path: "a.rs".into(),
+            status: ChangedFileStatus::Modified,
+            staged: false,
+            insertions: None,
+            deletions: None,
+        });
+        snap.status_error = Some("status unavailable".into());
+        assert_eq!(
+            notice(&st, &snap).as_deref(),
+            Some("the mark cannot be read: gone")
+        );
+        st.notify("marked 1234567 as reviewed");
+        assert!(notice(&st, &snap).unwrap().starts_with("status failed:"));
+    }
+
+    #[test]
+    fn an_empty_branch_list_names_the_base() {
+        use crate::engine::{Base, BaseSource, Scope};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        snap.files.clear();
+        snap.diff = crate::engine::DiffState::Idle;
+        snap.selected = None;
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        assert!(render(&snap, &st, 120, 24)
+            .plain()
+            .iter()
+            .any(|l| l.contains("working tree clean")));
+        snap.scope = Scope::Branch;
+        snap.base = Some(Base {
+            requested: "refs/heads/main".into(),
+            commit: "0".repeat(40),
+            merge_base: Some("1".repeat(40)),
+            source: BaseSource::Default,
+        });
+        let text = render(&snap, &st, 120, 24).plain();
+        assert!(
+            text.iter()
+                .any(|l| l.contains("nothing on this branch since main")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn the_chip_says_reviewed_only_while_the_base_is_the_mark() {
+        use crate::engine::{Base, BaseSource, Mark, MarkState, Scope};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let commit = "a".repeat(40);
+        snap.scope = Scope::Branch;
+        snap.base = Some(Base {
+            requested: commit.clone(),
+            commit: commit.clone(),
+            merge_base: Some(commit.clone()),
+            source: BaseSource::Picked,
+        });
+        snap.mark = Some(Mark {
+            commit: commit.clone(),
+            at: 1,
+            state: MarkState::Current,
+            classified_at: None,
+        });
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        let rendered = render(&snap, &st, 120, 24);
+        assert!(rendered.plain()[0].contains("vs reviewed"));
+        let hit = rendered
+            .hits
+            .iter()
+            .find(|h| h.action == Action::ToggleScope)
+            .unwrap();
+        st.hover = Some((hit.x0, 0));
+        assert_eq!(
+            render(&snap, &st, 120, 24).plain().last().unwrap(),
+            "switch scope · b · reviewed @ aaaaaaa"
+        );
+        // A later mark leaves the base where it was: the alias stops, the id is shown.
+        snap.mark.as_mut().unwrap().commit = "b".repeat(40);
+        let top = render(&snap, &st, 120, 24).plain()[0].clone();
+        assert!(top.contains("vs aaaaaaa"), "{top}");
+        assert_eq!(
+            render(&snap, &st, 120, 24).plain().last().unwrap(),
+            &format!("switch scope · b · {commit} @ aaaaaaa")
+        );
+        snap.mark.as_mut().unwrap().commit = commit;
+        snap.base.as_mut().unwrap().requested = "refs/heads/main".into();
+        assert!(render(&snap, &st, 120, 24).plain()[0].contains("vs main"));
     }
 }

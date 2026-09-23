@@ -11,6 +11,13 @@ pub enum FilesPanel {
     Pinned,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub text: String,
+    /// Shown above the status and watcher lines until a body key acknowledges it.
+    pub urgent: bool,
+}
+
 pub struct ViewState {
     pub drawn_head: Option<String>,
     pub requested_mode: ViewMode,
@@ -28,11 +35,13 @@ pub struct ViewState {
     pub refs_token: u64,
     /// Last submitted pick's reply sequence, retained when the picker closes.
     pub submitted_pick_seq: u64,
-    pub notice: Option<String>,
+    pub notice: Option<Notice>,
     pub rows: Option<Rows>,
     pub body_height: u16,
     pub help_offset: usize,
     seen_base_error: Option<String>,
+    seen_mark_seq: u64,
+    seen_rewrite: Option<(String, String, crate::engine::MarkState)>,
     width: u16,
     /// The diff the rows were built from. Holding the Arc makes `Arc::ptr_eq` a safe,
     /// allocation-free "did anything change" test; the engine swaps the Arc only on change.
@@ -62,9 +71,25 @@ impl ViewState {
             body_height: 0,
             help_offset: 0,
             seen_base_error: None,
+            seen_mark_seq: 0,
+            seen_rewrite: None,
             width: 0,
             built_from: None,
         }
+    }
+
+    pub fn notify(&mut self, text: impl Into<String>) {
+        self.notice = Some(Notice {
+            text: text.into(),
+            urgent: false,
+        });
+    }
+
+    pub fn warn(&mut self, text: impl Into<String>) {
+        self.notice = Some(Notice {
+            text: text.into(),
+            urgent: true,
+        });
     }
 
     /// Record only a drawn body's id; any snapshot without an id clears the last one.
@@ -141,6 +166,8 @@ impl ViewState {
 
     /// Called once per snapshot the shell receives, before the next frame.
     pub fn observe(&mut self, snapshot: &Snapshot) {
+        use crate::engine::MarkState;
+
         // Close the picker before showing any warning from the same reply.
         if let Some(picker) = &mut self.picker {
             picker.observe(snapshot);
@@ -148,10 +175,44 @@ impl ViewState {
                 self.picker = None;
             }
         }
+        let mut answered_mark = false;
+        if snapshot.mark_seq != self.seen_mark_seq {
+            self.seen_mark_seq = snapshot.mark_seq;
+            answered_mark = true;
+            match (&snapshot.mark_error, &snapshot.mark) {
+                (Some(error), _) => self.warn(crate::tui::sanitize::sanitize(error)),
+                (None, Some(mark)) => {
+                    let short = &mark.commit[..mark.commit.len().min(7)];
+                    self.notify(format!("marked {short} as reviewed"));
+                }
+                (None, None) => {}
+            }
+        }
+        // Warn only for the pair the engine conclusively classified.
+        let rewritten = snapshot.mark.as_ref().and_then(|mark| {
+            let at = mark.classified_at.clone()?;
+            (Some(&at) == snapshot.head_seen.as_ref() && mark.state != MarkState::Current)
+                .then(|| (mark.commit.clone(), at, mark.state.clone()))
+        });
+        // Leave the warning pending until an urgent answer has been acknowledged.
+        let urgent_stands = self.notice.as_ref().is_some_and(|n| n.urgent);
+        if rewritten != self.seen_rewrite && !answered_mark && !urgent_stands {
+            self.seen_rewrite = rewritten.clone();
+            match rewritten.map(|(_, _, state)| state) {
+                Some(MarkState::Rewritten) => {
+                    self.warn("the marked commit is no longer on this branch; press M again")
+                }
+                Some(MarkState::Unreadable(reason)) => self.warn(format!(
+                    "the mark cannot be read: {}",
+                    crate::tui::sanitize::sanitize(&reason)
+                )),
+                _ => {}
+            }
+        }
         if snapshot.base_error != self.seen_base_error {
             self.seen_base_error = snapshot.base_error.clone();
             if let (Some(error), None) = (&snapshot.base_error, &self.picker) {
-                self.notice = Some(crate::tui::sanitize::sanitize(error));
+                self.warn(crate::tui::sanitize::sanitize(error));
             }
         }
     }
@@ -443,7 +504,7 @@ pub(crate) mod tests {
         snap.base_error = Some("remembered pick: not a commit: gone\u{1b}".into());
         st.observe(&snap);
         assert_eq!(
-            st.notice.as_deref(),
+            st.notice.as_ref().map(|n| n.text.as_str()),
             Some("remembered pick: not a commit: gone\u{241b}")
         );
         st.notice = None;
@@ -518,5 +579,100 @@ pub(crate) mod tests {
         snap.head = None;
         st.record_drawn(&snap, true);
         assert_eq!(st.drawn_head, None);
+    }
+    #[test]
+    fn the_rewrite_warning_waits_for_a_classified_pair_and_repeats_per_pair() {
+        use crate::engine::{Mark, MarkState};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        snap.head_seen = Some("h1".repeat(20));
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Rewritten,
+            classified_at: None,
+        });
+        st.observe(&snap);
+        assert!(st.notice.is_none(), "an unclassified pair says nothing");
+
+        snap.mark.as_mut().unwrap().classified_at = snap.head_seen.clone();
+        st.observe(&snap);
+        assert!(st.notice.as_ref().unwrap().urgent);
+        assert!(st
+            .notice
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("no longer on this branch"));
+
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none(), "once per classified pair");
+
+        snap.head_seen = Some("h2".repeat(20));
+        st.observe(&snap);
+        assert!(
+            st.notice.is_none(),
+            "the old classification cannot warn for a new head"
+        );
+        snap.mark.as_mut().unwrap().classified_at = snap.head_seen.clone();
+        st.observe(&snap);
+        assert!(st.notice.is_some(), "a new pair warns again");
+
+        st.notice = None;
+        snap.mark.as_mut().unwrap().state = MarkState::Unreadable("gone\u{1b}".into());
+        st.observe(&snap);
+        assert!(st.notice.as_ref().unwrap().urgent);
+        assert_eq!(
+            st.notice.as_ref().unwrap().text,
+            "the mark cannot be read: gone\u{241b}"
+        );
+        st.notice = None;
+        st.observe(&snap);
+        assert!(
+            st.notice.is_none(),
+            "an unreadable pair also warns only once"
+        );
+    }
+
+    #[test]
+    fn a_mark_answer_outranks_a_rewrite_warning_in_the_same_snapshot() {
+        use crate::engine::{Mark, MarkState};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        snap.head_seen = Some("h1".repeat(20));
+        // The mark answer and classification arrive together.
+        snap.mark_seq = 1;
+        snap.mark_error = Some("mark not remembered: no state directory".into());
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Rewritten,
+            classified_at: snap.head_seen.clone(),
+        });
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("mark not remembered: no state directory"),
+            "the answer the user is owed is not overwritten"
+        );
+
+        // Further snapshots must not overwrite an unacknowledged answer.
+        st.observe(&snap);
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("mark not remembered: no state directory"),
+        );
+
+        // The warning follows once a body key clears the answer.
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st
+            .notice
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("no longer on this branch"));
     }
 }
