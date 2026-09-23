@@ -858,11 +858,22 @@ async fn run(
                     Command::MarkReviewed(commit) => {
                         // Key repeat must not queue the same commit twice: each queued change
                         // costs a refresh and a write, and the second would answer nothing new.
-                        // A deliberate retry still lands -- the answer that prompts it also
-                        // clears the in-flight mark.
-                        let repeat = matches!(state.changes.back(), Some(Change::Mark(queued)) if *queued == commit)
-                            || state.in_flight_mark.as_deref() == Some(commit.as_str());
-                        if !repeat {
+                        // Only the latest pending mark counts -- one queued behind another
+                        // commit is the user changing their mind back, not a repeat -- and a
+                        // deliberate retry still lands, because the answer that prompts it
+                        // clears the in-flight mark first. A press dropped here never reaches
+                        // the queue and so owes no answer; every mark that does reach it still
+                        // advances `mark_seq` exactly once.
+                        let latest_pending = state
+                            .changes
+                            .iter()
+                            .rev()
+                            .find_map(|change| match change {
+                                Change::Mark(queued) => Some(queued.as_str()),
+                                _ => None,
+                            })
+                            .or(state.in_flight_mark.as_deref());
+                        if latest_pending != Some(commit.as_str()) {
                             state.changes.push_back(Change::Mark(commit));
                             let mut next = state.snapshot.clone();
                             next.refreshing = true;
@@ -2798,6 +2809,43 @@ mod tests {
         });
         assert_eq!(s.mark_seq, 1, "consecutive identical marks are one request");
         assert_eq!(s.mark.as_ref().map(|m| m.commit.clone()), Some(head));
+    }
+
+    #[test]
+    fn a_mark_queued_behind_another_commit_is_not_coalesced() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        let a = s.head.clone().unwrap();
+        let b = git_out(dir.path(), &["rev-parse", "HEAD~1"])
+            .trim()
+            .to_string();
+        // Changing one's mind and back: the last press must win, however the three land.
+        for commit in [&a, &b, &a] {
+            h.commands
+                .send(Command::MarkReviewed(commit.clone()))
+                .unwrap();
+        }
+        let s = wait_for(&h, "all three answered", |s| s.mark_seq == 3);
+        assert_eq!(
+            s.mark.as_ref().map(|m| m.commit.clone()),
+            Some(a.clone()),
+            "the final press decides the mark"
+        );
+        let (marks, _) = crate::engine::base::load_marks(state.path());
+        let toplevel = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(marks.get(&toplevel).map(|m| m.commit.clone()), Some(a));
     }
 
     #[test]
