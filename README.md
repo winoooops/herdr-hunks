@@ -185,8 +185,10 @@ git processes. In worktree scope, a staged row whose path turned from a file int
 a directory parses the directory's patch as its own (K7 in PORT-SURFACE.md); branch
 scope is unaffected. Paths that are not valid UTF-8 are shown with `\u{fffd}` in
 place of the offending bytes; git is given the replaced name, so their diff is empty
-(or that of a file literally so named), and paths that differ only in those bytes
-are one row. The diff view keeps at most 200,000 lines, with a truncation row.
+(or that of a file literally so named); paths that differ only in those bytes share
+one row in branch scope, and in worktree scope when they are also the same kind of row
+(staged, unstaged or untracked). The diff view keeps at most 200,000 lines, with a
+truncation row.
 `GIT_NO_LAZY_FETCH` takes effect from Git 2.45; older Git may fetch missing objects
 when reading a partial clone. No syntax highlighting or context expansion yet.
 
