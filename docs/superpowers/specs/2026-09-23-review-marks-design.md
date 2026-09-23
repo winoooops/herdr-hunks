@@ -81,36 +81,39 @@ half that cannot be pinned: the status read, which asks git about the worktree
 and the index against whatever `HEAD` is live.
 
 *The id is published only when its refresh reached the screen.* The sampled id
-is held as a candidate and becomes `Snapshot.head` when a row's diff from that
-refresh has been loaded successfully and published, or when that refresh
-published no row at all. A diff that ends in `DiffState::Failed` leaves the
-previous id in place, because its hunks were never drawn. The empty list has
-to count, or a clean repository would never advance the id again. The diff
-that promotes a candidate is named, not merely awaited: when a refresh
-publishes its rows, the engine records with the candidate the generation of
-3.3's diff request issued for that publication, and only a `Done::Diff`
-carrying that generation, successfully, promotes it -- 3.3 coalesces a second
-request for the same key and comparison instead of reissuing, so without the
-pairing a request issued *before* the refresh could finish after it, having
-read the tree before the commit. When the engine coalesces rather than
-reissues, the `diff_dirty` rule of 3.3 reissues once the running diff
-completes, so the generation the candidate waits for always arrives. A
-candidate is dropped, never published, when its id is invalidated (below).
+is held as a candidate and becomes `Snapshot.head` when the refresh that
+sampled it has been drawn. Two things make that checkable rather than inferred
+from timing, because inference has to assume an ordering between a diff task,
+a reset by another process and the next refresh, and no ordering is
+guaranteed:
 
-What a later refresh does to a pending candidate depends on what that refresh
-saw. **Same id:** the candidate keeps it and adopts the generation of the
-newest diff request issued. Replacing it would let a repository whose diffs
-take longer than its poll interval move the generation the candidate waits for
-ahead of every completing diff, so diffs would keep being drawn and `head`
-would never advance; keeping the id and moving the generation promotes the
-oldest unacknowledged id at the next completed diff, the safe direction of the
-promise above. **Different id:** the candidate is dropped, not carried and not
-promoted, and that refresh's own id becomes the candidate. This is what covers
-a rewind that the two samples of one job could not see -- both samples read
-`C`, a reset to `B` lands before the diff reads the tree, and the diff then
-draws `B`'s content; the next refresh observes `B`, the candidate `C` is
-dropped, and the late diff promotes nothing. A candidate is therefore promoted
-only while every refresh since has kept observing the id it names.
+- **The candidate carries a minimum generation.** When a refresh publishes its
+  rows, the engine records with the candidate the next diff generation 3.3
+  will issue, so only a request made *after* those rows can promote it. A
+  request already in flight for the same key and comparison -- which 3.3
+  coalesces rather than reissuing -- may have read the tree before the commit;
+  its generation is below the minimum, and the `diff_dirty` rule reissues once
+  it completes, so an eligible request always arrives.
+- **The diff reports the head it read at.** The diff task runs
+  `git rev-parse --verify --quiet HEAD^{commit}` immediately after its diff
+  command returns and reports that id with its result. Promotion requires it
+  to equal the candidate. This is what covers a reset landing between the row
+  job's last sample and the diff's read: the diff then draws the parent's
+  content and reports the parent, the candidate does not match, and nothing is
+  acknowledged -- whether or not another refresh has observed the reset yet.
+
+A candidate is therefore promoted only by a successful diff whose generation
+is at or above its minimum and whose reported head is the candidate's own id.
+A refresh whose row list is empty has no diff to report; it promotes its id at
+publication, on the strength of the row job's two agreeing samples alone, and
+the empty list has to count, or a clean repository would never advance the id
+again. A diff that ends in `DiffState::Failed` promotes nothing, because its
+hunks were never drawn. A candidate is dropped, never published, when its id
+is invalidated (below) or when a later refresh observes a different id, whose
+own id becomes the candidate instead. While refreshes keep observing the same
+id the candidate keeps it, so a repository whose diffs take longer than its
+poll interval still advances: the next eligible completed diff promotes the id
+every refresh has been agreeing on.
 
 *What the terminal drew is what can be marked.* Publication is still not the
 terminal: the shell drains every queued snapshot and draws only the last, so a
@@ -149,6 +152,12 @@ redraws whatever the tree settled on. A rewind that does not come back is a
 rewrite, which 8.3's warning reports; a rewind that comes back inside one
 refresh is the one case where this section's promise rests on no other process
 rewinding history under the reader, and one more `M` corrects the mark.
+
+The window that remains around a diff is the one between its diff command and
+the `rev-parse` that follows it in the same task -- two adjacent commands,
+microseconds apart, rather than the seconds a poll interval spans. A third
+process that rewinds history inside it can still have its content drawn under
+the candidate's id.
 
 History need not move at all for the tree to mask a commit: an editor can put
 a file back to its pre-commit content, and the row's diff -- the working tree
@@ -385,7 +394,11 @@ commit that has left the branch is a legitimate thing to ask for -- but its
 baseline is then the common ancestor of the two histories, so the list can
 hold rows the mark's tree already contained, and an amend that changed nothing
 but the message can leave it non-empty. The rewrite warning of 8.3 is what
-tells the reviewer they are in that case; one `M` ends it. It is a comparison, not a filter of the dotted rows: a file the agent
+tells the reviewer they are in that case. One `M` ends the warning, because it
+marks a commit that is the head; it does not change the base, so a comparison
+already picked against the old mark stays until the reviewer picks again --
+`reviewed` then submits the new commit, and the chip stops reading
+`vs reviewed` for the old one (8.5). It is a comparison, not a filter of the dotted rows: a file the agent
 edited without committing has no dot but is listed, and a file reverted to its
 marked content has neither. It is an ordinary pick -- remembered in `bases.json`, shown as
 `vs reviewed` by the chip of 8.5, cleared by the reset row -- and the mark
@@ -490,10 +503,16 @@ The key sheet gains a row: 24 rows. `M` does not change the scope: in branch
 scope its effect is the markers clearing, in worktree scope it is the notice
 of 8.2, and a reviewer who wants the narrowed list asks for it with `B`.
 
-**The chip.** Unchanged by this section, except that a base picked from the
-`reviewed` row is the mark's commit, and the chip then reads `vs reviewed`
-rather than `vs a1b2c3d`; its hover hint keeps the shape of 7.4 with the same
-substitution, `switch scope · b · reviewed @ a1b2c3d`.
+**The chip.** Unchanged by this section, except that the chip reads
+`vs reviewed` exactly while `base.requested` is the commit `Snapshot.mark`
+names -- the alias is a comparison, not a label the pick remembers. Picking
+the `reviewed` row makes it true; a later `M` marks a new commit and makes it
+false again, and the chip then reads `vs a1b2c3d` for the base that is
+genuinely in force, which is the older commit the pick froze. The same holds
+after reopening the viewer, where the pick comes from `bases.json` and the
+mark from `marks.json` and nothing else ties them together. Its hover hint
+keeps the shape of 7.4 with the same substitution,
+`switch scope · b · reviewed @ a1b2c3d`.
 
 **The empty list.** `state_message` of 4.2 shows `working tree clean` whenever
 the row list is empty. That is true in worktree scope and wrong in branch
@@ -525,7 +544,8 @@ rows, the diffs and the base untouched, because a mark is not a base:
 | `@{upstream}`, `HEAD~1` or `HEAD~3` do not resolve | that quick row is not offered; the others are |
 
 Cost. Two `rev-parse` runs per refresh for the head id -- one before the row
-commands, one after, which must agree -- in both scopes, on top of what 3.3
+commands, one after, which must agree -- plus one in each diff task, after its
+diff command, which is what lets a diff say where it read; in both scopes, on top of what 3.3
 and 7.5 already run; one `diff --name-only` between two commits per refresh in
 branch scope while a mark exists and is an ancestor; one `merge-base --is-ancestor` per changed
 `(mark.commit, head_seen)` pair; three `rev-parse` runs each time the picker
@@ -569,11 +589,14 @@ Test layers, added to 5.2 and 7.9:
    post-mark change is the deletion of its rename source is flagged through
    `rename_sources`; the set is empty in worktree scope and with no mark.
 3. Engine, the published head: a failed diff does not advance it while an
-   empty row list does; with diffs slower than the poll interval it still
-   advances, because a pending candidate at an unchanged id keeps that id and
-   only adopts the newest generation; a refresh that observes a different id
-   drops the candidate instead, so a reset landing between a job's last sample
-   and its diff read cannot be acknowledged by the diff that follows it; a diff issued before the rows were published never
+   empty row list does; a diff whose generation is below the candidate's
+   minimum -- the request already in flight when the rows were published,
+   which 3.3 coalesced -- never promotes, and the reissue that follows it
+   does; a diff that reports a head other than the candidate's never promotes,
+   which a reset landing between the row job's last sample and the diff's read
+   exercises without relying on any other refresh running first; with diffs
+   slower than the poll interval the id still advances while every refresh
+   keeps observing it; a diff issued before the rows were published never
    promotes a candidate, even when it completes afterwards; the refresh's row
    commands carry the sampled id, so the rows a frame shows are the rows of
    the id it publishes even when `HEAD` leaves and returns during the job; a
