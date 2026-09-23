@@ -969,7 +969,7 @@ In the command loop, next to `SetBase`:
 
 ```rust
                     Command::MarkReviewed(commit) => {
-                        state.changes.push_back(Change::Mark(commit));
+                        state.changes.push_back(Change::Mark(commit));   // see the repeat guard below
                         let mut next = state.snapshot.clone();
                         next.refreshing = true;
                         publish(&mut state, next, &snapshots);
@@ -1148,6 +1148,13 @@ where `state_mark_override` is `job.inputs.session_mark`, a new field on `Resolv
 
 Run the full gate of the Global Constraints, plus `cargo test --locked --lib engine::session -- --test-threads=1` three times.
 Expected: all pass, the four new tests included.
+
+Applied after the pre-PR review (codex, 2026-09-23): `M` is a single key and auto-repeats, so
+the arm drops a press that names the commit already at the back of `changes` or already carried
+by the refresh in flight (`State.in_flight_mark`, cleared on every `Done::Status`). This is the
+same coalescing the engine already does for refreshes and diffs; a deliberate retry still lands,
+because the answer that prompts it clears the in-flight mark first. Every *consumed* mark still
+answers exactly once, which is what the failure-path test checks.
 
 - [ ] **Step 11: Commit (orchestrator)**
 

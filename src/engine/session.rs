@@ -188,6 +188,8 @@ struct State {
     /// Run the resolution steps in the next refresh (start, `r`, and after a pick).
     resolve_pending: bool,
     changes: VecDeque<Change>,
+    /// The mark a refresh is carrying right now, so key repeat cannot queue it again.
+    in_flight_mark: Option<String>,
     pick_seq: u64,
     mark_seq: u64,
 }
@@ -510,6 +512,9 @@ impl State {
         self.status_in_flight = true;
         refreshes.fetch_add(1, Ordering::SeqCst);
         let change = self.changes.pop_front();
+        if let Some(Change::Mark(commit)) = &change {
+            self.in_flight_mark = Some(commit.clone());
+        }
         let scope = match &change {
             Some(Change::Scope(scope)) => *scope,
             Some(Change::Base(_)) => Scope::Branch,
@@ -759,6 +764,7 @@ async fn run(
         unread_at: None,
         resolve_pending: true,
         changes: VecDeque::new(),
+        in_flight_mark: None,
         pick_seq: 0,
         mark_seq: 0,
     };
@@ -850,11 +856,19 @@ async fn run(
                         state.request_status(&cwd, false, &results_tx, &refreshes);
                     }
                     Command::MarkReviewed(commit) => {
-                        state.changes.push_back(Change::Mark(commit));
-                        let mut next = state.snapshot.clone();
-                        next.refreshing = true;
-                        publish(&mut state, next, &snapshots);
-                        state.request_status(&cwd, false, &results_tx, &refreshes);
+                        // Key repeat must not queue the same commit twice: each queued change
+                        // costs a refresh and a write, and the second would answer nothing new.
+                        // A deliberate retry still lands -- the answer that prompts it also
+                        // clears the in-flight mark.
+                        let repeat = matches!(state.changes.back(), Some(Change::Mark(queued)) if *queued == commit)
+                            || state.in_flight_mark.as_deref() == Some(commit.as_str());
+                        if !repeat {
+                            state.changes.push_back(Change::Mark(commit));
+                            let mut next = state.snapshot.clone();
+                            next.refreshing = true;
+                            publish(&mut state, next, &snapshots);
+                            state.request_status(&cwd, false, &results_tx, &refreshes);
+                        }
                     }
                     Command::LoadRefs(token) => {
                         let toplevel = match &state.snapshot.repo {
@@ -959,6 +973,7 @@ async fn run(
                     }
                     Done::Status { response, head, head_seen, head_sampled, confirmed, loaded, change } => {
                         state.status_in_flight = false;
+                        state.in_flight_mark = None;
                         let before = comparison_of(&state.snapshot);
                         let mut succeeded = false;
                         let mut change_error = None;
@@ -1083,6 +1098,11 @@ async fn run(
                             next.mark_error = mark_answer.or_else(|| Some("no answer".into()));
                         }
                         if head_sampled {
+                            // Published even when the load failed: this is the observation, not
+                            // a claim about the rows. A failed refresh keeps the previous rows,
+                            // mark and dots, so `head_seen` can name a newer commit than the set
+                            // describes; every consumer gates on a matching id instead
+                            // (`classified_at` for the warning, `unread_at` for the cache).
                             next.head_seen = head_seen;
                         }
                         state.requested_scope = next.scope;
@@ -2756,6 +2776,31 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_mark_does_not_queue_twice() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        let head = s.head.clone().unwrap();
+        // Key repeat: the same commit arrives many times before the first is answered.
+        for _ in 0..5 {
+            h.commands
+                .send(Command::MarkReviewed(head.clone()))
+                .unwrap();
+        }
+        let s = wait_for(&h, "answered and settled", |s| {
+            s.mark_seq >= 1 && !s.refreshing
+        });
+        assert_eq!(s.mark_seq, 1, "consecutive identical marks are one request");
+        assert_eq!(s.mark.as_ref().map(|m| m.commit.clone()), Some(head));
+    }
+
+    #[test]
     fn a_mark_that_cannot_be_validated_or_written_says_so() {
         let dir = branch_fixture();
         let (_rt, h) = start_with(dir.path(), Scope::Branch, None, None);
@@ -2931,12 +2976,12 @@ mod tests {
             if broken_status {
                 std::fs::write(dir.path().join(".git/index"), "broken index").unwrap();
             }
-            for _ in 0..2 {
+            // Two consumed commands, each answered once. They are sent one after the other
+            // rather than in a burst because identical marks coalesce while one is pending.
+            for seq in 1..=2 {
                 h.commands
                     .send(Command::MarkReviewed("b".repeat(40)))
                     .unwrap();
-            }
-            for seq in 1..=2 {
                 let s = wait_for(&h, "mark error", |s| s.mark_seq == seq);
                 assert!(s.mark.is_none());
                 assert_eq!(s.pick_seq, 0);
