@@ -1580,7 +1580,10 @@ Expected: PASS (five tests).
     pub unread: Arc<BTreeSet<String>>,
 ```
 
-(`Arc::new(BTreeSet::new())` in `empty`, and in `fingerprint`). `Loaded` gains `unread: BTreeSet<String>`, and `load_rows` fills both it and the mark:
+(`Arc::new(BTreeSet::new())` in `empty`, and in `fingerprint`). `Loaded` gains
+`unread: BTreeSet<String>` and `unread_at: Option<String>` — the head that set was read at,
+`head_id.map(str::to_string)` in the branch arm below and `None` in the other two — and
+`load_rows` fills them with the mark:
 
 ```rust
     let (mark, unread) = match (&mark_record, head_id) {
@@ -1661,29 +1664,34 @@ Replace Task 2's construction in the `marked` block with
                     BTreeSet::new(),
                 ),
             };
-            Some((mark, set, written))
+            Some((mark, set, written, head_id.map(str::to_string)))
 ```
 
-so `Loaded.marked` becomes `Option<(Mark, BTreeSet<String>, Result<(), String>)>` and the
-publication carries the pair together. Publish the refresh's own pair first:
+so `Loaded.marked` becomes
+`Option<(Mark, BTreeSet<String>, Result<(), String>, Option<String>)>` and the publication
+carries the pair, its answer and its provenance together. Publish the refresh's own pair first:
 
 ```rust
                                         next.mark = loaded.mark;
                                         next.unread = Arc::new(loaded.unread);
+                                        state.unread_at = loaded.unread_at;
 ```
 
 right after `next.rename_sources` is assigned, and keep Task 2's `marked` block *after* it,
 now setting both:
 
 ```rust
-                                        if let Some((mark, set, written)) = loaded.marked {
+                                        if let Some((mark, set, written, read_at)) = loaded.marked {
                                             next.mark = Some(mark.clone());
                                             next.unread = Arc::new(set);
+                                            state.unread_at = read_at;
                                             // ... the mark_seq and session_mark handling of Task 2
                                         }
 ```
 
-A fresh mark never leaves the previous mark's set behind it.
+A fresh mark never leaves the previous mark's set behind it, and `read_at` — the `head_id` its
+`classify` call used, `None` outside branch scope — keeps the provenance of the published set
+true for the next refresh's cache.
 
 - [ ] **Step 6: Write the failing session test for the published set**
 
@@ -2904,3 +2912,5 @@ git commit -m "feat: quick picker bases, docs and version 0.0.3"
 Type consistency: `read_head`, `merge_base_of`, `is_object_id`, `MarkRecord`, `load_marks`, `save_mark`, `quick_bases`, `marks::{unread, is_ancestor, classify}`, `Mark { commit, at, state, classified_at }`, `MarkState::{Current, Rewritten, Unreadable}`, `QuickBase { label, detail, submits }`, `Snapshot.{head, head_seen, mark, unread, quick, mark_seq, mark_error}`, `LoadedDiff.read_at`, `Command::MarkReviewed`, `KeyAction::MarkReviewed`, `Notice { text, urgent }`, `ViewState.{drawn_head, notify, warn}`, `PickerRow::Quick`, `picker::age` are the names used throughout.
 
 One deliberate deviation from the spec's wording, recorded here rather than left implicit: 8.3 says a `Rewritten` or `Unreadable` mark makes the engine flag every row. The engine publishes an *empty* `unread` set in those states and the view flags every row from `Mark::state` (Task 3's `classify`, Task 4's `unread_marker`). The observable behaviour is the spec's; putting the rule in one place keeps the set's meaning single ("paths the diff named") and matches 8.3's own instruction that the view distinguishes the states by `Mark::state`, never by the size of the set.
+
+<!-- codex-reviewed: 2026-09-23T17:58:54Z -->
