@@ -80,54 +80,47 @@ offers its id only when the two agree, which is the cheap detector for the
 half that cannot be pinned: the status read, which asks git about the worktree
 and the index against whatever `HEAD` is live.
 
-*The id is published only when its refresh reached the screen.* The sampled id
-is held as a candidate and becomes `Snapshot.head` when the refresh that
-sampled it has been drawn. Two things make that checkable rather than inferred
-from timing, because inference has to assume an ordering between a diff task,
-a reset by another process and the next refresh, and no ordering is
-guaranteed:
+*The markable id travels with the content, not beside it.* A snapshot's
+`head` is the id **its own content corresponds to**, and nothing else:
 
-- **The candidate carries a minimum generation.** When a refresh publishes its
-  rows, the engine records with the candidate the next diff generation 3.3
-  will issue, so only a request made *after* those rows can promote it. A
-  request already in flight for the same key and comparison -- which 3.3
-  coalesces rather than reissuing -- may have read the tree before the commit;
-  its generation is below the minimum, and the `diff_dirty` rule reissues once
-  it completes, so an eligible request always arrives.
-- **The diff reports the head it read at.** The diff task runs
-  `git rev-parse --verify --quiet HEAD^{commit}` immediately after its diff
-  command returns and reports that id with its result. Promotion requires it
-  to equal the candidate. This is what covers a reset landing between the row
-  job's last sample and the diff's read: the diff then draws the parent's
-  content and reports the parent, the candidate does not match, and nothing is
-  acknowledged -- whether or not another refresh has observed the reset yet.
+- with a `Ready` diff, the id the diff task reports (below);
+- with an empty row list, the id the refresh sampled, whose two samples agreed;
+- while the diff is `Loading` or `Failed`, `None` -- this snapshot shows no
+  content to acknowledge.
 
-A candidate is therefore promoted only by a successful diff whose generation
-is at or above its minimum and whose reported head is the candidate's own id.
-A refresh whose row list is empty has no diff to report; it promotes its id at
-publication, on the strength of the row job's two agreeing samples alone, and
-the empty list has to count, or a clean repository would never advance the id
-again. A diff that ends in `DiffState::Failed` promotes nothing, because its
-hunks were never drawn. A candidate is dropped, never published, when its id
-is invalidated (below) or when a later refresh observes a different id, whose
-own id becomes the candidate instead. While refreshes keep observing the same
-id the candidate keeps it, so a repository whose diffs take longer than its
-poll interval still advances: the next eligible completed diff promotes the id
-every refresh has been agreeing on.
+The diff task brackets its work: `git rev-parse --verify --quiet HEAD^{commit}`
+before its diff call and again after, and it reports an id only when the two
+agree, `None` otherwise. That makes the report mean "the content in this
+result was read while `HEAD` stood at this commit", which is what a mark
+needs, and it holds whether the call was branch scope's own command (8.3, one
+command) or worktree scope's frozen helper (3.2, which runs a patch command
+and then several `cat-file` and `show` reads before returning): a longer
+interval only makes the two samples disagree more often, which costs an
+acknowledgement, never truth. `LoadedDiff` carries the reported id, so it
+cannot be separated from the hunks it belongs to.
+
+That is the whole mechanism, and it replaces the one this section first
+proposed -- a pending candidate promoted by a matching diff generation. A
+candidate is a claim about which refresh a diff belongs to, and every ordering
+it assumed between a diff task, another process's `reset` and the next refresh
+had to be defended separately. An id carried by the content defends itself:
+there is no refresh to associate, nothing to invalidate when `HEAD` moves, and
+a diff requested before a commit and completed after it reports where it
+actually read.
 
 *What the terminal drew is what can be marked.* Publication is still not the
 terminal: the shell drains every queued snapshot and draws only the last, so a
-snapshot that completed a refresh can be skipped when a newer one arrives
-inside the same 100 ms poll. `ViewState` therefore gains
-`drawn_head: Option<String>`, assigned after a frame that actually showed the
-review body -- the snapshot's diff is `Ready` or its row list is empty, *and*
-the frame was the ordinary body, not the "terminal too small" notice of 5.1,
-the key sheet of 4.3 or the picker of 7.4, each of which covers the diff
-completely. A frame showing `Loading` or `Failed`, and any modal frame, leaves
-it alone. `M` marks `drawn_head`, never `Snapshot.head` directly, and with
-nothing drawn -- no commit yet on an unborn branch, not a repository, or no
-frame drawn yet -- it shows the notice `nothing to mark: no commit yet` and
-sends nothing, as `b` does without a base (7.3).
+snapshot can be skipped. `ViewState` therefore gains
+`drawn_head: Option<String>`, assigned after each frame from the `head` of the
+snapshot that frame used, and only when the frame showed the review body --
+not the "terminal too small" notice of 5.1, the key sheet of 4.3 or the picker
+of 7.4, each of which covers the diff completely. A modal frame leaves it
+alone, and a snapshot whose `head` is `None` clears it: whatever was drawn
+before, the viewer is no longer showing content it can vouch for. `M` marks
+`drawn_head`, and with nothing drawn -- no commit yet on an unborn branch, not
+a repository, or no frame yet whose diff was loaded -- it shows the notice
+`nothing to mark: no commit yet` and sends nothing, as `b` does without a base
+(7.3).
 
 The promise is therefore narrow and checkable: **`M` never marks a commit
 newer than the last frame this viewer drew with its diff loaded.** If a commit
@@ -146,18 +139,12 @@ empty list, under an id whose comparison is otherwise correct, with both
 samples agreeing, and nothing detects it. The viewer holds no lock on the
 repository and cannot close that window. What it does instead is bounded and
 stated here: in branch scope every frame's comparison is derived from the id
-that frame carries, a frame whose diff never loaded acknowledges nothing, an
-invalidated id takes its pending candidate with it, and the next refresh
+that frame carries, a frame whose diff never loaded acknowledges nothing, a
+diff during which `HEAD` moved reports no id at all, and the next refresh
 redraws whatever the tree settled on. A rewind that does not come back is a
 rewrite, which 8.3's warning reports; a rewind that comes back inside one
 refresh is the one case where this section's promise rests on no other process
 rewinding history under the reader, and one more `M` corrects the mark.
-
-The window that remains around a diff is the one between its diff command and
-the `rev-parse` that follows it in the same task -- two adjacent commands,
-microseconds apart, rather than the seconds a poll interval spans. A third
-process that rewinds history inside it can still have its content drawn under
-the candidate's id.
 
 History need not move at all for the tree to mask a commit: an editor can put
 a file back to its pre-commit content, and the row's diff -- the working tree
@@ -203,10 +190,9 @@ view that a head change happened at all -- the gated `head` cannot, since a
 refresh whose diff keeps failing leaves it unchanged -- and, being part of the
 snapshot, it also keeps 3.3 from suppressing the publication of a head change
 that altered nothing else. When the head `rev-parse` runs and reports no
-commit, both ids become `None` in the next publication, gate or no gate,
-taking any pending candidate with them, and a snapshot with `head = None`
-clears `drawn_head` on the next frame; that is invalidation, not advance, so
-it needs no gate and its only effect is `M` refusing.
+commit, `head_seen` becomes `None`, a snapshot with no content to acknowledge
+carries `head = None` by the rule above, and the frame that draws it clears
+`drawn_head`; the only effect is `M` refusing.
 
 `Snapshot` also gains `mark: Option<Mark>`:
 
@@ -362,7 +348,11 @@ timeout, an unreadable object store -- is `MarkState::Unreadable(reason)`: it
 also flags every row, and its urgent notice is `the mark cannot be read:
 <reason>`, git's own message, which is what tells a pruned object from a
 timeout. It takes precedence over the ancestry answer, whose `--is-ancestor`
-would have exited `128` on the same object and left the pair unclassified; the
+would have exited `128` on the same object and left the pair unclassified. A
+mark already classified `Rewritten` keeps that state if its object is pruned
+later while the pair does not change, because neither command runs again for
+an unchanged pair; both states flag every row and warn, and only the wording
+differs until the next head change reclassifies it. the
 picker's row then reads `reviewed (a1b2c3d · unreadable)`. The view
 distinguishes the three states by `Mark::state`, never by the size of the
 unread set, which is all-paths in the ordinary case where every row was
@@ -540,12 +530,13 @@ rows, the diffs and the base untouched, because a mark is not a base:
 
 | the head `rev-parse` cannot be run (spawn failure, timeout) | `head` and `head_seen` keep their previous values; `M` marks the older id, the safe direction of 8.2 |
 | the head `rev-parse` runs and finds no commit (unborn branch, not a repository) | both ids become `None` in the next publication, taking any pending candidate with them, and `drawn_head` clears; `M` then refuses instead of marking a commit of the branch that was left |
-| the selected row's diff fails during a refresh | `head` does not advance; `M` keeps marking the last commit whose hunks were drawn |
+| the selected row's diff fails, or `HEAD` moves while it runs | that snapshot carries `head = None`, the frame that draws it clears `drawn_head`, and `M` refuses until a diff is drawn again |
 | `@{upstream}`, `HEAD~1` or `HEAD~3` do not resolve | that quick row is not offered; the others are |
 
 Cost. Two `rev-parse` runs per refresh for the head id -- one before the row
-commands, one after, which must agree -- plus one in each diff task, after its
-diff command, which is what lets a diff say where it read; in both scopes, on top of what 3.3
+commands, which the commands then use, and one after, which must agree for an
+empty list to be markable -- and two in each diff task, bracketing its call;
+in both scopes, on top of what 3.3
 and 7.5 already run; one `diff --name-only` between two commits per refresh in
 branch scope while a mark exists and is an ancestor; one `merge-base --is-ancestor` per changed
 `(mark.commit, head_seen)` pair; three `rev-parse` runs each time the picker
@@ -588,23 +579,22 @@ Test layers, added to 5.2 and 7.9:
    without `--no-renames` -- would have reduced to one; a row whose only
    post-mark change is the deletion of its rename source is flagged through
    `rename_sources`; the set is empty in worktree scope and with no mark.
-3. Engine, the published head: a failed diff does not advance it while an
-   empty row list does; a diff whose generation is below the candidate's
-   minimum -- the request already in flight when the rows were published,
-   which 3.3 coalesced -- never promotes, and the reissue that follows it
-   does; a diff that reports a head other than the candidate's never promotes,
-   which a reset landing between the row job's last sample and the diff's read
-   exercises without relying on any other refresh running first; with diffs
-   slower than the poll interval the id still advances while every refresh
-   keeps observing it; a diff issued before the rows were published never
+3. Engine, the markable id: a snapshot with a `Ready` diff carries the id that
+   diff reported, one with an empty list carries the refresh's confirmed id,
+   and one that is `Loading` or `Failed` carries `None`; a diff during which
+   `HEAD` moves -- a commit landing between its two samples, and a `reset
+   --hard` to the parent -- reports nothing and leaves that snapshot
+   unmarkable, whatever any other refresh has seen; a diff requested before a
+   commit and completed after it reports where it read, so no generation
+   bookkeeping is needed; a diff issued before the rows were published never
    promotes a candidate, even when it completes afterwards; the refresh's row
    commands carry the sampled id, so the rows a frame shows are the rows of
    the id it publishes even when `HEAD` leaves and returns during the job; a
    refresh during which `HEAD` moves offers no id and the next one settles it;
    with a watcher that never emits, an ordinary commit still advances `head`
    within one poll (the case a `with_head`-only rule would miss); switching to
-   an unborn branch publishes `None` for both ids and drops the candidate,
-   while a failed spawn keeps the previous ids.
+   an unborn branch publishes `None`, while a failed spawn keeps the previous
+   `head_seen`.
 4. Engine, ancestry: a plain commit keeps the state `Current`; `commit --amend`
    makes the next refresh publish `MarkState::Rewritten`, flag every row and warn
    once per classified pair, and one `M` restores both; a mark loaded from
@@ -634,8 +624,10 @@ Test layers, added to 5.2 and 7.9:
    `rewritten` detail across two renders of one open picker, its membership
    not changing with them, and the cursor rules of 8.4.
 7. Input: `M` sends `MarkReviewed` with `drawn_head`, which a frame whose diff
-   is `Loading` or `Failed` leaves untouched, so a `Ready` snapshot the shell
-   skipped can never be marked; a frame drawn with the key sheet or the picker
+   is `Loading` or `Failed` clears rather than keeps, so a commit whose diff
+   was drawn only in a snapshot the shell skipped can never be marked, and
+   neither can one left behind in a stale field while the body shows another
+   commit's diff; a frame drawn with the key sheet or the picker
    open leaves it untouched too; `head = None` clears it; with nothing drawn
    it shows the notice and sends nothing; `M` does not change the scope; a
    mark answered while a pick is in flight neither closes the picker nor
