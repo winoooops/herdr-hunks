@@ -245,11 +245,12 @@ fn the_engine_never_mutates_the_repository() {
         }
     }
     assert!(back, "worktree scope did not come back");
-    // Mark a loaded head and open the picker again without widening the allow-list.
-    handle
-        .commands
-        .send(Command::MarkReviewed(head.expect("a markable head")))
-        .unwrap();
+    // Mark a commit that is not the head, and open the picker again, without widening the
+    // allow-list. Older on purpose: marking the head short-circuits classification before any
+    // git call, and classification is where 8.3's two commands run.
+    assert!(head.is_some(), "nothing was markable in worktree scope");
+    let older = git(&real, p, &["rev-parse", "HEAD~1"]).trim().to_string();
+    handle.commands.send(Command::MarkReviewed(older)).unwrap();
     handle.commands.send(Command::LoadRefs(2)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let (mut marked, mut refs) = (false, false);
@@ -262,6 +263,24 @@ fn the_engine_never_mutates_the_repository() {
     }
     assert!(marked, "the mark was never answered");
     assert!(refs, "the quick rows never arrived for this opening");
+    // Classification runs only in branch scope. Without this switch the allow-list below would
+    // prove nothing about the commands this feature added.
+    handle
+        .commands
+        .send(Command::SetScope(Scope::Branch))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut classified = false;
+    while Instant::now() < deadline && !classified {
+        let Ok(s) = handle.snapshots.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
+        classified = s.scope == Scope::Branch
+            && s.mark
+                .as_ref()
+                .is_some_and(|mark| mark.classified_at.is_some());
+    }
+    assert!(classified, "the mark was never classified in branch scope");
     // Now the harness switches HEAD underneath the engine, through the real git.
     git(&real, p, &["symbolic-ref", "HEAD", "refs/heads/other"]);
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -341,6 +360,19 @@ fn the_engine_never_mutates_the_repository() {
             .lines()
             .any(|l| l.contains("diff ") && l.contains("--name-status -M -z --")),
         "no name-status against the merge-base"
+    );
+    // The two commands 8.3 adds, both reads, both with shape-validated endpoints.
+    assert!(
+        recorded
+            .lines()
+            .any(|l| l.contains("merge-base --is-ancestor ")),
+        "the mark's ancestry was never asked about"
+    );
+    assert!(
+        recorded
+            .lines()
+            .any(|l| l.contains("diff ") && l.contains("--name-only --no-renames -z --")),
+        "the unread set was never read"
     );
     assert!(
         !recorded.lines().any(|l| l.contains("--merge-base")),
