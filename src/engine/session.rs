@@ -1265,17 +1265,27 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    /// The engine polls this repository while the test mutates it, and both take `index.lock`.
+    /// That one failure is retried; anything else fails the test with git's own message.
     fn git(dir: &std::path::Path, args: &[&str]) {
-        assert!(
-            Proc::new("git")
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let out = Proc::new("git")
                 .arg("-C")
                 .arg(dir)
                 .args(args)
-                .status()
-                .unwrap()
-                .success(),
-            "git {args:?}"
-        );
+                .output()
+                .unwrap();
+            if out.status.success() {
+                return;
+            }
+            let err = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(
+                err.contains("index.lock") && Instant::now() < deadline,
+                "git {args:?}: {err}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn fixture() -> tempfile::TempDir {

@@ -26,15 +26,27 @@ fn real_git() -> PathBuf {
     PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
 }
 
+/// The engine polls this repository while the harness drives it, and both take `index.lock`.
+/// That one failure is retried; anything else fails the test with git's own message.
 fn git(real: &Path, dir: &Path, args: &[&str]) -> String {
-    let out = Proc::new(real)
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}");
-    String::from_utf8_lossy(&out.stdout).to_string()
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = Proc::new(real)
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        if out.status.success() {
+            return String::from_utf8_lossy(&out.stdout).to_string();
+        }
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            err.contains("index.lock") && Instant::now() < deadline,
+            "git {args:?}: {err}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Content hash of every file outside `.git`, in path order. Pure Rust, so it is the same on macOS.
