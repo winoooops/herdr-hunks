@@ -2991,10 +2991,17 @@ mod tests {
         h.commands.send(Command::MarkReviewed(a.clone())).unwrap();
         h.commands.send(Command::Refresh).unwrap();
         h.commands.send(Command::MarkReviewed(b)).unwrap();
-        let s = wait_for(&h, "the remembered pick is resolved", |s| {
-            s.base.as_ref().map(|base| base.requested.as_str()) == Some("refs/heads/side")
-        });
-        assert_eq!(s.mark_seq, 2, "both marks still answered");
+        // Both conditions in one predicate: which refresh carries the resolution depends on
+        // whether the first mark has finished when `r` arrives, and on a loaded machine the
+        // base can land while only one mark has been answered.
+        wait_for(
+            &h,
+            "the remembered pick is resolved and both marks answered",
+            |s| {
+                s.base.as_ref().map(|base| base.requested.as_str()) == Some("refs/heads/side")
+                    && s.mark_seq == 2
+            },
+        );
 
         // The same holds when the mark that carries the resolution cannot be verified. The
         // first mark's refresh is in flight, so `r` only records the request, and the failing
