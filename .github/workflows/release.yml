@@ -82,6 +82,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        # The notes below come from the tag's own annotation, which a shallow
+        # checkout does not fetch.
+        with:
+          fetch-tags: true
         continue-on-error: true
       - uses: actions/download-artifact@v4
         with:
@@ -102,12 +106,18 @@ jobs:
         run: |
           set -euo pipefail
           notes_args=()
-          if notes=$(git log -1 --format=%b "$GITHUB_REF_NAME" 2>/dev/null) \
-            && [ -n "${notes//[[:space:]]/}" ]; then
-            notes_file=$(mktemp) \
-              && printf '%s\n' "$notes" > "$notes_file" \
-              && notes_args=(--notes-file "$notes_file") \
-              || true
+          # The tag's own annotation first. `git log <tag>` resolves the tag to its commit and
+          # prints *that* body, so v0.0.3 shipped with only the generated changelog while its
+          # annotation held the release notes. The commit body stays as the fallback: that is
+          # where a squash or merge commit carries the pull request description.
+          notes=$(git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" 2>/dev/null || true)
+          if [ -z "${notes//[[:space:]]/}" ]; then
+            notes=$(git log -1 --format=%b "$GITHUB_REF_NAME" 2>/dev/null || true)
+          fi
+          if [ -n "${notes//[[:space:]]/}" ]; then
+            notes_file=$(mktemp)
+            printf '%s\n' "$notes" > "$notes_file"
+            notes_args=(--notes-file "$notes_file")
           fi
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
