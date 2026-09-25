@@ -21,6 +21,7 @@ pub enum KeyAction {
     Refresh,
     ToggleScope,
     PickBase,
+    MarkReviewed,
     First,
     Last,
     ScrollLeft,
@@ -136,6 +137,12 @@ pub const KEYS: &[Binding] = &[
         key: "B",
         label: "compare against",
         action: KeyAction::PickBase,
+        vimeflow: None,
+    },
+    Binding {
+        key: "M",
+        label: "mark reviewed",
+        action: KeyAction::MarkReviewed,
         vimeflow: None,
     },
     Binding {
@@ -269,8 +276,8 @@ mod tests {
                 assert_eq!(lookup(&KeyEvent::new(code, modifiers)), None);
             }
         }
-        assert_eq!(KEYS.len(), 23);
-        assert_eq!(help_panel(false).rows.len(), 23);
+        assert_eq!(KEYS.len(), 24);
+        assert_eq!(help_panel(false).rows.len(), 24);
     }
 
     #[test]
@@ -278,6 +285,10 @@ mod tests {
         assert_eq!(
             lookup(&KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT)),
             Some(KeyAction::PickBase)
+        );
+        assert_eq!(
+            lookup(&KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT)),
+            Some(KeyAction::MarkReviewed)
         );
         assert_eq!(
             lookup(&KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),

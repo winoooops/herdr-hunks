@@ -58,7 +58,7 @@ pub fn handle_key(
         {
             state.help_open = false;
             state.help_offset = 0;
-            state.notice = None;
+            state.notice = state.notice.take().filter(|n| n.urgent);
             return Outcome::Redraw;
         }
         return match action {
@@ -96,7 +96,7 @@ fn picker_key(state: &mut ViewState, snapshot: &Snapshot, key: KeyEvent) -> Outc
     };
     let rows = picker.rows(snapshot);
     let moved = |picker: &mut crate::tui::picker::Picker, delta: isize| {
-        if picker.move_by(delta, rows.len(), visible) {
+        if picker.move_by(delta, &rows, visible) {
             Outcome::Redraw
         } else {
             Outcome::Inert
@@ -147,7 +147,7 @@ fn pick_row(state: &mut ViewState, snapshot: &Snapshot, index: usize) -> Outcome
     };
     let sent = snapshot.pick_seq.max(state.submitted_pick_seq);
     state.submitted_pick_seq = sent + 1;
-    picker.cursor = index;
+    picker.set_cursor(index, &rows);
     picker.pending = Some(sent);
     picker.error = None;
     Outcome::Engine(Command::SetBase(row.submit()))
@@ -161,6 +161,11 @@ fn apply_action(
 ) -> Outcome {
     let cleared_notice = state.notice.take().is_some();
     let outcome = act(state, snapshot, action, width);
+    // A warning held back behind that answer has no new snapshot to arrive on: a settled
+    // repository publishes none. Give it this frame, now that the answer is acknowledged.
+    if cleared_notice && state.notice.is_none() {
+        state.observe(snapshot);
+    }
     if cleared_notice && outcome == Outcome::Inert {
         Outcome::Redraw
     } else {
@@ -176,7 +181,7 @@ fn act(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction, width: u16
         ToggleScope => {
             return match snapshot.base {
                 None => {
-                    state.notice = Some(NO_BASE_NOTICE.into());
+                    state.notify(NO_BASE_NOTICE);
                     Outcome::Redraw
                 }
                 Some(_) => Outcome::Engine(Command::SetScope(snapshot.scope.other())),
@@ -187,11 +192,20 @@ fn act(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction, width: u16
             state.picker = Some(crate::tui::picker::Picker::open(state.refs_token));
             return Outcome::Engine(Command::LoadRefs(state.refs_token));
         }
+        MarkReviewed => {
+            return match state.drawn_head.clone() {
+                None => {
+                    state.notify("nothing to mark: no commit yet");
+                    Outcome::Redraw
+                }
+                Some(commit) => Outcome::Engine(Command::MarkReviewed(commit)),
+            };
+        }
         FileNext => return Outcome::Engine(Command::SelectNext),
         FilePrev => return Outcome::Engine(Command::SelectPrev),
         ToggleView => {
             if state.requested_mode == ViewMode::Unified && width < view::MIN_SPLIT_WIDTH {
-                state.notice = Some("split view needs 100 columns".into());
+                state.notify("split view needs 100 columns");
             } else {
                 state.requested_mode = match state.requested_mode {
                     ViewMode::Unified => ViewMode::Split,
@@ -359,8 +373,8 @@ pub fn handle_mouse(
             .saturating_add(u16::from(view::notice(state, snapshot).is_some()));
         if let Some(picker) = state.picker.as_mut() {
             let visible = picker.visible(overlay);
-            let len = picker.rows(snapshot).len();
-            return if picker.move_by(delta, len, visible) {
+            let rows = picker.rows(snapshot);
+            return if picker.move_by(delta, &rows, visible) {
                 Outcome::Redraw
             } else {
                 Outcome::Inert
@@ -577,7 +591,12 @@ mod tests {
         st.reconcile(&snap);
         handle_key(&mut st, &snap, key("t"), 90);
         assert_eq!(st.mode, ViewMode::Unified);
-        assert!(st.notice.as_deref().unwrap_or("").contains("100 columns"));
+        assert!(st
+            .notice
+            .as_ref()
+            .map(|n| n.text.as_str())
+            .unwrap_or("")
+            .contains("100 columns"));
         assert_eq!(st.requested_mode, ViewMode::Unified);
     }
 
@@ -615,7 +634,12 @@ mod tests {
         assert_eq!(st.requested_mode, ViewMode::Unified);
         assert_eq!(handle_key(&mut st, &snap, key("t"), 90), Outcome::Redraw);
         assert_eq!(st.requested_mode, ViewMode::Unified);
-        assert!(st.notice.as_deref().unwrap().contains("100 columns"));
+        assert!(st
+            .notice
+            .as_ref()
+            .map(|n| n.text.as_str())
+            .unwrap()
+            .contains("100 columns"));
         st.resize(120, st.body_height);
         st.reconcile(&snap);
         assert_eq!(st.mode, ViewMode::Unified);
@@ -1224,7 +1248,10 @@ mod tests {
         use crate::engine::{Base, BaseSource, Scope, NO_BASE_NOTICE};
         let (mut snap, mut st) = setup(&[(1, "+")]);
         assert_eq!(handle_key(&mut st, &snap, key("b"), 120), Outcome::Redraw);
-        assert_eq!(st.notice.as_deref(), Some(NO_BASE_NOTICE));
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some(NO_BASE_NOTICE)
+        );
         snap.base = Some(Base {
             requested: "refs/heads/main".into(),
             commit: "0".repeat(40),
@@ -1545,7 +1572,7 @@ mod tests {
         st.observe(&snap);
         assert!(st.picker.is_none());
         assert_eq!(
-            st.notice.as_deref(),
+            st.notice.as_ref().map(|n| n.text.as_str()),
             Some("pick not remembered: no state directory"),
             "the warning survives the picker closing"
         );
@@ -1633,5 +1660,140 @@ mod tests {
             Outcome::Inert,
             "toolbar hits are inert under the picker"
         );
+    }
+    #[test]
+    fn capital_m_marks_the_drawn_head_and_refuses_without_one() {
+        let (mut snap, mut st) = setup(&[(1, "+")]);
+        assert_eq!(handle_key(&mut st, &snap, key("M"), 120), Outcome::Redraw);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("nothing to mark: no commit yet")
+        );
+        st.drawn_head = Some("c".repeat(40));
+        snap.head = Some("d".repeat(40));
+        for scope in [crate::engine::Scope::Worktree, crate::engine::Scope::Branch] {
+            snap.scope = scope;
+            assert_eq!(
+                handle_key(&mut st, &snap, key("M"), 120),
+                Outcome::Engine(Command::MarkReviewed("c".repeat(40)))
+            );
+            assert_eq!(snap.scope, scope);
+        }
+    }
+
+    #[test]
+    fn acknowledging_an_answer_shows_the_warning_that_waited_behind_it() {
+        use crate::engine::{Mark, MarkState};
+        let (mut snap, mut st) = setup(&[(1, "+")]);
+        snap.head_seen = Some("h1".repeat(20));
+        // One snapshot carries both the unwritable mark and its rewritten classification.
+        snap.mark_seq = 1;
+        snap.mark_error = Some("mark not remembered: no state directory".into());
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Rewritten,
+            classified_at: snap.head_seen.clone(),
+        });
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.clone()).as_deref(),
+            Some("mark not remembered: no state directory")
+        );
+
+        // A settled repository publishes no further snapshot, so the body key that clears the
+        // answer is the only chance the warning gets.
+        handle_key(&mut st, &snap, key("t"), 120);
+        let notice = st.notice.as_ref().expect("the warning follows the answer");
+        assert!(notice.urgent);
+        assert!(notice.text.contains("no longer on this branch"));
+
+        // And the next body key clears that one, leaving nothing behind.
+        handle_key(&mut st, &snap, key("t"), 120);
+        assert!(st.notice.is_none());
+    }
+
+    #[test]
+    fn a_mark_answer_becomes_a_notice_even_behind_a_modal() {
+        let (mut snap, mut st) = setup(&[(1, "+")]);
+        st.help_open = true;
+        snap.mark_seq = 1;
+        snap.mark_error = Some("not a commit: abcdef1".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| (n.text.clone(), n.urgent)),
+            Some(("not a commit: abcdef1".to_string(), true))
+        );
+        // Modal keys preserve the answer until the next body key.
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert!(
+            st.notice.is_some(),
+            "the key sheet's own key does not clear it"
+        );
+        handle_key(
+            &mut st,
+            &snap,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            120,
+        );
+        assert!(
+            st.notice.is_some(),
+            "closing the sheet does not clear an urgent notice"
+        );
+        handle_key(&mut st, &snap, key("t"), 120);
+        assert!(st.notice.is_none());
+
+        // The same holds behind the picker, and for a mark that was taken but not written.
+        handle_key(&mut st, &snap, key("B"), 120);
+        assert_eq!(
+            handle_key(
+                &mut st,
+                &snap,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                120
+            ),
+            Outcome::Engine(Command::SetBase(None))
+        );
+        snap.mark_seq = 2;
+        snap.mark_error = Some("mark not remembered: no state directory".into());
+        snap.mark = Some(crate::engine::Mark {
+            commit: "d".repeat(40),
+            at: 1,
+            state: crate::engine::MarkState::Current,
+            classified_at: None,
+        });
+        st.observe(&snap);
+        let picker = st
+            .picker
+            .as_ref()
+            .expect("the mark answer leaves the pick pending");
+        assert_eq!(picker.pending, Some(snap.pick_seq));
+        assert!(picker.error.is_none());
+        handle_key(&mut st, &snap, key("M"), 120);
+        assert!(st.notice.as_ref().unwrap().urgent);
+        handle_key(
+            &mut st,
+            &snap,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            120,
+        );
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("mark not remembered: no state directory")
+        );
+        // The same error answered twice shows twice.
+        handle_key(&mut st, &snap, key("t"), 120);
+        assert!(st.notice.is_none());
+        snap.mark_seq = 3;
+        st.observe(&snap);
+        assert!(st.notice.is_some());
+
+        handle_key(&mut st, &snap, key("t"), 120);
+        snap.mark_seq = 4;
+        snap.mark_error = None;
+        st.observe(&snap);
+        let notice = st.notice.as_ref().unwrap();
+        assert_eq!(notice.text, "marked ddddddd as reviewed");
+        assert!(!notice.urgent);
     }
 }

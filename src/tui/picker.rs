@@ -1,11 +1,26 @@
 //! The base picker (spec 7.4): one input line that filters the ref list and takes free text.
 
-use crate::engine::{ref_label, BaseSource, RepoState, Snapshot};
+use crate::engine::{ref_label, BaseSource, QuickBase, RepoState, Snapshot};
 use crate::tui::dialog::{Panel, Row};
 use crate::tui::format::truncate;
 use crate::tui::sanitize::sanitize;
 
 pub const WIDTH: u16 = 60;
+
+/// Coarse age at render time; future timestamps read as just now.
+pub fn age(at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let seconds = now.saturating_sub(at);
+    match seconds {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{} min ago", seconds / 60),
+        3_600..=86_399 => format!("{} h ago", seconds / 3_600),
+        _ => format!("{} d ago", seconds / 86_400),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickerRow {
@@ -13,6 +28,12 @@ pub enum PickerRow {
     Reset(String),
     /// `use "<input>"`: the typed text as a base.
     Typed(String),
+    /// A review mark or one of the engine's computed bases.
+    Quick {
+        label: String,
+        detail: String,
+        submits: String,
+    },
     /// A listed ref: the qualified name it submits and its markers.
     Ref {
         qualified: String,
@@ -26,6 +47,7 @@ impl PickerRow {
         match self {
             Self::Reset(_) => None,
             Self::Typed(text)
+            | Self::Quick { submits: text, .. }
             | Self::Ref {
                 qualified: text, ..
             } => Some(text.clone()),
@@ -50,6 +72,9 @@ pub struct Picker {
     pub token: u64,
     /// The last `refs_seq` the cursor was placed for.
     pub seen_refs_seq: u64,
+    seen_mark: Option<String>,
+    seen_base: Option<String>,
+    rows_at_cursor_submit: Option<String>,
 }
 
 impl Picker {
@@ -69,6 +94,15 @@ impl Picker {
         }
     }
 
+    /// This opening's quick rows; empty until its own `LoadRefs` is answered.
+    pub fn quick<'a>(&self, snapshot: &'a Snapshot) -> &'a [QuickBase] {
+        if snapshot.refs_seq == self.token {
+            snapshot.quick.as_deref().map(Vec::as_slice).unwrap_or(&[])
+        } else {
+            &[]
+        }
+    }
+
     pub fn rows(&self, snapshot: &Snapshot) -> Vec<PickerRow> {
         let default_label = snapshot
             .default_base
@@ -77,11 +111,39 @@ impl Picker {
             .unwrap_or("none");
         let mut rows = vec![PickerRow::Reset(format!("default ({default_label})"))];
         let refs = self.refs(snapshot);
-        let listed = refs.iter().any(|r| ref_label(r) == self.input);
+        let listed = refs.iter().any(|r| ref_label(r) == self.input)
+            || (self.input == "reviewed" && snapshot.mark.is_some())
+            || self.quick(snapshot).iter().any(|q| q.label == self.input);
         if !self.input.is_empty() && !listed {
             rows.push(PickerRow::Typed(self.input.clone()));
         }
         let needle = self.input.to_lowercase();
+        if let Some(mark) = &snapshot.mark {
+            let short = &mark.commit[..mark.commit.len().min(7)];
+            let detail = match &mark.state {
+                crate::engine::MarkState::Current => age(mark.at),
+                crate::engine::MarkState::Rewritten => "rewritten".to_string(),
+                crate::engine::MarkState::Unreadable(_) => "unreadable".to_string(),
+            };
+            // Only the stable label filters a row whose detail changes with time.
+            if "reviewed".contains(&needle) {
+                rows.push(PickerRow::Quick {
+                    label: "reviewed".into(),
+                    detail: format!("{short} · {detail}"),
+                    submits: mark.commit.clone(),
+                });
+            }
+        }
+        for quick in self.quick(snapshot) {
+            let haystack = format!("{} {}", quick.label, quick.detail).to_lowercase();
+            if haystack.contains(&needle) {
+                rows.push(PickerRow::Quick {
+                    label: quick.label.clone(),
+                    detail: quick.detail.clone(),
+                    submits: quick.submits.clone(),
+                });
+            }
+        }
         let current_base = snapshot.base.as_ref().map(|b| b.requested.as_str());
         let checked_out = match &snapshot.repo {
             RepoState::Repo {
@@ -114,7 +176,7 @@ impl Picker {
                 }
             })
             .collect();
-        // The current base's row comes right after the reset row.
+        // The current base leads the ref rows after any quick rows.
         if let Some(i) = matching.iter().position(
             |row| matches!(row, PickerRow::Ref { qualified, .. } if Some(qualified.as_str()) == current_base),
         ) {
@@ -176,12 +238,20 @@ impl Picker {
             let (label, value) = match row {
                 PickerRow::Reset(text) => (text.clone(), String::new()),
                 PickerRow::Typed(text) => (format!("use \"{text}\""), String::new()),
+                PickerRow::Quick { label, detail, .. } => {
+                    (format!("{label} ({detail})"), String::new())
+                }
                 PickerRow::Ref { qualified, markers } => {
                     (ref_label(qualified).to_string(), markers.join(" · "))
                 }
             };
+            let label_width = if matches!(row, PickerRow::Quick { .. }) {
+                usize::from(width.saturating_sub(8))
+            } else {
+                30
+            };
             panel_rows.push(Row::Entry {
-                label: truncate(&sanitize(&label), 30),
+                label: truncate(&sanitize(&label), label_width),
                 value,
                 enabled: true,
             });
@@ -195,8 +265,14 @@ impl Picker {
         }
     }
 
-    /// Moves the cursor, keeping it inside `[0, len)` and the window around it; false when nothing moved.
-    pub fn move_by(&mut self, delta: isize, len: usize, visible: usize) -> bool {
+    pub fn set_cursor(&mut self, index: usize, rows: &[PickerRow]) {
+        self.cursor = index.min(rows.len().saturating_sub(1));
+        self.rows_at_cursor_submit = rows.get(self.cursor).and_then(PickerRow::submit);
+    }
+
+    /// Move within the rows and keep the cursor visible; false when nothing moved.
+    pub fn move_by(&mut self, delta: isize, rows: &[PickerRow], visible: usize) -> bool {
+        let len = rows.len();
         if len == 0 {
             return false;
         }
@@ -204,7 +280,7 @@ impl Picker {
         if next == self.cursor {
             return false;
         }
-        self.cursor = next;
+        self.set_cursor(next, rows);
         self.offset = self.window(visible.max(1));
         true
     }
@@ -217,19 +293,32 @@ impl Picker {
 
     fn follow_input(&mut self, snapshot: &Snapshot) {
         let rows = self.rows(snapshot);
-        self.cursor = if self.input.is_empty() {
+        let cursor = if self.input.is_empty() {
             0
         } else {
             rows.iter()
-                .position(|r| matches!(r, PickerRow::Ref { .. }))
+                .position(|r| matches!(r, PickerRow::Quick { .. } | PickerRow::Ref { .. }))
                 .or_else(|| rows.iter().position(|r| matches!(r, PickerRow::Typed(_))))
                 .unwrap_or(0)
         };
+        self.set_cursor(cursor, &rows);
         self.offset = 0;
     }
 
     /// The engine's answers: a new ref list re-places the cursor; the pending `SetBase` closes or errs.
     pub fn observe(&mut self, snapshot: &Snapshot) {
+        let mark_key = snapshot.mark.as_ref().map(|mark| mark.commit.clone());
+        let base_key = snapshot.base.as_ref().map(|base| base.requested.clone());
+        if mark_key != self.seen_mark || base_key != self.seen_base {
+            self.seen_mark = mark_key;
+            self.seen_base = base_key;
+            let rows = self.rows(snapshot);
+            let cursor = rows
+                .iter()
+                .position(|row| row.submit() == self.rows_at_cursor_submit)
+                .unwrap_or_else(|| rows.len().saturating_sub(1));
+            self.set_cursor(cursor, &rows);
+        }
         if snapshot.refs_seq == self.token && self.seen_refs_seq != self.token {
             self.seen_refs_seq = snapshot.refs_seq;
             self.follow_input(snapshot);
@@ -287,6 +376,7 @@ mod tests {
             .map(|r| match r {
                 PickerRow::Reset(t) => t.clone(),
                 PickerRow::Typed(t) => format!("use \"{t}\""),
+                PickerRow::Quick { label, detail, .. } => format!("{label} ({detail})"),
                 PickerRow::Ref { qualified, markers } => {
                     let mut s = crate::engine::ref_label(qualified).to_string();
                     if !markers.is_empty() {
@@ -370,11 +460,11 @@ mod tests {
         p.retarget(&s);
         assert_eq!(p.cursor, 0);
         let len = p.rows(&s).len();
-        assert!(!p.move_by(-1, len, 3));
-        assert!(p.move_by(1, len, 3) && p.cursor == 1);
-        assert!(p.move_by(10, len, 3) && p.cursor == len - 1);
+        assert!(!p.move_by(-1, &p.rows(&s), 3));
+        assert!(p.move_by(1, &p.rows(&s), 3) && p.cursor == 1);
+        assert!(p.move_by(10, &p.rows(&s), 3) && p.cursor == len - 1);
         assert_eq!(p.offset, len - 3, "the window follows the cursor down");
-        assert!(p.move_by(-(len as isize), len, 3) && p.cursor == 0 && p.offset == 0);
+        assert!(p.move_by(-(len as isize), &p.rows(&s), 3) && p.cursor == 0 && p.offset == 0);
     }
 
     #[test]
@@ -447,12 +537,18 @@ mod tests {
     #[test]
     fn the_list_counts_only_once_this_opening_is_answered_and_the_cursor_follows_it() {
         let mut s = snap(&REFS, None);
+        s.quick = Some(Arc::new(vec![QuickBase {
+            label: "upstream".into(),
+            detail: "origin/main".into(),
+            submits: "refs/remotes/origin/main".into(),
+        }]));
         s.refs_seq = 0;
         let mut p = Picker::open(2);
         assert!(
             p.refs(&s).is_empty(),
             "the previous opening's list is not shown"
         );
+        assert!(p.quick(&s).is_empty());
         assert_eq!(labels(&p.rows(&s)), ["default (main)"]);
         assert_eq!(p.panel(&s, WIDTH, 12).footer, "loading refs…");
         p.input = "ma".into();
@@ -467,10 +563,16 @@ mod tests {
         );
         assert_eq!(p.panel(&s, WIDTH, 12).footer, "loading refs…");
         assert_eq!(p.cursor, 1, "a stale reply must not move the cursor");
+        assert!(p.quick(&s).is_empty());
         s.refs_seq = 2;
         p.observe(&s);
         assert_eq!(p.refs(&s).len(), REFS.len());
+        assert_eq!(p.quick(&s).len(), 1);
         assert_eq!(p.cursor, 2, "the first match once the list arrived");
+        assert_eq!(
+            p.rows(&s)[p.cursor].submit().as_deref(),
+            Some("refs/remotes/origin/main")
+        );
         assert_eq!(
             p.error.as_deref(),
             Some("kept"),
@@ -536,5 +638,223 @@ mod tests {
         s.pick_error = None;
         p.observe(&s);
         assert!(p.done);
+    }
+    #[test]
+    fn quick_rows_sit_between_the_typed_row_and_the_refs() {
+        use crate::engine::{Mark, MarkState, QuickBase};
+        let mut s = snap(&REFS, None);
+        s.quick = Some(std::sync::Arc::new(vec![
+            QuickBase {
+                label: "upstream".into(),
+                detail: "origin/main".into(),
+                submits: "refs/remotes/origin/main".into(),
+            },
+            QuickBase {
+                label: "last commit".into(),
+                detail: "9ffc8fd".into(),
+                submits: "HEAD~1".into(),
+            },
+        ]));
+        s.mark = Some(Mark {
+            commit: "a".repeat(40),
+            at: now() - 7_200,
+            state: MarkState::Current,
+            classified_at: None,
+        });
+        let p = Picker::open(1); // the token `snap` publishes as refs_seq
+        let shown = labels(&p.rows(&s));
+        assert_eq!(&shown[0], "default (main)");
+        assert_eq!(&shown[1], "reviewed (aaaaaaa · 2 h ago)");
+        assert_eq!(&shown[2], "upstream (origin/main)");
+        assert_eq!(&shown[3], "last commit (9ffc8fd)");
+        assert!(shown[4..].iter().any(|l| l.starts_with("main")));
+        assert_eq!(
+            p.rows(&s)[1].submit().as_deref(),
+            Some("a".repeat(40).as_str())
+        );
+
+        // The reviewed row is live: its detail follows the snapshot, not a frozen string.
+        s.mark.as_mut().unwrap().state = MarkState::Rewritten;
+        assert_eq!(&labels(&p.rows(&s))[1], "reviewed (aaaaaaa · rewritten)");
+        s.mark.as_mut().unwrap().state = MarkState::Unreadable("gone".into());
+        assert_eq!(&labels(&p.rows(&s))[1], "reviewed (aaaaaaa · unreadable)");
+        s.mark.as_mut().unwrap().at = now();
+        s.mark.as_mut().unwrap().state = MarkState::Current;
+        assert_eq!(&labels(&p.rows(&s))[1], "reviewed (aaaaaaa · just now)");
+        for (state, detail) in [
+            (MarkState::Current, "just now"),
+            (MarkState::Rewritten, "rewritten"),
+            (MarkState::Unreadable("gone".into()), "unreadable"),
+        ] {
+            s.mark.as_mut().unwrap().state = state;
+            for width in [40, WIDTH] {
+                let panel = p.panel(&s, width, 20);
+                let lines = crate::tui::dialog::render(&panel, width, 20);
+                let text: String = lines.iter().flatten().map(|s| s.text.as_str()).collect();
+                assert!(
+                    text.contains(&format!("reviewed (aaaaaaa · {detail})")),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn filtering_matches_a_quick_rows_detail_but_only_the_reviewed_label() {
+        use crate::engine::{Mark, MarkState, QuickBase};
+        let mut s = snap(&REFS, None);
+        s.quick = Some(std::sync::Arc::new(vec![QuickBase {
+            label: "upstream".into(),
+            detail: "origin/main".into(),
+            submits: "refs/remotes/origin/main".into(),
+        }]));
+        s.mark = Some(Mark {
+            commit: "a".repeat(40),
+            at: now(),
+            state: MarkState::Current,
+            classified_at: None,
+        });
+        let mut p = Picker::open(1);
+        p.input = "orig".into();
+        assert!(labels(&p.rows(&s))
+            .iter()
+            .any(|l| l.starts_with("upstream")));
+        p.input = "rev".into();
+        assert!(labels(&p.rows(&s))
+            .iter()
+            .any(|l| l.starts_with("reviewed")));
+        p.input = "just now".into();
+        assert!(
+            !labels(&p.rows(&s))
+                .iter()
+                .any(|l| l.starts_with("reviewed")),
+            "the age is not matched, or a passing minute would move the row"
+        );
+    }
+
+    #[test]
+    fn the_cursor_keeps_its_row_when_the_mark_arrives() {
+        use crate::engine::{Mark, MarkState, QuickBase};
+        let mut s = snap(&REFS, None);
+        s.quick = Some(std::sync::Arc::new(vec![QuickBase {
+            label: "upstream".into(),
+            detail: "origin/main".into(),
+            submits: "refs/remotes/origin/main".into(),
+        }]));
+        let mut p = Picker::open(1);
+        p.observe(&s); // consume this opening's refs_seq, so the move below is not undone
+        p.move_by(1, &p.rows(&s), 10); // onto `upstream`
+        let before = p.rows(&s)[p.cursor].submit();
+        assert_eq!(before.as_deref(), Some("refs/remotes/origin/main"));
+        s.mark = Some(Mark {
+            commit: "a".repeat(40),
+            at: now(),
+            state: MarkState::Current,
+            classified_at: None,
+        });
+        p.observe(&s);
+        assert_eq!(
+            p.rows(&s)[p.cursor].submit(),
+            before,
+            "the cursor followed its row"
+        );
+        s.base = Some(Base {
+            requested: "refs/tags/main".into(),
+            commit: "b".repeat(40),
+            merge_base: None,
+            source: BaseSource::Picked,
+        });
+        p.set_cursor(3, &p.rows(&s));
+        let before = p.rows(&s)[p.cursor].submit();
+        p.observe(&s);
+        s.base.as_mut().unwrap().requested = "refs/heads/maint-2.1".into();
+        p.observe(&s);
+        assert_eq!(
+            p.rows(&s)[p.cursor].submit(),
+            before,
+            "a base change preserves the selected ref"
+        );
+
+        p.set_cursor(1, &p.rows(&s));
+        s.mark.as_mut().unwrap().commit = "b".repeat(40);
+        p.observe(&s);
+        assert_eq!(
+            p.cursor,
+            p.rows(&s).len() - 1,
+            "a replaced mark clamps to the last row"
+        );
+        let last = p.rows(&s)[p.cursor].submit();
+        s.mark = None;
+        p.observe(&s);
+        assert_eq!(
+            p.rows(&s)[p.cursor].submit(),
+            last,
+            "reconciliation also updates the identity"
+        );
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn ages_use_coarse_units_and_saturate_future_timestamps() {
+        let now = now();
+        for (seconds, expected) in [
+            (0, "just now"),
+            (60, "1 min ago"),
+            (59 * 60, "59 min ago"),
+            (3_600, "1 h ago"),
+            (7_200, "2 h ago"),
+            (86_400, "1 d ago"),
+            (3 * 86_400, "3 d ago"),
+        ] {
+            assert_eq!(age(now - seconds), expected);
+        }
+        assert_eq!(age(now + 60), "just now");
+        assert_eq!(age(u64::MAX), "just now");
+    }
+
+    #[test]
+    fn typing_a_quick_rows_label_submits_that_base() {
+        use crate::engine::{Mark, MarkState, QuickBase};
+        let mut s = snap(&REFS, None);
+        s.quick = Some(std::sync::Arc::new(vec![QuickBase {
+            label: "last commit".into(),
+            detail: "9ffc8fd".into(),
+            submits: "HEAD~1".into(),
+        }]));
+        s.mark = Some(Mark {
+            commit: "a".repeat(40),
+            at: now(),
+            state: MarkState::Current,
+            classified_at: None,
+        });
+        let mut p = Picker::open(1);
+        p.input = "last commit".into();
+        p.retarget(&s);
+        assert_eq!(p.rows(&s)[p.cursor].submit().as_deref(), Some("HEAD~1"));
+        assert!(
+            !labels(&p.rows(&s)).iter().any(|l| l.starts_with("use ")),
+            "an exact quick label leaves no typed row to pick by mistake"
+        );
+        p.input = "reviewed".into();
+        p.retarget(&s);
+        assert_eq!(
+            p.rows(&s)[p.cursor].submit().as_deref(),
+            Some("a".repeat(40).as_str())
+        );
+
+        // With no mark there is no reviewed row, so the typed row must still be offered.
+        s.mark = None;
+        p.retarget(&s);
+        assert!(
+            labels(&p.rows(&s)).iter().any(|l| l == "use \"reviewed\""),
+            "{:?}",
+            labels(&p.rows(&s))
+        );
     }
 }

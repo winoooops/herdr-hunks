@@ -90,6 +90,21 @@ impl Isolated {
             .unwrap_or_else(|error| panic!("host {args:?} returned invalid JSON: {error}"))
     }
 
+    /// `pane read` prints the pane's own text, not a JSON envelope.
+    fn herdr_text(&self, args: &[&str]) -> String {
+        let out = self
+            .host_command()
+            .args(args)
+            .output()
+            .expect("run isolated host");
+        assert!(
+            out.status.success(),
+            "host {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
     fn viewers(&self) -> Vec<Value> {
         self.herdr(&["pane", "list"])["result"]["panes"]
             .as_array()
@@ -285,6 +300,72 @@ fn open_split_creates_one_viewer_and_reuses_it() {
             "--timeout",
             "15000",
         ]);
+        // Wait for the loaded body before marking its commit.
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "@@",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        iso.herdr(&["pane", "send-text", viewer_id, "M"]);
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "as reviewed",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        // Pin the files panel even in a narrow split pane.
+        wait_for("the files panel is shown", || {
+            let screen = iso.herdr_text(&["pane", "read", viewer_id, "--source", "visible"]);
+            if screen.contains("CHANGED ") {
+                return true;
+            }
+            iso.herdr(&["pane", "send-text", viewer_id, "E"]);
+            false
+        });
+
+        // Commit to the selected file so its marker and new diff both appear.
+        std::fs::write(repo.join("c.txt"), "c\nAFTER-THE-MARK\n").unwrap();
+        git(&["add", "c.txt"]);
+        git(&["commit", "-q", "-m", "later"]);
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "●",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        // Wait for the new commit's body before marking again.
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "AFTER-THE-MARK",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        iso.herdr(&["pane", "send-text", viewer_id, "M"]);
+        wait_for("the marker clears", || {
+            let screen = iso.herdr_text(&["pane", "read", viewer_id, "--source", "visible"]);
+            !screen.contains('●')
+        });
         assert_eq!(
             viewer["cwd"].as_str().map(PathBuf::from),
             Some(std::fs::canonicalize(&repo).unwrap())

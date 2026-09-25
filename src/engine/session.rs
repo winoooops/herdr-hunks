@@ -7,14 +7,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Semaphore;
 
-use super::base::{self, ResolveInputs};
+use super::base::{self, MarkRecord, ResolveInputs};
 use super::{
-    branch, gitver, Base, BaseSource, Command, Comparison, DiffState, FileKey, LoadedDiff,
-    RepoState, Scope, Snapshot, NO_BASE_NOTICE,
+    branch, gitver, marks, Base, BaseSource, Command, Comparison, DiffState, FileKey, LoadedDiff,
+    Mark, MarkState, QuickBase, RepoState, Scope, Snapshot, NO_BASE_NOTICE,
 };
 use crate::git::{self, ChangedFile, GetGitDiffResponse, GitStatusResponse};
 use crate::runtime::EventSink;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub type BoxFut<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
@@ -49,6 +49,8 @@ pub struct EngineHandle {
     pub refs_answered: Arc<AtomicUsize>,
     /// Test hook: diff results discarded for a stale generation or comparison.
     pub diffs_discarded: Arc<AtomicUsize>,
+    /// Test hook: opening head samples taken by diff tasks.
+    pub head_samples: Arc<AtomicUsize>,
 }
 
 struct FrozenWatcher {
@@ -121,6 +123,7 @@ enum WatcherPhase {
 enum Change {
     Scope(Scope),
     Base(Option<String>),
+    Mark(String),
 }
 
 /// How the refresh obtains the base: keep and re-verify, run the resolution steps, or verify a pick
@@ -140,19 +143,28 @@ struct Job {
     base: BaseJob,
     inputs: ResolveInputs,
     default_base: Option<String>,
+    previous_mark: Option<Mark>,
+    previous_unread: Option<(String, BTreeSet<String>)>,
     change: Option<Change>,
 }
+
+type Marked = (Mark, BTreeSet<String>, Result<(), String>, Option<String>);
 
 /// What a refresh loaded, published only as a whole.
 struct Loaded {
     scope: Scope,
     base: Option<Base>,
     default_base: Option<String>,
+    mark: Option<Mark>,
+    unread: BTreeSet<String>,
+    unread_at: Option<String>,
     base_error: Option<String>,
     files: Vec<ChangedFile>,
     rename_sources: BTreeMap<String, String>,
     /// `Some` after a pick or reset: whether `bases.json` took it.
     persisted: Option<Result<(), String>>,
+    /// The mark answered by this refresh and whether it was remembered.
+    marked: Option<Marked>,
 }
 
 struct State {
@@ -171,10 +183,19 @@ struct State {
     /// The scope the next refresh loads; equals the published scope except before the first rows.
     requested_scope: Scope,
     inputs: ResolveInputs,
+    session_mark: Option<MarkRecord>,
+    unread_at: Option<String>,
     /// Run the resolution steps in the next refresh (start, `r`, and after a pick).
     resolve_pending: bool,
     changes: VecDeque<Change>,
+    /// The mark a refresh is carrying right now, so key repeat cannot queue it again.
+    in_flight_mark: Option<String>,
+    /// The commit the published row list was loaded at; `None` before the first rows.
+    rows_at: Option<String>,
+    /// The refresh in flight was asked to run the resolution steps.
+    in_flight_resolve: bool,
     pick_seq: u64,
+    mark_seq: u64,
 }
 
 fn comparison_of(snapshot: &Snapshot) -> Comparison {
@@ -192,25 +213,61 @@ fn comparison_of(snapshot: &Snapshot) -> Comparison {
     }
 }
 
+/// The diff's commit, the confirmed commit for an empty list, or no loaded content.
+fn head_of(snapshot: &Snapshot, confirmed: Option<String>) -> Option<String> {
+    match &snapshot.diff {
+        DiffState::Ready(d) => d.read_at.clone(),
+        DiffState::Idle if snapshot.files.is_empty() => confirmed,
+        _ => None,
+    }
+}
+
+/// The commit this publication may be marked at.
+fn markable(
+    next: &Snapshot,
+    previous_head: Option<String>,
+    head_sampled: bool,
+    confirmed: Option<String>,
+    rows_at: Option<&str>,
+) -> Option<String> {
+    let id = if !head_sampled {
+        // A sample that could not run keeps the previous id for an empty list.
+        head_of(next, previous_head)
+    } else {
+        // A successful sample with no commit invalidates even a retained diff's id.
+        next.head_seen.as_ref()?;
+        head_of(next, confirmed)
+    };
+    // Both surfaces must answer for the same commit. A diff read after a commit the row list
+    // has not seen yet would otherwise let `M` acknowledge files that are not on screen, and
+    // they would arrive with no dot; a diff older than the rows cannot vouch for them either.
+    id.filter(|id| rows_at == Some(id.as_str()))
+}
+
 enum Done {
     GitCheck(Result<gitver::GitVersion, gitver::GitCheckError>),
     Watcher(Result<(), String>),
     Status {
         response: Result<GitStatusResponse, String>,
         head: Option<(Option<String>, Option<String>)>,
+        head_seen: Option<String>,
+        head_sampled: bool,
+        confirmed: Option<String>,
         /// `None` when the status failed or the directory is not a repository.
-        loaded: Option<Result<Loaded, String>>,
+        loaded: Option<Result<Box<Loaded>, String>>,
         change: Option<Change>,
     },
     Diff {
         generation: u64,
         key: FileKey,
         comparison: Comparison,
+        read_at: Option<String>,
         result: Result<GetGitDiffResponse, String>,
     },
     Refs {
         token: u64,
         result: Result<(Vec<String>, bool), String>,
+        quick: Vec<QuickBase>,
     },
 }
 
@@ -220,6 +277,7 @@ async fn load_rows(
     job: &Job,
     status: &GitStatusResponse,
     head: Option<&(Option<String>, Option<String>)>,
+    head_id: Option<&str>,
 ) -> Result<Loaded, String> {
     let toplevel = status.repo_root.as_str();
     let branch_changed = matches!(head, Some((Some(b), _)) if Some(b) != job.known_branch.as_ref());
@@ -264,7 +322,8 @@ async fn load_rows(
             if matches!(job.base, BaseJob::Keep(_)) {
                 b.commit = base::verify(toplevel, &b.requested).await?;
             }
-            b.merge_base = Some(base::merge_base(toplevel, &b.commit).await?);
+            let head = head_id.ok_or_else(|| "no commit yet".to_string())?;
+            b.merge_base = Some(base::merge_base_of(toplevel, head, &b.commit).await?);
         }
     }
     let scope = if base.is_some() {
@@ -297,18 +356,117 @@ async fn load_rows(
         (BaseJob::Pick(_), None) => Some(Err("no state directory".to_string())),
         _ => None,
     };
+    let marked = match &job.change {
+        Some(Change::Mark(commit)) => {
+            let id = base::verify(toplevel, commit).await.map_err(|_| {
+                format!(
+                    "not a commit: {}",
+                    commit.chars().take(7).collect::<String>()
+                )
+            })?;
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let record = MarkRecord { commit: id, at };
+            let written = match &job.inputs.state_dir {
+                Some(dir) => base::save_mark(dir, toplevel, &record).map_err(|e| e.to_string()),
+                None => Err("no state directory".to_string()),
+            };
+            let (mark, set, read_at) = match head_id {
+                Some(head) if scope == Scope::Branch => {
+                    let (mark, set) = marks::classify(toplevel, &record, head, None, None).await;
+                    (mark, set, Some(head.to_string()))
+                }
+                _ => (
+                    Mark {
+                        commit: record.commit,
+                        at: record.at,
+                        state: MarkState::Current,
+                        classified_at: None,
+                    },
+                    BTreeSet::new(),
+                    None,
+                ),
+            };
+            Some((mark, set, written, read_at))
+        }
+        _ => None,
+    };
+    let (mark, unread, unread_at) = if let Some((mark, set, _, read_at)) = &marked {
+        (Some(mark.clone()), set.clone(), read_at.clone())
+    } else {
+        let mark_record = if matches!(job.base, BaseJob::Keep(_)) && !branch_changed {
+            job.previous_mark.as_ref().map(|mark| MarkRecord {
+                commit: mark.commit.clone(),
+                at: mark.at,
+            })
+        } else {
+            match (&job.inputs.session_mark, &job.inputs.state_dir) {
+                (Some(record), _) => Some(record.clone()),
+                (None, Some(dir)) => {
+                    let (marks, problem) = base::load_marks(dir);
+                    if let Some(problem) = problem {
+                        base::note_problem(dir, &problem);
+                    }
+                    marks.get(toplevel).cloned()
+                }
+                (None, None) => None,
+            }
+        };
+        match (&mark_record, head_id) {
+            (Some(record), Some(head)) if scope == Scope::Branch => {
+                let (mark, set) = marks::classify(
+                    toplevel,
+                    record,
+                    head,
+                    job.previous_mark.as_ref(),
+                    job.previous_unread
+                        .as_ref()
+                        .map(|(at, set)| (at.as_str(), set)),
+                )
+                .await;
+                (Some(mark), set, Some(head.to_string()))
+            }
+            (Some(record), _) => (
+                Some(Mark {
+                    commit: record.commit.clone(),
+                    at: record.at,
+                    state: job
+                        .previous_mark
+                        .as_ref()
+                        .filter(|p| p.commit == record.commit)
+                        .map(|p| p.state.clone())
+                        .unwrap_or(MarkState::Current),
+                    classified_at: job
+                        .previous_mark
+                        .as_ref()
+                        .filter(|p| p.commit == record.commit)
+                        .and_then(|p| p.classified_at.clone()),
+                }),
+                BTreeSet::new(),
+                None,
+            ),
+            (None, _) => (None, BTreeSet::new(), None),
+        }
+    };
     Ok(Loaded {
         scope,
         base,
         default_base,
+        mark,
+        unread,
+        unread_at,
         base_error,
         files,
         rename_sources,
         persisted,
+        marked,
     })
 }
 
 async fn run_job(job: Job) -> Done {
+    let sampled = base::read_head(&job.cwd).await;
     let response = git::git_status_inner(job.cwd.clone()).await;
     let head = if job.with_head {
         let (branch, worktree) = tokio::join!(
@@ -319,15 +477,29 @@ async fn run_job(job: Job) -> Done {
     } else {
         None
     };
+    let sampled_head = match &sampled {
+        Ok(id) => id.clone(),
+        Err(_) => None,
+    };
     let loaded = match &response {
-        Ok(status) if !status.repo_root.is_empty() => {
-            Some(load_rows(&job, status, head.as_ref()).await)
-        }
+        Ok(status) if !status.repo_root.is_empty() => Some(
+            load_rows(&job, status, head.as_ref(), sampled_head.as_deref())
+                .await
+                .map(Box::new),
+        ),
+        _ => None,
+    };
+    // Only agreeing samples can make an empty list markable.
+    let confirmed = match (&sampled, base::read_head(&job.cwd).await) {
+        (Ok(first), Ok(second)) if *first == second => first.clone(),
         _ => None,
     };
     Done::Status {
         response,
         head,
+        head_seen: sampled_head,
+        head_sampled: sampled.is_ok(),
+        confirmed,
         loaded,
         change: job.change,
     }
@@ -350,25 +522,42 @@ impl State {
         self.status_in_flight = true;
         refreshes.fetch_add(1, Ordering::SeqCst);
         let change = self.changes.pop_front();
+        if let Some(Change::Mark(commit)) = &change {
+            self.in_flight_mark = Some(commit.clone());
+        }
         let scope = match &change {
             Some(Change::Scope(scope)) => *scope,
             Some(Change::Base(_)) => Scope::Branch,
-            None => self.requested_scope,
+            Some(Change::Mark(_)) | None => self.requested_scope,
         };
         // Explicit changes resolve preferences; polls only re-verify ids.
         let base = match (&change, std::mem::take(&mut self.resolve_pending)) {
             (Some(Change::Base(pick)), _) => BaseJob::Pick(pick.clone()),
-            (Some(Change::Scope(_)), _) | (None, true) => BaseJob::Resolve,
-            (None, false) => BaseJob::Keep(self.snapshot.base.clone()),
+            // A mark changes no comparison, but it must not swallow a resolution `r` asked for.
+            (Some(Change::Scope(_)), _) | (Some(Change::Mark(_)), true) | (None, true) => {
+                BaseJob::Resolve
+            }
+            (Some(Change::Mark(_)), false) | (None, false) => {
+                BaseJob::Keep(self.snapshot.base.clone())
+            }
         };
+        self.in_flight_resolve = matches!(base, BaseJob::Resolve);
         let job = Job {
             cwd: cwd.to_string(),
             with_head,
             known_branch: self.branch.clone(),
             scope,
             base,
-            inputs: self.inputs.clone(),
+            inputs: ResolveInputs {
+                session_mark: self.session_mark.clone(),
+                ..self.inputs.clone()
+            },
             default_base: self.snapshot.default_base.clone(),
+            previous_mark: self.snapshot.mark.clone(),
+            previous_unread: self
+                .unread_at
+                .clone()
+                .map(|at| (at, (*self.snapshot.unread).clone())),
             change,
         };
         let results = results.clone();
@@ -384,6 +573,7 @@ impl State {
         delay: Option<Duration>,
         gate: Option<Arc<Semaphore>>,
         results: &UnboundedSender<Done>,
+        head_samples: &Arc<AtomicUsize>,
     ) {
         let comparison = comparison_of(&self.snapshot);
         if matches!(&self.diff_in_flight, Some((_, pending, under)) if pending == &key && under == &comparison)
@@ -402,7 +592,11 @@ impl State {
         let old = self.snapshot.rename_sources.get(&key.path).cloned();
         let cwd = cwd.to_string();
         let results = results.clone();
+        let head_samples = head_samples.clone();
         tokio::spawn(async move {
+            // Open the bracket before any delay or gate.
+            let before = base::read_head(&toplevel).await;
+            head_samples.fetch_add(1, Ordering::SeqCst);
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
@@ -419,10 +613,20 @@ impl State {
                         .await
                 }
             };
+            // Equal endpoints, not a proof of stillness: HEAD could have gone A -> B -> A
+            // within this read. The bracket is kept as is because that window errs the safe
+            // way -- the id is then older than the content, and a mark that is too old only
+            // shows dots for changes the reader has already seen. The dangerous direction,
+            // an id newer than the content, is what the samples do rule out.
+            let read_at = match (before, base::read_head(&toplevel).await) {
+                (Ok(Some(a)), Ok(Some(b))) if a == b => Some(a),
+                _ => None,
+            };
             let _ = results.send(Done::Diff {
                 generation,
                 key,
                 comparison,
+                read_at,
                 result,
             });
         });
@@ -437,7 +641,7 @@ fn fingerprint(s: &Snapshot) -> String {
         DiffState::Ready(d) => format!("ready:{:p}", Arc::as_ptr(d)),
     };
     format!(
-        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}",
+        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}",
         s.repo,
         serde_json::to_string(&s.files).unwrap_or_default(),
         s.selected,
@@ -445,6 +649,8 @@ fn fingerprint(s: &Snapshot) -> String {
         s.status_error,
         s.watcher_error,
         s.refreshing,
+        s.head,
+        s.head_seen,
         s.scope,
         s.base,
         s.base_error,
@@ -454,7 +660,12 @@ fn fingerprint(s: &Snapshot) -> String {
         s.refs_overflow,
         s.refs_seq,
         s.pick_seq,
-        s.pick_error
+        s.pick_error,
+        s.mark,
+        s.mark_seq,
+        s.mark_error,
+        s.unread,
+        s.quick.as_ref().map(Arc::as_ptr)
     )
 }
 
@@ -548,6 +759,7 @@ async fn run(
     refreshes: Arc<AtomicUsize>,
     refs_answered: Arc<AtomicUsize>,
     diffs_discarded: Arc<AtomicUsize>,
+    head_samples: Arc<AtomicUsize>,
 ) {
     let mut state = State {
         snapshot: Snapshot::empty(&config.path.to_string_lossy()),
@@ -565,12 +777,19 @@ async fn run(
         requested_scope: config.scope,
         inputs: ResolveInputs {
             session_pick: None,
+            session_mark: None,
             config: config.base_ref.clone(),
             state_dir: config.state_dir.clone(),
         },
+        session_mark: None,
+        unread_at: None,
         resolve_pending: true,
         changes: VecDeque::new(),
+        in_flight_mark: None,
+        rows_at: None,
+        in_flight_resolve: false,
         pick_seq: 0,
+        mark_seq: 0,
     };
     let path = match config.path.canonicalize() {
         Ok(path) if path.is_dir() => path,
@@ -659,6 +878,32 @@ async fn run(
                         publish(&mut state, next, &snapshots);
                         state.request_status(&cwd, false, &results_tx, &refreshes);
                     }
+                    Command::MarkReviewed(commit) => {
+                        // Key repeat must not queue the same commit twice: each queued change
+                        // costs a refresh and a write, and the second would answer nothing new.
+                        // Only the latest pending mark counts -- one queued behind another
+                        // commit is the user changing their mind back, not a repeat -- and a
+                        // deliberate retry still lands, because the answer that prompts it
+                        // clears the in-flight mark first. A press dropped here never reaches
+                        // the queue and so owes no answer; every mark that does reach it still
+                        // advances `mark_seq` exactly once.
+                        let latest_pending = state
+                            .changes
+                            .iter()
+                            .rev()
+                            .find_map(|change| match change {
+                                Change::Mark(queued) => Some(queued.as_str()),
+                                _ => None,
+                            })
+                            .or(state.in_flight_mark.as_deref());
+                        if latest_pending != Some(commit.as_str()) {
+                            state.changes.push_back(Change::Mark(commit));
+                            let mut next = state.snapshot.clone();
+                            next.refreshing = true;
+                            publish(&mut state, next, &snapshots);
+                            state.request_status(&cwd, false, &results_tx, &refreshes);
+                        }
+                    }
                     Command::LoadRefs(token) => {
                         let toplevel = match &state.snapshot.repo {
                             RepoState::Repo { toplevel, .. } => Some(toplevel.clone()),
@@ -666,11 +911,14 @@ async fn run(
                         };
                         let results = results_tx.clone();
                         tokio::spawn(async move {
-                            let result = match toplevel {
-                                Some(toplevel) => base::list_refs(&toplevel).await,
-                                None => Ok((Vec::new(), false)),
+                            let (result, quick) = match toplevel {
+                                Some(toplevel) => (
+                                    base::list_refs(&toplevel).await,
+                                    base::quick_bases(&toplevel).await,
+                                ),
+                                None => (Ok((Vec::new(), false)), Vec::new()),
                             };
-                            let _ = results.send(Done::Refs { token, result });
+                            let _ = results.send(Done::Refs { token, result, quick });
                         });
                     }
                     selection => {
@@ -690,8 +938,9 @@ async fn run(
                             let mut next = state.snapshot.clone();
                             next.selected = Some(key.clone());
                             next.diff = DiffState::Loading;
+                            next.head = None;
                             publish(&mut state, next, &snapshots);
-                            state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx);
+                            state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx, &head_samples);
                         }
                     }
                 }
@@ -740,10 +989,11 @@ async fn run(
                         }
                         publish(&mut state, next, &snapshots);
                     }
-                    Done::Refs { token, result } => {
+                    Done::Refs { token, result, quick } => {
                         if token > next.refs_seq {
                             let (refs, overflow) = result.unwrap_or_default();
                             next.refs = Some(Arc::new(refs));
+                            next.quick = Some(Arc::new(quick));
                             next.refs_overflow = overflow;
                             next.refs_seq = token;
                             publish(&mut state, next, &snapshots);
@@ -755,13 +1005,23 @@ async fn run(
                         next.watcher_error = result.err();
                         publish(&mut state, next, &snapshots);
                     }
-                    Done::Status { response, head, loaded, change } => {
+                    Done::Status { response, head, head_seen, head_sampled, confirmed, loaded, change } => {
                         state.status_in_flight = false;
+                        state.in_flight_mark = None;
+                        // The rows may only claim a commit the refresh bracketed: the opening
+                        // sample alone would let rows loaded across a move name a commit whose
+                        // files they never listed.
+                        let head_seen_for_rows = confirmed.clone();
                         let before = comparison_of(&state.snapshot);
                         let mut succeeded = false;
                         let mut change_error = None;
+                        let mut mark_answer = None;
+                        let mut mark_answered = false;
                         match response {
                             Err(e) => {
+                                if matches!(change, Some(Change::Mark(_))) {
+                                    mark_answer = Some(e.clone());
+                                }
                                 change_error = Some(e.clone());
                                 next.status_error = Some(e);
                             }
@@ -783,24 +1043,32 @@ async fn run(
                                     None if matches!(change, Some(Change::Base(_))) => {
                                         change_error = Some("not a git repository".into());
                                     }
+                                    None if matches!(change, Some(Change::Mark(_))) => {
+                                        mark_answer = Some("not a git repository".into());
+                                    }
                                     Some(Err(e)) => match &change {
                                         // Failed picks and switches report notices; refresh errors keep the rows.
                                         Some(Change::Base(_)) => change_error = Some(e),
+                                        Some(Change::Mark(_)) => mark_answer = Some(e),
                                         Some(Change::Scope(_)) => next.base_error = Some(e),
                                         None => next.status_error = Some(e),
                                     },
                                     other => {
                                         next.status_error = None;
                                         let loaded = match other {
-                                            Some(Ok(loaded)) => loaded,
+                                            Some(Ok(loaded)) => *loaded,
                                             _ => Loaded {
                                                 scope: Scope::Worktree,
                                                 base: None,
                                                 default_base: None,
+                                                mark: None,
+                                                unread: BTreeSet::new(),
+                                                unread_at: None,
                                                 base_error: None,
                                                 files: response.files,
                                                 rename_sources: BTreeMap::new(),
                                                 persisted: None,
+                                                marked: None,
                                             },
                                         };
                                         let switched = loaded.scope != next.scope;
@@ -813,6 +1081,9 @@ async fn run(
                                         next.default_base = loaded.default_base;
                                         next.files = loaded.files;
                                         next.rename_sources = Arc::new(loaded.rename_sources);
+                                        next.mark = loaded.mark;
+                                        next.unread = Arc::new(loaded.unread);
+                                        state.unread_at = loaded.unread_at;
                                         next.selected = if switched {
                                             // The path survives a scope switch; the unstaged row wins when both exist.
                                             previous.as_ref().and_then(|key| {
@@ -833,10 +1104,52 @@ async fn run(
                                                 None => {}
                                             }
                                         }
+                                        if let Some((mark, set, written, read_at)) = loaded.marked {
+                                            mark_answered = true;
+                                            state.mark_seq += 1;
+                                            next.mark_seq = state.mark_seq;
+                                            next.mark = Some(mark.clone());
+                                            next.unread = Arc::new(set);
+                                            state.unread_at = read_at;
+                                            match written {
+                                                Ok(()) => {
+                                                    state.session_mark = None;
+                                                    next.mark_error = None;
+                                                }
+                                                Err(e) => {
+                                                    state.session_mark = Some(MarkRecord {
+                                                        commit: mark.commit,
+                                                        at: mark.at,
+                                                    });
+                                                    next.mark_error = Some(format!("mark not remembered: {e}"));
+                                                }
+                                            }
+                                        }
+                                        state.rows_at = head_seen_for_rows.clone();
                                         succeeded = true;
                                     }
                                 }
                             }
+                        }
+                        if matches!(change, Some(Change::Mark(_))) && !mark_answered {
+                            state.mark_seq += 1;
+                            next.mark_seq = state.mark_seq;
+                            next.mark_error = mark_answer.or_else(|| Some("no answer".into()));
+                        }
+                        // A refresh asked to resolve that delivered no rows puts the request
+                        // back: an explicit `r` must not be lost to a failed status or to a mark
+                        // whose id would not verify.
+                        if !succeeded && state.in_flight_resolve {
+                            state.resolve_pending = true;
+                        }
+                        state.in_flight_resolve = false;
+                        if head_sampled {
+                            // Published even when the load failed: this is the observation, not
+                            // a claim about the rows. A failed refresh keeps the previous rows,
+                            // mark and dots, so `head_seen` can name a newer commit than the set
+                            // describes; every consumer gates on a matching id instead
+                            // (`classified_at` for the warning, `unread_at` for the cache).
+                            next.head_seen = head_seen;
                         }
                         state.requested_scope = next.scope;
                         let comparison = comparison_of(&next);
@@ -849,6 +1162,14 @@ async fn run(
                         if succeeded && !same {
                             next.diff = if next.selected.is_some() { DiffState::Loading } else { DiffState::Idle };
                         }
+                        let previous_head = next.head.clone();
+                        next.head = markable(
+                            &next,
+                            previous_head,
+                            head_sampled,
+                            confirmed.filter(|_| succeeded),
+                            state.rows_at.as_deref(),
+                        );
                         if matches!(change, Some(Change::Base(_))) {
                             state.pick_seq += 1;
                             next.pick_seq = state.pick_seq;
@@ -860,7 +1181,7 @@ async fn run(
                         }
                         publish(&mut state, next, &snapshots);
                         if let Some(key) = selected {
-                            state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx);
+                            state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx, &head_samples);
                         }
                         if state.status_dirty || !state.changes.is_empty() {
                             state.status_dirty = false;
@@ -868,7 +1189,7 @@ async fn run(
                             state.request_status(&cwd, with_head, &results_tx, &refreshes);
                         }
                     }
-                    Done::Diff { generation, key, comparison, result } => {
+                    Done::Diff { generation, key, comparison, read_at, result } => {
                         if generation != state.diff_generation || comparison != comparison_of(&state.snapshot) {
                             diffs_discarded.fetch_add(1, Ordering::SeqCst);
                             continue;
@@ -877,12 +1198,18 @@ async fn run(
                         if Some(&key) == next.selected.as_ref() {
                             match result {
                                 Ok(response) => {
-                                    let unchanged = matches!(&next.diff, DiffState::Ready(d) if d.key == key && d.comparison == comparison && d.raw_diff == response.raw_diff);
+                                    let unchanged = matches!(&next.diff, DiffState::Ready(d) if d.key == key && d.comparison == comparison && d.raw_diff == response.raw_diff && d.read_at == read_at);
                                     if !unchanged {
-                                        next.diff = DiffState::Ready(Arc::new(LoadedDiff::build(key, comparison, response)));
+                                        next.diff = DiffState::Ready(Arc::new(LoadedDiff::build(key, comparison, read_at.clone(), response)));
                                     }
+                                    // Only when the rows on screen came from this commit too.
+                                    next.head =
+                                        read_at.filter(|id| state.rows_at.as_deref() == Some(id.as_str()));
                                 }
-                                Err(e) => next.diff = DiffState::Failed(e),
+                                Err(e) => {
+                                    next.diff = DiffState::Failed(e);
+                                    next.head = None;
+                                }
                             }
                             if !state.status_in_flight && !state.diff_dirty {
                                 next.refreshing = false;
@@ -891,7 +1218,7 @@ async fn run(
                         }
                         if std::mem::take(&mut state.diff_dirty) {
                             if let Some(key) = state.snapshot.selected.clone() {
-                                state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx);
+                                state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx, &head_samples);
                             }
                         }
                     }
@@ -909,6 +1236,7 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
     let refreshes = Arc::new(AtomicUsize::new(0));
     let refs_answered = Arc::new(AtomicUsize::new(0));
     let diffs_discarded = Arc::new(AtomicUsize::new(0));
+    let head_samples = Arc::new(AtomicUsize::new(0));
     runtime.spawn(run(
         config,
         commands_rx,
@@ -916,6 +1244,7 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
         refreshes.clone(),
         refs_answered.clone(),
         diffs_discarded.clone(),
+        head_samples.clone(),
     ));
     EngineHandle {
         commands,
@@ -923,6 +1252,7 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
         refreshes,
         refs_answered,
         diffs_discarded,
+        head_samples,
     }
 }
 
@@ -935,17 +1265,27 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    /// The engine polls this repository while the test mutates it, and both take `index.lock`.
+    /// That one failure is retried; anything else fails the test with git's own message.
     fn git(dir: &std::path::Path, args: &[&str]) {
-        assert!(
-            Proc::new("git")
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let out = Proc::new("git")
                 .arg("-C")
                 .arg(dir)
                 .args(args)
-                .status()
-                .unwrap()
-                .success(),
-            "git {args:?}"
-        );
+                .output()
+                .unwrap();
+            if out.status.success() {
+                return;
+            }
+            let err = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(
+                err.contains("index.lock") && Instant::now() < deadline,
+                "git {args:?}: {err}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn fixture() -> tempfile::TempDir {
@@ -1977,7 +2317,23 @@ mod tests {
     #[test]
     fn queued_base_picks_each_receive_an_answer_in_order() {
         let dir = branch_fixture();
-        let (_rt, h) = start_with(dir.path(), Scope::Worktree, None, None);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = spawn(
+            rt.handle(),
+            SessionConfig {
+                // Only the queued commands should contribute to the busy flag.
+                poll_interval: Duration::from_secs(60),
+                watcher: Arc::new(FlakyWatcher {
+                    allow: Arc::new(AtomicBool::new(true)),
+                }),
+                git_check: ok_git(),
+                ..SessionConfig::production(dir.path().to_path_buf())
+            },
+        );
         wait_for(&h, "first", |s| ready(s).is_some());
         let picks = ["missing-one", "missing-two", "missing-three"];
         for pick in picks {
@@ -2163,6 +2519,12 @@ mod tests {
         );
         assert!(!s.refs_overflow);
         assert_eq!(s.refs_seq, 1);
+        assert!(s
+            .quick
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|q| q.submits == "HEAD~1"));
         h.commands.send(Command::LoadRefs(2)).unwrap();
         wait_for(&h, "second answer", |s| s.refs_seq == 2);
 
@@ -2206,6 +2568,10 @@ mod tests {
         assert!(Arc::ptr_eq(
             latest.refs.as_ref().unwrap(),
             newest.refs.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            latest.quick.as_ref().unwrap(),
+            newest.quick.as_ref().unwrap()
         ));
     }
 
@@ -2271,5 +2637,776 @@ mod tests {
         assert_eq!(s.scope, Scope::Worktree);
         assert!(s.base.is_none() && s.files.is_empty() && s.selected.is_none());
         assert!(matches!(s.repo, RepoState::NotARepo { .. }));
+    }
+
+    #[test]
+    fn a_snapshot_carries_the_head_its_content_was_read_at() {
+        let dir = branch_fixture();
+        let (_rt, h) = start_with(dir.path(), Scope::Branch, None, None);
+        let s = wait_for(&h, "first branch diff", |s| ready(s).is_some());
+        let head = git_out(dir.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        assert_eq!(s.head_seen.as_deref(), Some(head.as_str()));
+        assert_eq!(s.head.as_deref(), Some(head.as_str()));
+        assert_eq!(ready(&s).unwrap().read_at.as_deref(), Some(head.as_str()));
+
+        // A snapshot whose diff is not loaded carries no markable id.
+        h.commands.send(Command::SelectNext).unwrap();
+        let loading = wait_for(&h, "loading", |s| matches!(s.diff, DiffState::Loading));
+        assert_eq!(loading.head, None);
+        assert_eq!(loading.head_seen.as_deref(), Some(head.as_str()));
+        wait_for(&h, "loaded again", |s| ready(s).is_some());
+    }
+
+    #[test]
+    fn an_empty_list_is_markable_and_an_unborn_branch_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        git(p, &["config", "user.email", "t@example.com"]);
+        git(p, &["config", "user.name", "t"]);
+        std::fs::write(p.join("a.txt"), "a\n").unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-q", "-m", "init"]);
+        let (_rt, h) = start_with(p, Scope::Worktree, None, None);
+        let head = git_out(p, &["rev-parse", "HEAD"]).trim().to_string();
+        let s = wait_for(&h, "clean tree", |s| {
+            matches!(s.repo, RepoState::Repo { .. }) && s.files.is_empty()
+        });
+        assert_eq!(
+            s.head.as_deref(),
+            Some(head.as_str()),
+            "an empty list is markable"
+        );
+
+        // An unborn branch clears both ids.
+        git(p, &["checkout", "-q", "--orphan", "fresh"]);
+        git(p, &["rm", "-q", "--cached", "a.txt"]);
+        std::fs::remove_file(p.join("a.txt")).unwrap();
+        h.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&h, "unborn", |s| s.head_seen.is_none());
+        assert_eq!(s.head, None);
+    }
+
+    #[test]
+    fn an_unborn_branch_is_unmarkable_with_a_diff_still_on_screen() {
+        let dir = branch_fixture();
+        let (_rt, h) = start_with(dir.path(), Scope::Branch, None, None);
+        let s = wait_for(&h, "first branch diff", |s| ready(s).is_some());
+        assert!(s.head.is_some());
+
+        // Branch scope's row load fails without a commit, so the rows and the diff stay on
+        // screen -- and the id that diff was read at belongs to the branch that was left.
+        git(dir.path(), &["checkout", "-q", "--orphan", "fresh"]);
+        h.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&h, "unborn", |s| s.head_seen.is_none());
+        assert!(ready(&s).is_some(), "the previous diff is still drawn");
+        assert_eq!(s.head, None, "and it no longer vouches for an id");
+    }
+
+    #[test]
+    fn a_diff_that_spans_a_head_move_reports_no_id() {
+        let dir = branch_fixture();
+        // Block the first diff after its opening sample.
+        let gate = Arc::new(Semaphore::new(0));
+        let (_rt, h) = start_with(dir.path(), Scope::Branch, None, Some(gate.clone()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.head_samples.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "no diff task reached its first sample"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::write(dir.path().join("late.txt"), "late\n").unwrap();
+        git(dir.path(), &["add", "late.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "late"]);
+        gate.add_permits(4);
+        let seen = wait_for(
+            &h,
+            "a diff with no id",
+            |s| matches!(&s.diff, DiffState::Ready(d) if d.read_at.is_none()),
+        );
+        assert_eq!(
+            seen.head, None,
+            "a snapshot whose diff spanned a move is unmarkable"
+        );
+        // Once the tree settles, a later diff brackets cleanly and the id comes back.
+        gate.add_permits(8);
+        let settled = wait_for(
+            &h,
+            "a clean bracket",
+            |s| matches!(&s.diff, DiffState::Ready(d) if d.read_at.is_some()),
+        );
+        assert!(settled.head.is_some());
+    }
+
+    #[test]
+    fn a_sample_that_could_not_run_keeps_the_previous_id() {
+        let mut snap = Snapshot::empty("/r");
+        let previous = "a".repeat(40);
+        let confirmed = "b".repeat(40);
+        let rows = |id: &String| Some(id.clone());
+        // An empty list gets its id from the sample.
+        assert_eq!(
+            markable(
+                &snap,
+                Some(previous.clone()),
+                true,
+                Some(confirmed.clone()),
+                rows(&confirmed).as_deref()
+            ),
+            None,
+            "sampled, and there is no commit"
+        );
+        snap.head_seen = Some(confirmed.clone());
+        assert_eq!(
+            markable(
+                &snap,
+                Some(previous.clone()),
+                true,
+                Some(confirmed.clone()),
+                rows(&confirmed).as_deref()
+            ),
+            Some(confirmed.clone()),
+            "a confirmed sample is what the empty list is marked at"
+        );
+        assert_eq!(
+            markable(
+                &snap,
+                Some(previous.clone()),
+                true,
+                None,
+                rows(&confirmed).as_deref()
+            ),
+            None,
+            "sampled, but the two samples disagreed"
+        );
+        assert_eq!(
+            markable(
+                &snap,
+                Some(previous.clone()),
+                false,
+                None,
+                rows(&previous).as_deref()
+            ),
+            Some(previous.clone()),
+            "the sample could not run: 8.6 keeps the previous id"
+        );
+        // The rows must answer for the same commit as the content.
+        assert_eq!(
+            markable(
+                &snap,
+                Some(previous.clone()),
+                true,
+                Some(confirmed.clone()),
+                rows(&previous).as_deref()
+            ),
+            None,
+            "rows from another commit cannot vouch for this one"
+        );
+        assert_eq!(
+            markable(
+                &snap,
+                Some(previous.clone()),
+                true,
+                Some(confirmed.clone()),
+                None
+            ),
+            None,
+            "no rows yet, nothing to mark"
+        );
+        // A loading diff cannot vouch for an id.
+        snap.diff = DiffState::Loading;
+        assert_eq!(
+            markable(
+                &snap,
+                Some(previous.clone()),
+                false,
+                None,
+                rows(&previous).as_deref()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn marking_writes_the_record_and_answers_on_its_own_channel() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        let head = s.head.clone().expect("a markable id");
+
+        h.commands
+            .send(Command::MarkReviewed(head.clone()))
+            .unwrap();
+        let s = wait_for(&h, "answered", |s| s.mark_seq == 1);
+        assert!(s.mark_error.is_none());
+        assert_eq!(s.pick_seq, 0, "a mark is not a pick");
+        let mark = s.mark.clone().expect("the mark is published");
+        assert_eq!(mark.commit, head);
+        assert!(mark.at > 1_600_000_000, "a real timestamp");
+        assert_eq!(mark.state, crate::engine::MarkState::Current);
+        assert_eq!(
+            s.base.as_ref().map(|b| b.requested.as_str()),
+            Some("refs/heads/main"),
+            "the base is untouched"
+        );
+
+        let toplevel = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let (marks, _) = crate::engine::base::load_marks(state.path());
+        assert_eq!(
+            marks.get(&toplevel).map(|m| m.commit.clone()),
+            Some(head.clone())
+        );
+        assert!(
+            !state.path().join("bases.json").exists(),
+            "no base was written"
+        );
+
+        // A second mark replaces the record.
+        std::fs::write(dir.path().join("more.txt"), "more\n").unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-q", "-m", "more"]);
+        let s = wait_for(&h, "the new head is markable", |s| {
+            s.head.as_deref().is_some_and(|h| h != head)
+        });
+        let head2 = s.head.clone().unwrap();
+        h.commands
+            .send(Command::MarkReviewed(head2.clone()))
+            .unwrap();
+        let s = wait_for(&h, "second answer", |s| s.mark_seq == 2);
+        assert_eq!(
+            s.mark.as_ref().map(|m| m.commit.clone()),
+            Some(head2.clone())
+        );
+        let (marks, _) = crate::engine::base::load_marks(state.path());
+        assert_eq!(marks.get(&toplevel).map(|m| m.commit.clone()), Some(head2));
+    }
+
+    #[test]
+    fn a_repeated_mark_does_not_queue_twice() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        let head = s.head.clone().unwrap();
+        // Key repeat: the same commit arrives many times before the first is answered.
+        for _ in 0..5 {
+            h.commands
+                .send(Command::MarkReviewed(head.clone()))
+                .unwrap();
+        }
+        let s = wait_for(&h, "answered and settled", |s| {
+            s.mark_seq >= 1 && !s.refreshing
+        });
+        assert_eq!(s.mark_seq, 1, "consecutive identical marks are one request");
+        assert_eq!(s.mark.as_ref().map(|m| m.commit.clone()), Some(head));
+    }
+
+    #[test]
+    fn a_mark_queued_behind_another_commit_is_not_coalesced() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        let a = s.head.clone().unwrap();
+        let b = git_out(dir.path(), &["rev-parse", "HEAD~1"])
+            .trim()
+            .to_string();
+        // Changing one's mind and back: the last press must win, however the three land.
+        for commit in [&a, &b, &a] {
+            h.commands
+                .send(Command::MarkReviewed(commit.clone()))
+                .unwrap();
+        }
+        let s = wait_for(&h, "all three answered", |s| s.mark_seq == 3);
+        assert_eq!(
+            s.mark.as_ref().map(|m| m.commit.clone()),
+            Some(a.clone()),
+            "the final press decides the mark"
+        );
+        let (marks, _) = crate::engine::base::load_marks(state.path());
+        let toplevel = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(marks.get(&toplevel).map(|m| m.commit.clone()), Some(a));
+    }
+
+    #[test]
+    fn a_mark_does_not_swallow_a_pending_resolution() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        let a = s.head.clone().unwrap();
+        let b = git_out(dir.path(), &["rev-parse", "HEAD~1"])
+            .trim()
+            .to_string();
+        assert_eq!(
+            s.base.as_ref().map(|base| base.requested.clone()),
+            Some("refs/heads/main".to_string())
+        );
+
+        // Another viewer remembers a different base. `r` asks for the resolution steps; the
+        // mark queued behind it must not consume that request and leave the pick unread.
+        git(dir.path(), &["branch", "side", "HEAD~1"]);
+        let toplevel = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        base::save_pick(state.path(), &toplevel, Some("refs/heads/side")).unwrap();
+        h.commands.send(Command::MarkReviewed(a.clone())).unwrap();
+        h.commands.send(Command::Refresh).unwrap();
+        h.commands.send(Command::MarkReviewed(b)).unwrap();
+        let s = wait_for(&h, "the remembered pick is resolved", |s| {
+            s.base.as_ref().map(|base| base.requested.as_str()) == Some("refs/heads/side")
+        });
+        assert_eq!(s.mark_seq, 2, "both marks still answered");
+
+        // The same holds when the mark that carries the resolution cannot be verified. The
+        // first mark's refresh is in flight, so `r` only records the request, and the failing
+        // mark's refresh is the one that takes it: its rows never load, so the request must go
+        // back rather than be consumed with them.
+        git(dir.path(), &["branch", "later", "HEAD~1"]);
+        base::save_pick(state.path(), &toplevel, Some("refs/heads/later")).unwrap();
+        h.commands.send(Command::MarkReviewed(a)).unwrap();
+        h.commands.send(Command::Refresh).unwrap();
+        h.commands
+            .send(Command::MarkReviewed("b".repeat(40)))
+            .unwrap();
+        let s = wait_for(&h, "the failed mark did not eat the resolution", |s| {
+            s.base.as_ref().map(|base| base.requested.as_str()) == Some("refs/heads/later")
+                && s.mark_seq == 4
+        });
+        assert_eq!(s.mark_error.as_deref(), Some("not a commit: bbbbbbb"));
+    }
+
+    #[test]
+    fn a_mark_that_cannot_be_validated_or_written_says_so() {
+        let dir = branch_fixture();
+        let (_rt, h) = start_with(dir.path(), Scope::Branch, None, None);
+        wait_for(&h, "first", |s| ready(s).is_some());
+
+        // An id that is not a commit: answered, nothing written, previous mark untouched.
+        h.commands
+            .send(Command::MarkReviewed("b".repeat(40)))
+            .unwrap();
+        let s = wait_for(&h, "rejected", |s| s.mark_seq == 1);
+        assert_eq!(s.mark_error.as_deref(), Some("not a commit: bbbbbbb"));
+        assert!(s.mark.is_none());
+
+        // With no state directory the mark holds for the session and says so.
+        let head = s.head.clone().expect("a markable id");
+        h.commands
+            .send(Command::MarkReviewed(head.clone()))
+            .unwrap();
+        let s = wait_for(&h, "session mark", |s| s.mark_seq == 2);
+        assert_eq!(
+            s.mark.as_ref().map(|m| m.commit.clone()),
+            Some(head.clone())
+        );
+        assert!(
+            s.mark_error
+                .as_deref()
+                .unwrap()
+                .starts_with("mark not remembered: "),
+            "{:?}",
+            s.mark_error
+        );
+        assert_eq!(s.pick_seq, 0, "a mark never answers on the pick channel");
+        // It survives an ordinary refresh, like the session pick of 7.3.
+        let revision = s.revision;
+        h.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&h, "after refresh", |s| {
+            s.revision > revision && !s.refreshing
+        });
+        assert_eq!(
+            s.mark.as_ref().map(|m| m.commit.clone()),
+            Some(head.clone())
+        );
+
+        // Rejections preserve a previous mark and cannot panic on Unicode input.
+        for (index, invalid) in ["--output=x", "猫猫猫猫"].into_iter().enumerate() {
+            h.commands
+                .send(Command::MarkReviewed(invalid.into()))
+                .unwrap();
+            let s = wait_for(&h, "rejected replacement", |s| {
+                s.mark_seq == index as u64 + 3
+            });
+            assert_eq!(s.mark.as_ref().map(|m| &m.commit), Some(&head));
+            assert_eq!(s.pick_seq, 0);
+            assert_eq!(
+                s.mark_error,
+                Some(format!(
+                    "not a commit: {}",
+                    invalid.chars().take(7).collect::<String>()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn marks_are_reloaded_on_resolution_and_failed_writes_keep_the_session_mark() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let previous = MarkRecord {
+            commit: git_out(dir.path(), &["rev-parse", "HEAD~1"]).trim().into(),
+            at: 1,
+        };
+        let current = MarkRecord {
+            commit: git_out(dir.path(), &["rev-parse", "HEAD"]).trim().into(),
+            at: 2,
+        };
+        base::save_mark(state.path(), &top, &previous).unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Worktree,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "stored mark", |s| ready(s).is_some());
+        assert_eq!(s.mark.as_ref().map(|m| &m.commit), Some(&previous.commit));
+        assert_eq!(s.mark.as_ref().unwrap().classified_at, None);
+
+        base::save_mark(state.path(), &top, &current).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "polled edit\n").unwrap();
+        let s = wait_for(&h, "polled edit", |s| {
+            ready(s).is_some_and(|d| d.raw_diff.contains("polled edit"))
+        });
+        assert_eq!(s.mark.as_ref().map(|m| &m.commit), Some(&previous.commit));
+        h.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&h, "another viewer's mark", |s| {
+            s.mark.as_ref().is_some_and(|m| m.at == 2)
+        });
+        assert_eq!(s.mark.as_ref().map(|m| &m.commit), Some(&current.commit));
+        assert_eq!(s.mark_seq, 0);
+
+        base::save_mark(state.path(), &top, &previous).unwrap();
+        let lock = state.path().join("split-panes.lock");
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        h.commands
+            .send(Command::MarkReviewed(current.commit.clone()))
+            .unwrap();
+        let s = wait_for(&h, "failed save", |s| s.mark_seq == 1);
+        assert!(s
+            .mark_error
+            .as_deref()
+            .unwrap()
+            .starts_with("mark not remembered: "));
+        assert!(s.base_error.is_none());
+        assert_eq!(s.scope, Scope::Worktree);
+        assert_eq!(base::load_marks(state.path()).0.get(&top), Some(&previous));
+        let revision = s.revision;
+        h.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&h, "session override", |s| {
+            s.revision > revision && !s.refreshing
+        });
+        assert_eq!(s.mark.as_ref().map(|m| &m.commit), Some(&current.commit));
+
+        std::fs::remove_dir(&lock).unwrap();
+        h.commands
+            .send(Command::MarkReviewed(current.commit.clone()))
+            .unwrap();
+        let s = wait_for(&h, "save recovered", |s| s.mark_seq == 2);
+        assert!(s.mark_error.is_none());
+        base::save_mark(state.path(), &top, &previous).unwrap();
+        h.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&h, "override cleared", |s| {
+            s.mark.as_ref().is_some_and(|m| m.at == 1)
+        });
+        assert_eq!(s.mark.as_ref().map(|m| &m.commit), Some(&previous.commit));
+        assert_eq!((s.mark_seq, s.pick_seq), (2, 0));
+
+        std::fs::write(
+            state.path().join("marks.json"),
+            r#"{"/r/bad":{"commit":"--output=x","at":1}}"#,
+        )
+        .unwrap();
+        h.commands.send(Command::Refresh).unwrap();
+        wait_for(&h, "bad record absent", |s| s.mark.is_none());
+        assert!(
+            std::fs::read_to_string(state.path().join("config-problems.log"))
+                .unwrap()
+                .contains("marks.json: 1 unusable record(s)")
+        );
+    }
+
+    #[test]
+    fn queued_marks_answer_once_even_without_a_repository_or_a_successful_status() {
+        for broken_status in [false, true] {
+            let dir = if broken_status {
+                branch_fixture()
+            } else {
+                tempfile::tempdir().unwrap()
+            };
+            let (_rt, h) = start_with(dir.path(), Scope::Worktree, None, None);
+            wait_for(&h, "first", |s| {
+                if broken_status {
+                    ready(s).is_some()
+                } else {
+                    s.revision > 0
+                }
+            });
+            if broken_status {
+                std::fs::write(dir.path().join(".git/index"), "broken index").unwrap();
+            }
+            // Two consumed commands, each answered once. They are sent one after the other
+            // rather than in a burst because identical marks coalesce while one is pending.
+            for seq in 1..=2 {
+                h.commands
+                    .send(Command::MarkReviewed("b".repeat(40)))
+                    .unwrap();
+                let s = wait_for(&h, "mark error", |s| s.mark_seq == seq);
+                assert!(s.mark.is_none());
+                assert_eq!(s.pick_seq, 0);
+                if broken_status {
+                    assert_eq!(s.mark_error, s.status_error);
+                    assert!(s
+                        .mark_error
+                        .as_deref()
+                        .unwrap()
+                        .starts_with("git status failed:"));
+                } else {
+                    assert_eq!(s.mark_error.as_deref(), Some("not a git repository"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_unread_set_follows_the_mark_and_empties_on_a_new_one() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        assert!(s.unread.is_empty(), "no mark, no dots");
+        let head = s.head.clone().unwrap();
+
+        h.commands.send(Command::MarkReviewed(head)).unwrap();
+        let s = wait_for(&h, "marked", |s| s.mark_seq == 1);
+        assert!(
+            s.unread.is_empty(),
+            "marking the head leaves nothing unread"
+        );
+
+        // Commit only fresh.txt, leaving a.txt edited and u.txt untracked.
+        std::fs::write(dir.path().join("fresh.txt"), "fresh\n").unwrap();
+        git(dir.path(), &["add", "fresh.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "fresh"]);
+        // Wait for the new commit's diff before marking again.
+        let fresh_head = git_out(dir.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let s = wait_for(&h, "the new commit is unread and drawn", |s| {
+            s.unread.contains("fresh.txt") && s.head.as_deref() == Some(fresh_head.as_str())
+        });
+        assert!(!s.unread.contains("a.txt"), "{:?}", s.unread);
+        assert!(
+            !s.unread.contains("u.txt"),
+            "untracked rows are never in the set"
+        );
+        assert_eq!(
+            s.mark.as_ref().map(|m| m.state.clone()),
+            Some(crate::engine::MarkState::Current)
+        );
+
+        // Uncommitted work raises nothing, and a second mark clears the set on a dirty tree.
+        std::fs::write(dir.path().join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+        let s = wait_for(&h, "the edit is listed", |s| {
+            s.files.iter().any(|f| f.path == "a.txt")
+                && ready(s).is_some_and(|d| d.raw_diff.contains("+four"))
+                && s.head.as_deref() == Some(fresh_head.as_str())
+        });
+        assert!(
+            !s.unread.contains("a.txt"),
+            "an uncommitted edit is not a dot"
+        );
+        let head = s.head.clone().unwrap();
+        h.commands.send(Command::MarkReviewed(head)).unwrap();
+        let s = wait_for(&h, "marked again", |s| s.mark_seq == 2);
+        assert!(
+            s.unread.is_empty(),
+            "M clears every dot even with a dirty worktree"
+        );
+    }
+
+    #[test]
+    fn a_scope_switch_and_back_keeps_the_dots() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        h.commands
+            .send(Command::MarkReviewed(s.head.clone().unwrap()))
+            .unwrap();
+        wait_for(&h, "marked", |s| s.mark_seq == 1);
+        std::fs::write(dir.path().join("fresh.txt"), "fresh\n").unwrap();
+        git(dir.path(), &["add", "fresh.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "fresh"]);
+        wait_for(&h, "a dot", |s| s.unread.contains("fresh.txt"));
+
+        h.commands.send(Command::SetScope(Scope::Worktree)).unwrap();
+        let s = wait_for(&h, "worktree", |s| s.scope == Scope::Worktree);
+        assert!(s.unread.is_empty(), "worktree scope publishes no set");
+        h.commands.send(Command::SetScope(Scope::Branch)).unwrap();
+        let s = wait_for(&h, "branch again", |s| s.scope == Scope::Branch);
+        assert!(
+            s.unread.contains("fresh.txt"),
+            "the dots come back: {:?}",
+            s.unread
+        );
+    }
+
+    #[test]
+    fn an_amended_mark_is_rewritten_and_one_mark_repairs_it() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let s = wait_for(&h, "first", |s| ready(s).is_some());
+        h.commands
+            .send(Command::MarkReviewed(s.head.clone().unwrap()))
+            .unwrap();
+        wait_for(&h, "marked", |s| s.mark_seq == 1);
+
+        // A new message guarantees a different commit ID.
+        git(dir.path(), &["commit", "-q", "--amend", "-m", "amended"]);
+        let amended = git_out(dir.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let s = wait_for(&h, "rewritten", |s| {
+            matches!(
+                s.mark.as_ref().map(|m| m.state.clone()),
+                Some(crate::engine::MarkState::Rewritten)
+            ) && s.head.as_deref() == Some(amended.as_str())
+        });
+        assert!(
+            s.unread.is_empty(),
+            "the view flags every row from the state, not the set"
+        );
+        assert!(s.files.len() >= 4, "the rows and the base keep working");
+
+        // Marking the pre-amend frame must still classify the stale commit as rewritten.
+        let stale = s.mark.as_ref().unwrap().commit.clone();
+        h.commands.send(Command::MarkReviewed(stale)).unwrap();
+        let s = wait_for(&h, "stale frame marked", |s| s.mark_seq == 2);
+        let mark = s.mark.as_ref().unwrap();
+        assert_eq!(mark.state, MarkState::Rewritten);
+        assert_eq!(mark.classified_at.as_deref(), Some(amended.as_str()));
+
+        let head = s.head.clone().unwrap();
+        h.commands.send(Command::MarkReviewed(head)).unwrap();
+        let s = wait_for(&h, "repaired", |s| s.mark_seq == 3);
+        assert_eq!(
+            s.mark.as_ref().map(|m| m.state.clone()),
+            Some(crate::engine::MarkState::Current)
+        );
+    }
+
+    #[test]
+    fn stored_marks_are_classified_on_arrival_without_changing_the_base() {
+        let dir = branch_fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let (_rt, h) = start_with(
+            dir.path(),
+            Scope::Branch,
+            Some(state.path().to_path_buf()),
+            None,
+        );
+        let initial = wait_for(&h, "first", |s| ready(s).is_some());
+        let main = git_out(dir.path(), &["rev-parse", "refs/heads/main"])
+            .trim()
+            .to_string();
+        for (commit, unreadable) in [("b".repeat(40), true), (main, false)] {
+            base::save_mark(
+                state.path(),
+                &top,
+                &MarkRecord {
+                    commit: commit.clone(),
+                    at: 1,
+                },
+            )
+            .unwrap();
+            h.commands.send(Command::Refresh).unwrap();
+            let s = wait_for(&h, "stored mark classified", |s| {
+                s.mark
+                    .as_ref()
+                    .is_some_and(|m| m.commit == commit && m.classified_at == s.head_seen)
+            });
+            assert_eq!(s.head_seen, initial.head_seen);
+            assert_eq!(s.base, initial.base);
+            assert_eq!(rows_of(&s), rows_of(&initial));
+            assert!(s.status_error.is_none());
+            assert_eq!(s.mark_seq, 0);
+            if unreadable {
+                assert!(matches!(&s.mark.as_ref().unwrap().state,
+                    MarkState::Unreadable(reason) if reason.starts_with("git diff --name-only failed:")));
+                assert!(s.unread.is_empty());
+            } else {
+                assert_eq!(s.mark.as_ref().unwrap().state, MarkState::Current);
+                assert!(s.unread.contains("a.txt"));
+                assert!(s.unread.contains("old.txt") && s.unread.contains("new.txt"));
+            }
+        }
     }
 }

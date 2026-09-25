@@ -1,6 +1,6 @@
 [package]
 name = "herdr-hunks"
-version = "0.0.2"
+version = "0.0.3"
 description = "Read-only git hunk viewer plugin for herdr, ported from vimeflow."
 license = "Apache-2.0"
 edition = "2021"

@@ -11,7 +11,23 @@ pub enum FilesPanel {
     Pinned,
 }
 
+/// Which of `observe`'s notices is on screen. Everything the shell and the keys set is `Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeKind {
+    Other,
+    Rewrite,
+    BaseError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub text: String,
+    /// Shown above the status and watcher lines until a body key acknowledges it.
+    pub urgent: bool,
+}
+
 pub struct ViewState {
+    pub drawn_head: Option<String>,
     pub requested_mode: ViewMode,
     pub mode: ViewMode,
     pub cursor: Option<usize>,
@@ -27,11 +43,17 @@ pub struct ViewState {
     pub refs_token: u64,
     /// Last submitted pick's reply sequence, retained when the picker closes.
     pub submitted_pick_seq: u64,
-    pub notice: Option<String>,
+    pub notice: Option<Notice>,
     pub rows: Option<Rows>,
     pub body_height: u16,
     pub help_offset: usize,
     seen_base_error: Option<String>,
+    /// A base error taken from a snapshot and still owed to the user.
+    pending_base_error: Option<String>,
+    /// What the notice on screen is, so displacing one can put it back.
+    notice_kind: NoticeKind,
+    seen_mark_seq: u64,
+    seen_rewrite: Option<(String, String, crate::engine::MarkState)>,
     width: u16,
     /// The diff the rows were built from. Holding the Arc makes `Arc::ptr_eq` a safe,
     /// allocation-free "did anything change" test; the engine swaps the Arc only on change.
@@ -41,6 +63,7 @@ pub struct ViewState {
 impl ViewState {
     pub fn new(mode: ViewMode, files_panel: FilesPanel, mouse: bool) -> Self {
         Self {
+            drawn_head: None,
             requested_mode: mode,
             mode,
             cursor: None,
@@ -60,9 +83,38 @@ impl ViewState {
             body_height: 0,
             help_offset: 0,
             seen_base_error: None,
+            pending_base_error: None,
+            notice_kind: NoticeKind::Other,
+            seen_mark_seq: 0,
+            seen_rewrite: None,
             width: 0,
             built_from: None,
         }
+    }
+
+    pub fn notify(&mut self, text: impl Into<String>) {
+        self.notice = Some(Notice {
+            text: text.into(),
+            urgent: false,
+        });
+        self.notice_kind = NoticeKind::Other;
+    }
+
+    pub fn warn(&mut self, text: impl Into<String>) {
+        self.notice = Some(Notice {
+            text: text.into(),
+            urgent: true,
+        });
+        self.notice_kind = NoticeKind::Other;
+    }
+
+    /// Record only a drawn body's id; any snapshot without an id clears the last one.
+    pub fn record_drawn(&mut self, snapshot: &Snapshot, drew_body: bool) {
+        self.drawn_head = if drew_body {
+            snapshot.head.clone()
+        } else {
+            self.drawn_head.take().filter(|_| snapshot.head.is_some())
+        };
     }
 
     /// Resolves the effective mode and clamps offsets before each frame.
@@ -130,6 +182,8 @@ impl ViewState {
 
     /// Called once per snapshot the shell receives, before the next frame.
     pub fn observe(&mut self, snapshot: &Snapshot) {
+        use crate::engine::MarkState;
+
         // Close the picker before showing any warning from the same reply.
         if let Some(picker) = &mut self.picker {
             picker.observe(snapshot);
@@ -137,10 +191,75 @@ impl ViewState {
                 self.picker = None;
             }
         }
+        let mut answered_mark = false;
+        if snapshot.mark_seq != self.seen_mark_seq {
+            self.seen_mark_seq = snapshot.mark_seq;
+            answered_mark = true;
+            // The answer to the key the user just pressed is shown at once, even over an
+            // unread warning -- but displacing one puts it back, so it speaks again once this
+            // answer is read. A classification warning regenerates itself from the snapshot;
+            // a base error is text nothing else holds, so it returns to its slot. If the
+            // answer resolved what the warning was about, the branch below finds nothing to
+            // say and nothing comes back.
+            if let Some(displaced) = self.notice.as_ref().filter(|n| n.urgent) {
+                match self.notice_kind {
+                    NoticeKind::Rewrite => self.seen_rewrite = None,
+                    NoticeKind::BaseError => self.pending_base_error = Some(displaced.text.clone()),
+                    NoticeKind::Other => {}
+                }
+            }
+            match (&snapshot.mark_error, &snapshot.mark) {
+                (Some(error), _) => self.warn(crate::tui::sanitize::sanitize(error)),
+                (None, Some(mark)) => {
+                    let short = &mark.commit[..mark.commit.len().min(7)];
+                    self.notify(format!("marked {short} as reviewed"));
+                }
+                (None, None) => {}
+            }
+        }
+        // Warn only for the pair the engine conclusively classified.
+        let rewritten = snapshot.mark.as_ref().and_then(|mark| {
+            let at = mark.classified_at.clone()?;
+            (Some(&at) == snapshot.head_seen.as_ref() && mark.state != MarkState::Current)
+                .then(|| (mark.commit.clone(), at, mark.state.clone()))
+        });
+        // Leave the warning pending until an urgent answer has been acknowledged.
+        let urgent_stands = self.notice.as_ref().is_some_and(|n| n.urgent);
+        if rewritten != self.seen_rewrite && !answered_mark && !urgent_stands {
+            self.seen_rewrite = rewritten.clone();
+            match rewritten.map(|(_, _, state)| state) {
+                Some(MarkState::Rewritten) => {
+                    self.warn("the marked commit is no longer on this branch; press M again");
+                    self.notice_kind = NoticeKind::Rewrite;
+                }
+                Some(MarkState::Unreadable(reason)) => {
+                    self.warn(format!(
+                        "the mark cannot be read: {}",
+                        crate::tui::sanitize::sanitize(&reason)
+                    ));
+                    self.notice_kind = NoticeKind::Rewrite;
+                }
+                _ => {}
+            }
+        }
+        // One rule for every notice that has not been read: nothing overwrites it, and nothing
+        // deferred is forgotten. A base error is taken from the snapshot once and held here,
+        // because a later refresh can publish none and the snapshot is no place to keep
+        // something still owed to the user.
         if snapshot.base_error != self.seen_base_error {
             self.seen_base_error = snapshot.base_error.clone();
             if let (Some(error), None) = (&snapshot.base_error, &self.picker) {
-                self.notice = Some(crate::tui::sanitize::sanitize(error));
+                self.pending_base_error = Some(crate::tui::sanitize::sanitize(error));
+            }
+        }
+        // It then waits behind a mark answer from this same snapshot and behind any unread
+        // warning -- including the one the branch above just set, whose pair is already
+        // recorded and would never speak again.
+        if let Some(error) = self.pending_base_error.clone() {
+            if !answered_mark && !self.notice.as_ref().is_some_and(|n| n.urgent) {
+                self.pending_base_error = None;
+                self.warn(error);
+                self.notice_kind = NoticeKind::BaseError;
             }
         }
     }
@@ -253,6 +372,7 @@ pub(crate) mod tests {
         let loaded = LoadedDiff::build(
             key.clone(),
             Comparison::Worktree,
+            None,
             GetGitDiffResponse {
                 file_diff: FileDiff {
                     file_path: path.into(),
@@ -431,7 +551,7 @@ pub(crate) mod tests {
         snap.base_error = Some("remembered pick: not a commit: gone\u{1b}".into());
         st.observe(&snap);
         assert_eq!(
-            st.notice.as_deref(),
+            st.notice.as_ref().map(|n| n.text.as_str()),
             Some("remembered pick: not a commit: gone\u{241b}")
         );
         st.notice = None;
@@ -482,5 +602,327 @@ pub(crate) mod tests {
             "a new path starts at its first change"
         );
         assert_ne!(st.cursor, Some(3));
+    }
+
+    #[test]
+    fn a_frame_records_the_id_only_when_it_drew_the_body() {
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        snap.head = Some("a".repeat(40));
+        st.record_drawn(&snap, true);
+        assert_eq!(st.drawn_head.as_deref(), Some("a".repeat(40).as_str()));
+
+        // A modal frame leaves the last id alone, even as the snapshot's own moves on.
+        snap.head = Some("b".repeat(40));
+        st.record_drawn(&snap, false);
+        assert_eq!(st.drawn_head.as_deref(), Some("a".repeat(40).as_str()));
+
+        // A snapshot with no id clears it, drawn or not.
+        snap.head = None;
+        st.record_drawn(&snap, false);
+        assert_eq!(st.drawn_head, None);
+        snap.head = Some("c".repeat(40));
+        st.record_drawn(&snap, true);
+        snap.head = None;
+        st.record_drawn(&snap, true);
+        assert_eq!(st.drawn_head, None);
+    }
+    #[test]
+    fn the_rewrite_warning_waits_for_a_classified_pair_and_repeats_per_pair() {
+        use crate::engine::{Mark, MarkState};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        snap.head_seen = Some("h1".repeat(20));
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Rewritten,
+            classified_at: None,
+        });
+        st.observe(&snap);
+        assert!(st.notice.is_none(), "an unclassified pair says nothing");
+
+        snap.mark.as_mut().unwrap().classified_at = snap.head_seen.clone();
+        st.observe(&snap);
+        assert!(st.notice.as_ref().unwrap().urgent);
+        assert!(st
+            .notice
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("no longer on this branch"));
+
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none(), "once per classified pair");
+
+        snap.head_seen = Some("h2".repeat(20));
+        st.observe(&snap);
+        assert!(
+            st.notice.is_none(),
+            "the old classification cannot warn for a new head"
+        );
+        snap.mark.as_mut().unwrap().classified_at = snap.head_seen.clone();
+        st.observe(&snap);
+        assert!(st.notice.is_some(), "a new pair warns again");
+
+        st.notice = None;
+        snap.mark.as_mut().unwrap().state = MarkState::Unreadable("gone\u{1b}".into());
+        st.observe(&snap);
+        assert!(st.notice.as_ref().unwrap().urgent);
+        assert_eq!(
+            st.notice.as_ref().unwrap().text,
+            "the mark cannot be read: gone\u{241b}"
+        );
+        st.notice = None;
+        st.observe(&snap);
+        assert!(
+            st.notice.is_none(),
+            "an unreadable pair also warns only once"
+        );
+    }
+
+    #[test]
+    fn a_base_error_does_not_overwrite_a_mark_answer_from_the_same_snapshot() {
+        use crate::engine::{Mark, MarkState};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        // One refresh answers the mark and reports a base problem at once.
+        snap.mark_seq = 1;
+        snap.mark_error = Some("mark not remembered: no state directory".into());
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Current,
+            classified_at: None,
+        });
+        snap.base_error = Some("remembered pick: not a commit: gone".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("mark not remembered: no state directory"),
+            "the mark answer is not overwritten before it is drawn"
+        );
+
+        // The base error is not lost either: it speaks at the next snapshot.
+        st.notice = None;
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("remembered pick: not a commit: gone")
+        );
+    }
+
+    #[test]
+    fn a_mark_answer_over_an_unread_base_error_lets_it_speak_again() {
+        use crate::engine::{Mark, MarkState};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        // The pick that could not be written is on screen, unread.
+        snap.base_error = Some("pick not remembered: no state directory".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("pick not remembered: no state directory")
+        );
+
+        // A mark answers before the next draw: it is shown, and the warning goes back.
+        snap.base_error = None;
+        snap.mark_seq = 1;
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Current,
+            classified_at: None,
+        });
+        st.observe(&snap);
+        assert!(st.notice.as_ref().unwrap().text.contains("as reviewed"));
+
+        st.notice = None;
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("pick not remembered: no state directory"),
+            "the pick failure was not lost behind the answer"
+        );
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none(), "and then it rests");
+    }
+
+    #[test]
+    fn a_deferred_base_error_survives_a_refresh_that_no_longer_carries_it() {
+        use crate::engine::{Mark, MarkState};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        // An unwritable mark holds the screen; the pick that failed with it must wait.
+        snap.mark_seq = 1;
+        snap.mark_error = Some("mark not remembered: no state directory".into());
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Current,
+            classified_at: None,
+        });
+        snap.base_error = Some("pick not remembered: no state directory".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("mark not remembered: no state directory")
+        );
+
+        // An ordinary poll carries neither: the deferred warning is held here, not there.
+        snap.mark_error = None;
+        snap.base_error = None;
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("mark not remembered: no state directory"),
+            "the answer still stands"
+        );
+        st.notice = None;
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("pick not remembered: no state directory"),
+            "and the pick failure is still owed"
+        );
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none(), "each spoke exactly once");
+    }
+
+    #[test]
+    fn a_mark_answer_over_an_unread_warning_lets_it_speak_again() {
+        use crate::engine::{Mark, MarkState};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        snap.head_seen = Some("h1".repeat(20));
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Rewritten,
+            classified_at: snap.head_seen.clone(),
+        });
+        st.observe(&snap);
+        assert!(st
+            .notice
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("no longer on this branch"));
+
+        // A mark requested before the warning appeared now answers, and fails: the answer is
+        // shown, but the dots it does not explain are still on screen.
+        snap.mark_seq = 1;
+        snap.mark_error = Some("not a commit: bbbbbbb".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("not a commit: bbbbbbb"),
+            "the answer to the key just pressed is not delayed"
+        );
+
+        // Reading it brings the warning back, because the classification still stands.
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st
+            .notice
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("no longer on this branch"));
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none(), "and then it rests again");
+
+        // An answer that resolves the classification leaves nothing behind it.
+        st.observe(&snap);
+        snap.mark_seq = 2;
+        snap.mark_error = None;
+        snap.mark.as_mut().unwrap().state = MarkState::Current;
+        st.observe(&snap);
+        assert!(st.notice.as_ref().unwrap().text.contains("as reviewed"));
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none(), "nothing was queued behind it");
+    }
+
+    #[test]
+    fn a_base_error_waits_behind_a_rewrite_warning_and_then_speaks() {
+        use crate::engine::{Mark, MarkState};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        snap.head_seen = Some("h1".repeat(20));
+        // One refresh classifies the mark as rewritten and reports a base problem at once.
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Rewritten,
+            classified_at: snap.head_seen.clone(),
+        });
+        snap.base_error = Some("remembered pick: not a commit: gone".into());
+        st.observe(&snap);
+        assert!(
+            st.notice
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("no longer on this branch"),
+            "the warning for the pair just classified is not overwritten"
+        );
+
+        // Its pair is recorded and would never warn again, so the base error had to wait; it
+        // speaks once the warning is acknowledged.
+        st.notice = None;
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("remembered pick: not a commit: gone")
+        );
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none(), "each of them spoke exactly once");
+    }
+
+    #[test]
+    fn a_mark_answer_outranks_a_rewrite_warning_in_the_same_snapshot() {
+        use crate::engine::{Mark, MarkState};
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        snap.head_seen = Some("h1".repeat(20));
+        // The mark answer and classification arrive together.
+        snap.mark_seq = 1;
+        snap.mark_error = Some("mark not remembered: no state directory".into());
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Rewritten,
+            classified_at: snap.head_seen.clone(),
+        });
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("mark not remembered: no state directory"),
+            "the answer the user is owed is not overwritten"
+        );
+
+        // Further snapshots must not overwrite an unacknowledged answer.
+        st.observe(&snap);
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("mark not remembered: no state directory"),
+        );
+
+        // The warning follows once a body key clears the answer.
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st
+            .notice
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("no longer on this branch"));
     }
 }

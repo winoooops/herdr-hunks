@@ -110,7 +110,7 @@ fn initial_state(config: &Config, width: u16) -> ViewState {
     let mut state = ViewState::new(mode, files, config.mouse);
     state.resize(width, 0);
     if config.mode == ModeSetting::Split && width < view::MIN_SPLIT_WIDTH {
-        state.notice = Some("split view needs 100 columns".into());
+        state.notify("split view needs 100 columns");
     }
     state
 }
@@ -126,7 +126,9 @@ fn run_terminal(
     let mut width = terminal.size()?.width;
     let mut state = initial_state(config, width);
     state.popup = std::env::var("HERDR_HUNKS_PLACEMENT").as_deref() == Ok("popup");
-    state.notice = notice.or(state.notice);
+    if let Some(notice) = notice {
+        state.notify(notice);
+    }
     let mut snapshot = Arc::new(Snapshot::empty(&path.to_string_lossy()));
     let mut rendered = Rendered {
         lines: Vec::new(),
@@ -138,7 +140,7 @@ fn run_terminal(
         if let Some(requested) = guard::mouse_transition(state.mouse_requested, last_attempted) {
             last_attempted = Some(requested);
             if let Err(error) = guard.set_mouse(requested) {
-                state.notice = Some(format!("mouse capture failed: {error}"));
+                state.notify(format!("mouse capture failed: {error}"));
                 dirty = true;
             }
         }
@@ -148,12 +150,14 @@ fn run_terminal(
             dirty = true;
         }
         if dirty {
+            let mut drew_body = false;
             terminal.draw(|frame| {
                 let area = frame.area();
                 width = area.width;
                 state.resize(width, view::body_height(&state, &snapshot, area.height));
                 state.reconcile(&snapshot);
                 rendered = view::render(&snapshot, &state, width, area.height);
+                drew_body = view::body_is_drawn(&state, &snapshot, width, area.height);
                 let lines: Vec<_> = rendered
                     .lines
                     .iter()
@@ -172,6 +176,7 @@ fn run_terminal(
                     .collect();
                 frame.render_widget(Paragraph::new(lines), area);
             })?;
+            state.record_drawn(&snapshot, drew_body);
             dirty = false;
         }
         match guard::poll_terminal(Duration::ZERO).and_then(|pending| {
@@ -317,7 +322,12 @@ mod tests {
             (state.mode, state.files_panel, state.mouse_requested),
             (ViewMode::Unified, FilesPanel::Hidden, false)
         );
-        assert!(state.notice.as_deref().unwrap().contains("100 columns"));
+        assert!(state
+            .notice
+            .as_ref()
+            .map(|n| n.text.as_str())
+            .unwrap()
+            .contains("100 columns"));
         assert_eq!(state.requested_mode, ViewMode::Split);
         state.resize(120, 10);
         assert_eq!(state.mode, ViewMode::Split);

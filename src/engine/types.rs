@@ -1,5 +1,5 @@
 //! Snapshot types the UI renders from. No terminal types here.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::engine::nav::{targets_for_diff, unified_order, Target};
@@ -49,6 +49,36 @@ pub enum BaseSource {
     Picked,
     Config,
     Default,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkState {
+    /// An ancestor of `head_seen`: the unread set is the one the diff computed.
+    Current,
+    /// Still a commit, no longer on this branch: every row is flagged.
+    Rewritten,
+    /// The unread command failed; the string is git's reason. Every row is flagged.
+    Unreadable(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mark {
+    /// A full object id: hexadecimal only, of the length this repository's hash gives.
+    pub commit: String,
+    /// Seconds since the Unix epoch, recorded when the mark was written.
+    pub at: u64,
+    pub state: MarkState,
+    /// The `head_seen` this state was classified against; `None` while unclassified.
+    pub classified_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuickBase {
+    /// `upstream`, `last commit`, or `last 3 commits`.
+    pub label: String,
+    /// A ref name or short object id for display.
+    pub detail: String,
+    pub submits: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +141,7 @@ pub enum DiffState {
 pub struct LoadedDiff {
     pub key: FileKey,
     pub comparison: Comparison,
+    pub read_at: Option<String>,
     pub file_diff: FileDiff,
     pub raw_diff: String,
     pub targets: Vec<Target>,
@@ -119,13 +150,19 @@ pub struct LoadedDiff {
 }
 
 impl LoadedDiff {
-    pub fn build(key: FileKey, comparison: Comparison, response: GetGitDiffResponse) -> Self {
-        Self::build_with_cap(key, comparison, response, MAX_DIFF_LINES)
+    pub fn build(
+        key: FileKey,
+        comparison: Comparison,
+        read_at: Option<String>,
+        response: GetGitDiffResponse,
+    ) -> Self {
+        Self::build_with_cap(key, comparison, read_at, response, MAX_DIFF_LINES)
     }
 
     pub fn build_with_cap(
         key: FileKey,
         comparison: Comparison,
+        read_at: Option<String>,
         response: GetGitDiffResponse,
         cap: usize,
     ) -> Self {
@@ -152,6 +189,7 @@ impl LoadedDiff {
         Self {
             key,
             comparison,
+            read_at,
             file_diff,
             raw_diff: response.raw_diff,
             targets,
@@ -165,9 +203,14 @@ impl LoadedDiff {
 pub struct Snapshot {
     pub revision: u64,
     pub repo: RepoState,
+    /// The diff's commit, or the refresh's confirmed commit for an empty list.
+    pub head: Option<String>,
+    /// The id the last refresh observed, published as observed and never gated.
+    pub head_seen: Option<String>,
     /// `scope`, `base`, `files` and `rename_sources` always describe one comparison.
     pub scope: Scope,
     pub base: Option<Base>,
+    pub mark: Option<Mark>,
     /// A skipped resolution step, a `bases.json` problem or a pick that was not remembered; shown once.
     pub base_error: Option<String>,
     /// What steps 2-5 of the resolution order name, for the picker's reset row.
@@ -175,6 +218,8 @@ pub struct Snapshot {
     pub files: Vec<ChangedFile>,
     /// Branch scope only: a renamed row's path -> its old path.
     pub rename_sources: Arc<BTreeMap<String, String>>,
+    /// Branch scope paths changed since the mark; non-Current states flag every row instead.
+    pub unread: Arc<BTreeSet<String>>,
     pub selected: Option<FileKey>,
     pub diff: DiffState,
     pub status_error: Option<String>,
@@ -182,12 +227,16 @@ pub struct Snapshot {
     pub refreshing: bool,
     /// The picker's candidates, qualified, most recently created first; `None` until `LoadRefs`.
     pub refs: Option<Arc<Vec<String>>>,
+    pub quick: Option<Arc<Vec<QuickBase>>>,
     pub refs_overflow: bool,
     /// The token of the opening whose `LoadRefs` was answered last.
     pub refs_seq: u64,
     /// Bumped once per answered `SetBase`; `pick_error` is that answer.
     pub pick_seq: u64,
     pub pick_error: Option<String>,
+    /// Bumped once per answered `MarkReviewed`; `mark_error` is that answer.
+    pub mark_seq: u64,
+    pub mark_error: Option<String>,
 }
 
 impl Snapshot {
@@ -197,22 +246,29 @@ impl Snapshot {
             repo: RepoState::NotARepo {
                 cwd: cwd.to_string(),
             },
+            head: None,
+            head_seen: None,
             scope: Scope::Worktree,
             base: None,
+            mark: None,
             base_error: None,
             default_base: None,
             files: Vec::new(),
             rename_sources: Arc::new(BTreeMap::new()),
+            unread: Arc::new(BTreeSet::new()),
             selected: None,
             diff: DiffState::Idle,
             status_error: None,
             watcher_error: None,
             refreshing: false,
             refs: None,
+            quick: None,
             refs_overflow: false,
             refs_seq: 0,
             pick_seq: 0,
             pick_error: None,
+            mark_seq: 0,
+            mark_error: None,
         }
     }
 }
@@ -227,6 +283,8 @@ pub enum Command {
     SetScope(Scope),
     /// `Some`: validate, load branch rows under it, persist, publish. `None`: forget the pick and re-resolve.
     SetBase(Option<String>),
+    /// Record this commit as reviewed for this worktree. It changes no comparison.
+    MarkReviewed(String),
     /// Answer with `refs` and this opening's token on the snapshot.
     LoadRefs(u64),
     Shutdown,
@@ -284,6 +342,7 @@ mod tests {
         let loaded = LoadedDiff::build_with_cap(
             key(),
             Comparison::Worktree,
+            None,
             response(vec![hunk(1, 3), hunk(50, 2)]),
             10,
         );
@@ -299,6 +358,7 @@ mod tests {
         let loaded = LoadedDiff::build_with_cap(
             key(),
             Comparison::Worktree,
+            None,
             response(vec![hunk(1, 6), hunk(50, 6), hunk(90, 1)]),
             10,
         );
@@ -312,6 +372,7 @@ mod tests {
         let loaded = LoadedDiff::build_with_cap(
             key(),
             Comparison::Worktree,
+            None,
             response(vec![hunk(1, 25)]),
             10,
         );
@@ -361,7 +422,7 @@ mod tests {
         let branch = Comparison::Branch {
             merge_base: "1".repeat(40),
         };
-        let loaded = LoadedDiff::build(key(), branch.clone(), response(vec![hunk(1, 1)]));
+        let loaded = LoadedDiff::build(key(), branch.clone(), None, response(vec![hunk(1, 1)]));
         assert_eq!(loaded.comparison, branch);
         assert_ne!(loaded.comparison, Comparison::Worktree);
         let empty = Snapshot::empty("/r");

@@ -26,15 +26,27 @@ fn real_git() -> PathBuf {
     PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
 }
 
+/// The engine polls this repository while the harness drives it, and both take `index.lock`.
+/// That one failure is retried; anything else fails the test with git's own message.
 fn git(real: &Path, dir: &Path, args: &[&str]) -> String {
-    let out = Proc::new(real)
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}");
-    String::from_utf8_lossy(&out.stdout).to_string()
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = Proc::new(real)
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        if out.status.success() {
+            return String::from_utf8_lossy(&out.stdout).to_string();
+        }
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            err.contains("index.lock") && Instant::now() < deadline,
+            "git {args:?}: {err}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Content hash of every file outside `.git`, in path order. Pure Rust, so it is the same on macOS.
@@ -80,6 +92,7 @@ fn the_engine_never_mutates_the_repository() {
     let home = PathBuf::from(std::env::var_os("HOME").expect("test HOME"));
     let home_before: Vec<_> = [
         "bases.json",
+        "marks.json",
         "split-panes.json",
         "split-panes.lock",
         "config-problems.log",
@@ -233,13 +246,53 @@ fn the_engine_never_mutates_the_repository() {
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut back = false;
-    while Instant::now() < deadline && !back {
+    let mut head = None;
+    while Instant::now() < deadline && !(back && head.is_some()) {
         let Ok(s) = handle.snapshots.recv_timeout(Duration::from_millis(200)) else {
             continue;
         };
         back = s.scope == Scope::Worktree && s.files.len() == 3;
+        if back {
+            head = s.head.clone();
+        }
     }
     assert!(back, "worktree scope did not come back");
+    // Mark a commit that is not the head, and open the picker again, without widening the
+    // allow-list. Older on purpose: marking the head short-circuits classification before any
+    // git call, and classification is where 8.3's two commands run.
+    assert!(head.is_some(), "nothing was markable in worktree scope");
+    let older = git(&real, p, &["rev-parse", "HEAD~1"]).trim().to_string();
+    handle.commands.send(Command::MarkReviewed(older)).unwrap();
+    handle.commands.send(Command::LoadRefs(2)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (mut marked, mut refs) = (false, false);
+    while Instant::now() < deadline && !(marked && refs) {
+        let Ok(s) = handle.snapshots.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
+        marked |= s.mark_seq == 1 && s.mark_error.is_none();
+        refs |= s.refs_seq == 2 && s.quick.is_some();
+    }
+    assert!(marked, "the mark was never answered");
+    assert!(refs, "the quick rows never arrived for this opening");
+    // Classification runs only in branch scope. Without this switch the allow-list below would
+    // prove nothing about the commands this feature added.
+    handle
+        .commands
+        .send(Command::SetScope(Scope::Branch))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut classified = false;
+    while Instant::now() < deadline && !classified {
+        let Ok(s) = handle.snapshots.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
+        classified = s.scope == Scope::Branch
+            && s.mark
+                .as_ref()
+                .is_some_and(|mark| mark.classified_at.is_some());
+    }
+    assert!(classified, "the mark was never classified in branch scope");
     // Now the harness switches HEAD underneath the engine, through the real git.
     git(&real, p, &["symbolic-ref", "HEAD", "refs/heads/other"]);
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -320,6 +373,19 @@ fn the_engine_never_mutates_the_repository() {
             .any(|l| l.contains("diff ") && l.contains("--name-status -M -z --")),
         "no name-status against the merge-base"
     );
+    // The two commands 8.3 adds, both reads, both with shape-validated endpoints.
+    assert!(
+        recorded
+            .lines()
+            .any(|l| l.contains("merge-base --is-ancestor ")),
+        "the mark's ancestry was never asked about"
+    );
+    assert!(
+        recorded
+            .lines()
+            .any(|l| l.contains("diff ") && l.contains("--name-only --no-renames -z --")),
+        "the unread set was never read"
+    );
     assert!(
         !recorded.lines().any(|l| l.contains("--merge-base")),
         "the merge-base must be pinned, never recomputed by git diff"
@@ -331,7 +397,7 @@ fn the_engine_never_mutates_the_repository() {
     written.sort();
     assert_eq!(
         written,
-        ["bases.json", "split-panes.lock"],
+        ["bases.json", "marks.json", "split-panes.lock"],
         "the viewer wrote something else"
     );
     let picks: std::collections::BTreeMap<String, String> =

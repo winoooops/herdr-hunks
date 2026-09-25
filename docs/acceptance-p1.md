@@ -4,8 +4,10 @@ Status: PASS
 
 This is the release gate for the five success criteria in
 [spec section 1.5](superpowers/specs/2026-09-18-hunks-roadmap-p1-viewer-design.md#15-phase-1-success-criteria)
-and the branch-scope criteria in
-[spec section 7.9](superpowers/specs/2026-09-22-branch-scope-design.md#79-tests-and-success-criteria).
+the branch-scope criteria in
+[spec section 7.9](superpowers/specs/2026-09-22-branch-scope-design.md#79-tests-and-success-criteria),
+and the review-mark criteria in
+[spec section 8.7](superpowers/specs/2026-09-23-review-marks-design.md#87-tests-and-success-criteria).
 The orchestrator and user perform and record these checks. Automated test results
 alone do not complete manual acceptance. Phase 1 is not release-ready while any
 result is PENDING.
@@ -19,11 +21,13 @@ result is PENDING.
 | 5. Read-only guarantee | Run `cargo test --test readonly_guarantee`. | Only allow-listed git reads occur, required environment policy is present, and the index, refs, and worktree remain unchanged. | pass | 2026-09-20 | n/a (no host involved; git 2.55.0) | Linux 7.1.3 x86_64 (Nobara 44) |
 | 6. Branch scope parity | On a branch with committed and uncommitted changes (the fixture of `branch_scope_lists_every_change_the_branch_carries_once`, or a real worktree), press `b`. Compare the row list with `git diff $(git merge-base HEAD main) --name-status -M --` plus the `??` rows of `git status --porcelain --untracked-files=all`; compare one tracked row's hunks with `git diff <M> -- <path>`, the rename with `git diff <M> -M -- <old> <new>`, and an untracked row with `git diff --no-index -- /dev/null <path>`. | Every changed path is listed once (twice only for a path deleted on the branch and recreated untracked) and each diff matches hunk for hunk. | pass | 2026-09-22 | herdr 0.8.0 + vimeflow 0.8.0 (tier B on both at `b090e5a`); by-hand check on a build of `b090e5a` | Linux 7.1.3 x86_64 (Nobara 44) |
 | 7. Default base and remembered pick | On a repository with `main` and no configuration, press `b`: the chip reads `vs main`. Press `B`, pick another ref, close the viewer, reopen it on the same worktree and press `b`. | The base is `main` without configuration; the reopened viewer compares against the picked ref. | pass | 2026-09-22 | n/a (viewer built from `b090e5a`, run directly; git 2.55.0) | Linux 7.1.3 x86_64 (Nobara 44) |
+| 8. Review marks | On a branch where an agent has committed, press `b`, read the rows and press `M`: every `●` clears. Have the agent commit again and compare the marked rows with `git diff <marked commit> HEAD --name-only --no-renames`. Edit a file without committing, press `M` again. Close and reopen the viewer. | The dots clear on `M`; after the new commit exactly that command's paths carry one; an uncommitted edit carries none and `M` still clears everything; the mark survives reopening. | pass | 2026-09-23 | n/a (viewer 0.0.3 built from `1d0dd11`, run directly; git 2.55.0) | Linux 7.1.3 x86_64 (Nobara 44) |
 
 Only the orchestrator/user may replace result cells with `pass`, fill in the date,
 version, and host evidence, and change the first line to `Status: PASS` after all
-seven rows pass. The release workflow's guard refuses to build or publish without
-that PASS line. Record both upstream and fork observations for criteria 2–4;
+eight rows pass. Rows 1–7 belong to the earlier releases; row 8 covers 0.0.3.
+The release workflow's guard refuses to build or publish without that PASS line.
+Record both upstream and fork observations for criteria 2–4;
 the inotify exhaustion check specifically requires a Linux test host.
 
 ## Evidence
@@ -69,13 +73,29 @@ the base was `main` with no configuration, a pick of
 The owner's field test covered 15 checks (10 by the owner, 5 by the orchestrator on request);
 all 15 passed.
 
+- **Row 8.** 2026-09-23, viewer 0.0.3 run directly in a herdr pane on a scratch repository
+  (`main` plus a branch with two agent commits). `b` gave `vs main` and two rows; `M` answered
+  `marked 921244c as reviewed` and wrote one record to `marks.json` keyed by the worktree's
+  toplevel. A second agent commit touching `alpha.txt` and `gamma.txt` raised `●` on exactly
+  those two rows and on no other, matching
+  `git diff 921244c HEAD --name-only --no-renames` byte for byte. An uncommitted edit to
+  `beta.txt` raised no dot and appeared in the footer totals, and `M` then answered
+  `marked 0083ecb as reviewed` and cleared every dot. `B` listed `reviewed (0083ecb · just
+  now)`, `last commit` and `last 3 commits`, and no `upstream` row for a repository with no
+  remote; picking `reviewed` narrowed the list to `beta.txt` alone under a `vs reviewed` chip.
+  Quitting and reopening the viewer restored both the mark and that base. Finally,
+  `git reset --hard` past the marked commit produced
+  `the marked commit is no longer on this branch; press M again` with every row flagged, and
+  the rows, the diff and the base kept working.
+
 ## Automated Tier B check
 
 This ignored test starts and stops its own named server under a short `/tmp`
 directory, with separate HOME, XDG_CONFIG_HOME, and XDG_STATE_HOME. Every child
 starts with a cleared environment; host commands select the isolated session via
 `--session`. It links the plugin, verifies the viewer cwd, presses `b` and selects
-a committed row, invokes `open-split` twice from the opener, and checks pane reuse
+a committed row, marks it reviewed, verifies a later commit raises a marker and a
+second mark clears it, invokes `open-split` twice from the opener, and checks pane reuse
 and the saved reuse record. It never sets the test process's HERDR_SOCKET_PATH.
 
 Build first: `plugin link` skips build steps and uses `target/release/herdr-hunks`.

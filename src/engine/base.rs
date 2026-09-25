@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::actions::reuse;
-use crate::engine::{Base, BaseSource};
+use crate::engine::{ref_label, Base, BaseSource, QuickBase};
 use crate::git::run_git_with_timeout;
 
 pub const REFS_CAP: usize = 200;
 const PICKS_FILE: &str = "bases.json";
+const MARKS_FILE: &str = "marks.json";
 
 /// One git invocation in `toplevel` through the frozen runner (30 s timeout; the D3 variables are process-wide).
 pub(crate) async fn git(toplevel: &str, args: &[&str]) -> Result<std::process::Output, String> {
@@ -44,9 +45,27 @@ pub(crate) async fn verify(toplevel: &str, text: &str) -> Result<String, String>
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// `git merge-base HEAD <commit>`; fails for unrelated histories.
-pub(crate) async fn merge_base(toplevel: &str, commit: &str) -> Result<String, String> {
-    let output = git(toplevel, &["merge-base", "HEAD", commit]).await?;
+/// `Ok(Some(id))` for a commit, `Ok(None)` when git found none, `Err` when it could not run.
+pub(crate) async fn read_head(toplevel: &str) -> Result<Option<String>, String> {
+    let output = git(
+        toplevel,
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    )
+    .await?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!id.is_empty()).then_some(id))
+}
+
+/// `git merge-base <head> <commit>`; fails for unrelated histories.
+pub(crate) async fn merge_base_of(
+    toplevel: &str,
+    head: &str,
+    commit: &str,
+) -> Result<String, String> {
+    let output = git(toplevel, &["merge-base", head, commit]).await?;
     if !output.status.success() {
         let short = &commit[..commit.len().min(7)];
         let err = stderr_of(&output);
@@ -64,6 +83,8 @@ pub(crate) async fn merge_base(toplevel: &str, commit: &str) -> Result<String, S
 pub struct ResolveInputs {
     /// `Some(Some(ref))` a pick, `Some(None)` a reset, kept in memory when `bases.json` could not be written.
     pub session_pick: Option<Option<String>>,
+    /// A mark kept in memory when `marks.json` could not be written.
+    pub session_mark: Option<MarkRecord>,
     /// `[base] ref`.
     pub config: Option<String>,
     pub state_dir: Option<PathBuf>,
@@ -190,6 +211,59 @@ pub fn save_pick(state_dir: &Path, toplevel: &str, pick: Option<&str>) -> std::i
     })?
 }
 
+/// A commit id as `rev-parse` prints one: hexadecimal, 40 or 64 characters. Everything read
+/// back from a file is checked by shape before it can become an argument.
+pub fn is_object_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MarkRecord {
+    pub commit: String,
+    /// Seconds since the Unix epoch, recorded when the mark was written.
+    pub at: u64,
+}
+
+/// The remembered marks, keyed by canonical toplevel; a record whose commit is not an
+/// object id is dropped, as is an unreadable or malformed file, with the reason.
+pub fn load_marks(state_dir: &Path) -> (BTreeMap<String, MarkRecord>, Option<String>) {
+    let text = match std::fs::read_to_string(state_dir.join(MARKS_FILE)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (BTreeMap::new(), None),
+        Err(e) => return (BTreeMap::new(), Some(format!("{MARKS_FILE}: {e}"))),
+        Ok(text) => text,
+    };
+    let marks: BTreeMap<String, MarkRecord> = match serde_json::from_str(&text) {
+        Ok(marks) => marks,
+        Err(e) => return (BTreeMap::new(), Some(format!("{MARKS_FILE}: {e}"))),
+    };
+    let total = marks.len();
+    let kept: BTreeMap<String, MarkRecord> = marks
+        .into_iter()
+        .filter(|(_, m)| is_object_id(&m.commit))
+        .collect();
+    // Report every dropped record, even beside another worktree's valid record.
+    let dropped = total - kept.len();
+    let problem = (dropped > 0).then(|| format!("{MARKS_FILE}: {dropped} unusable record(s)"));
+    (kept, problem)
+}
+
+/// Read-modify-write under the same lock as the picks, then an atomic replace.
+pub fn save_mark(state_dir: &Path, toplevel: &str, record: &MarkRecord) -> std::io::Result<()> {
+    if !state_dir.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "state directory must be absolute",
+        ));
+    }
+    reuse::with_lock(state_dir, || {
+        let (mut marks, _) = load_marks(state_dir);
+        marks.insert(toplevel.to_string(), record.clone());
+        let tmp = state_dir.join(format!("{MARKS_FILE}.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&marks).unwrap_or_default())?;
+        std::fs::rename(tmp, state_dir.join(MARKS_FILE))
+    })?
+}
+
 /// One line appended to `config-problems.log`, the file the shell uses for config problems.
 pub fn note_problem(state_dir: &Path, line: &str) {
     use std::io::Write;
@@ -233,6 +307,38 @@ pub(crate) async fn list_refs(toplevel: &str) -> Result<(Vec<String>, bool), Str
     let overflow = refs.len() > REFS_CAP;
     refs.truncate(REFS_CAP);
     Ok((refs, overflow))
+}
+
+/// Independent quick bases in display order; unresolved revisions are omitted.
+pub(crate) async fn quick_bases(toplevel: &str) -> Vec<QuickBase> {
+    let mut rows = Vec::new();
+    if let Ok(output) = git(
+        toplevel,
+        &["rev-parse", "--symbolic-full-name", "@{upstream}"],
+    )
+    .await
+    {
+        if output.status.success() {
+            let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !name.is_empty() {
+                rows.push(QuickBase {
+                    label: "upstream".into(),
+                    detail: ref_label(&name).to_string(),
+                    submits: name,
+                });
+            }
+        }
+    }
+    for (label, revision) in [("last commit", "HEAD~1"), ("last 3 commits", "HEAD~3")] {
+        if let Ok(id) = verify(toplevel, revision).await {
+            rows.push(QuickBase {
+                label: label.into(),
+                detail: id[..id.len().min(7)].to_string(),
+                submits: revision.into(),
+            });
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -298,7 +404,7 @@ mod tests {
             rt().block_on(verify(&top, "nope")).unwrap_err(),
             "not a commit: nope"
         );
-        assert_eq!(rt().block_on(merge_base(&top, &id)).unwrap(), id);
+        assert_eq!(rt().block_on(merge_base_of(&top, "HEAD", &id)).unwrap(), id);
     }
 
     #[test]
@@ -512,5 +618,130 @@ mod tests {
             .into_owned();
         let (refs, overflow) = rt().block_on(list_refs(&top)).unwrap();
         assert!(refs.is_empty() && !overflow);
+    }
+
+    #[test]
+    fn object_ids_are_recognised_by_shape_alone() {
+        assert!(is_object_id(&"a".repeat(40)));
+        assert!(is_object_id(&"0".repeat(64)));
+        assert!(!is_object_id(&"a".repeat(39)));
+        assert!(!is_object_id(&"a".repeat(41)));
+        assert!(!is_object_id(""));
+        assert!(!is_object_id("--output=tracked.txt"));
+        assert!(!is_object_id("refs/heads/main"));
+        assert!(!is_object_id(&format!("{}z", "a".repeat(39))));
+    }
+
+    #[test]
+    fn marks_round_trip_and_a_bad_record_is_dropped() {
+        let state = tempfile::tempdir().unwrap();
+        assert_eq!(load_marks(state.path()).0.len(), 0);
+        let record = MarkRecord {
+            commit: "a".repeat(40),
+            at: 1_700_000_000,
+        };
+        save_mark(state.path(), "/r/one", &record).unwrap();
+        let (marks, problem) = load_marks(state.path());
+        assert_eq!(marks.get("/r/one"), Some(&record));
+        assert!(problem.is_none());
+
+        // A record whose commit is not an object id is dropped with a problem line.
+        std::fs::write(
+            state.path().join("marks.json"),
+            r#"{"/r/one":{"commit":"--output=x","at":1}}"#,
+        )
+        .unwrap();
+        let (marks, problem) = load_marks(state.path());
+        assert!(marks.is_empty());
+        assert!(problem.unwrap().starts_with("marks.json: "));
+
+        // A bad record is reported even when a neighboring record survives.
+        std::fs::write(
+            state.path().join("marks.json"),
+            format!(
+                r#"{{"/r/one":{{"commit":"{}","at":1}},"/r/two":{{"commit":"nope","at":2}}}}"#,
+                "a".repeat(40)
+            ),
+        )
+        .unwrap();
+        let (marks, problem) = load_marks(state.path());
+        assert_eq!(marks.len(), 1, "the valid record survives");
+        assert!(marks.contains_key("/r/one"));
+        assert!(problem.is_some(), "the dropped record is still reported");
+
+        // Malformed JSON degrades the same way, and the next save rewrites it.
+        std::fs::write(state.path().join("marks.json"), "{ not json").unwrap();
+        assert!(load_marks(state.path()).1.is_some());
+        save_mark(state.path(), "/r/two", &record).unwrap();
+        assert_eq!(load_marks(state.path()).0.len(), 1);
+        let mut names: Vec<_> = std::fs::read_dir(state.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["marks.json", "split-panes.lock"],
+            "no temp file is left behind"
+        );
+
+        // A relative state directory is refused, as for picks.
+        assert!(save_mark(std::path::Path::new("relative"), "/r/one", &record).is_err());
+    }
+    #[test]
+    fn quick_bases_offer_only_what_resolves() {
+        let (dir, top) = repo("main");
+        // One commit: no parent, no upstream.
+        let quick = rt().block_on(quick_bases(&top));
+        assert!(quick.is_empty(), "{quick:?}");
+
+        for n in 2..=4 {
+            std::fs::write(dir.path().join("a.txt"), format!("v{n}\n")).unwrap();
+            run(dir.path(), &["add", "-A"]);
+            run(dir.path(), &["commit", "-q", "-m", &format!("c{n}")]);
+            if n == 2 {
+                let quick = rt().block_on(quick_bases(&top));
+                assert_eq!(quick.len(), 1);
+                assert_eq!(quick[0].label, "last commit");
+                assert_eq!(quick[0].submits, "HEAD~1");
+            }
+        }
+        let quick = rt().block_on(quick_bases(&top));
+        assert_eq!(
+            quick.iter().map(|q| q.submits.as_str()).collect::<Vec<_>>(),
+            ["HEAD~1", "HEAD~3"]
+        );
+        // Upstream resolution needs a configured remote and fetch mapping.
+        run(dir.path(), &["remote", "add", "origin", "."]);
+        run(
+            dir.path(),
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        run(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD~1"],
+        );
+        run(
+            dir.path(),
+            &["branch", "--set-upstream-to=origin/main", "main"],
+        );
+
+        let quick = rt().block_on(quick_bases(&top));
+        let labels: Vec<&str> = quick.iter().map(|q| q.label.as_str()).collect();
+        assert_eq!(labels, ["upstream", "last commit", "last 3 commits"]);
+        assert_eq!(quick[0].submits, "refs/remotes/origin/main");
+        assert_eq!(quick[0].detail, "origin/main");
+        assert_eq!(quick[1].submits, "HEAD~1");
+        assert_eq!(quick[2].submits, "HEAD~3");
+        assert_eq!(
+            quick[1].detail.len(),
+            7,
+            "a short id: {:?}",
+            quick[1].detail
+        );
     }
 }
