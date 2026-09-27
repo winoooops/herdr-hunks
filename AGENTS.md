@@ -1,5 +1,9 @@
 # Working on herdr-hunks
 
+Start with [HANDOFF.md](HANDOFF.md): where the project stands, the three invariants a
+change can quietly break, how a release is made here, and the operational gotchas.
+This file is the rules; that one is the context behind them.
+
 - Phase 1 is a read-only viewer. Keep git mutations, comments, and agent dispatch out of this phase.
 - `src/git/` is frozen at vimeflow `91e45b1c8f381385093813d0b4eb1d9daeb2d563` plus registered patches. Never edit it by hand: change the pin or add a numbered patch in `port/patches/`, registered in `PORT-SURFACE.md`.
 - Verify the frozen tree with `scripts/port-check.sh /path/to/vimeflow` and `sh scripts/port-check-selftest.sh /path/to/vimeflow`. Treat the reference checkout as read-only. The engine reaches five additional frozen functions through the D6 visibility patch; its git allow-list has ten subcommands.
