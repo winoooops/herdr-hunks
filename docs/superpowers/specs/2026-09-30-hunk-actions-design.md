@@ -185,10 +185,12 @@ not required. Immediately before each form, and again before each retry of
 9.4, the engine reads the same two things and refuses with the same notice
 when the one that form applies to differs: the blob, or its absence, for a
 `--cached` form; the file, or its absence, for a working-tree one; both for
-an `--index` form, whose working-tree file must also be present, which the
-engine checks itself because git would recreate a missing one from the
-index and so erase an unstaged deletion (an `MD` path), and must equal its
-index entry, which git checks itself. A working-tree form runs only on a
+an `--index` form, whose working-tree file must be present whenever the
+index still holds an entry for it, which the engine checks itself because
+git would otherwise recreate the missing file from the index and so erase an
+unstaged deletion (an `MD` path), while a clean staged deletion has no entry
+and `--index -R` restores it; a present file must equal its index entry,
+which git checks itself. A working-tree form runs only on a
 regular file, a symlink or an absence; a directory or anything else is
 refused with `not a regular file: not applied here`, and a path that could
 not be read leaves the diff without a pre-image. The bytes a form is

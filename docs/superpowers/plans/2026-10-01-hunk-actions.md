@@ -133,74 +133,31 @@ One deviation from the spec's letter, recorded here and in the spec by this task
 
 - [ ] **Step 1: Move the section cutter to its own module, over bytes**
 
-Create `src/engine/sections.rs`:
+Create `src/engine/sections.rs` by moving `quoted_end`, `split_header`, `names_row`, `keep_sections` and `sections` out of `branch.rs` **verbatim, with their tests** (the mixed-quoting and `a b/c` cases among them; they must keep passing unchanged), then change only the two entry points to take and return bytes. `split_header` and `names_row` keep their `&str` signatures: a `diff --git` header line is matched after a lossy decode of that one line, exactly as the whole output was decoded before, while the section's bytes are kept as git wrote them.
 
 ```rust
 //! Cutting a multi-section diff down to one row's sections (spec 7.2, 9.2), over bytes.
 
 use crate::git::decode_git_patch_path;
 
-/// Index just past the closing quote of a C-quoted token that starts at byte 0.
-fn quoted_end(text: &str) -> Option<usize> {
-    let bytes = text.as_bytes();
-    if bytes.first() != Some(&b'"') {
-        return None;
-    }
-    let mut i = 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'"' => return Some(i + 1),
-            _ => i += 1,
-        }
-    }
-    None
-}
+// quoted_end, split_header and names_row: moved verbatim from branch.rs.
 
-/// `a/<x> b/<y>` of a `diff --git` header, each side decoded, or `None` when it cannot be split.
-pub fn split_header(header: &str) -> Option<(String, String)> {
-    let (a, rest) = match quoted_end(header) {
-        Some(end) => (header[..end].to_string(), header[end..].trim_start()),
-        None => {
-            let b_at = header.rfind(" b/")?;
-            (header[..b_at].to_string(), header[b_at + 1..].trim_start())
-        }
-    };
-    let b = match quoted_end(rest) {
-        Some(end) => rest[..end].to_string(),
-        None => rest.to_string(),
-    };
-    Some((decode_git_patch_path(&a), decode_git_patch_path(&b)))
-}
-
-fn names_row(header: &str, wanted_a: &str, wanted_b: &str) -> bool {
-    match split_header(header) {
-        Some((a, b)) => a == wanted_a && b == wanted_b || b == wanted_b || a == wanted_a && b == wanted_b,
-        None => false,
-    }
-}
-
-/// The sections whose header names `b/<path>`, `a/<path>` (a deletion) or `a/<old> b/<path>` (a rename).
+/// The sections whose `diff --git` header names the row: `b/<path>`, `a/<path>` for a deletion,
+/// `a/<old> b/<path>` for a rename.
 pub fn keep_sections(output: &[u8], path: &str, old: Option<&str>) -> Vec<u8> {
     let wanted_b = format!("b/{path}");
     let wanted_a = format!("a/{}", old.unwrap_or(path));
     let mut kept = Vec::new();
     for section in sections(output) {
         let first = section.split(|&b| b == b'\n').next().unwrap_or(&[]);
+        // Only the header line is decoded, and only to match it; the section's bytes stay as read.
         let first = String::from_utf8_lossy(first);
-        let Some(header) = first.strip_prefix("diff --git ") else {
-            continue;
-        };
-        let (a, b) = match split_header(header) {
-            Some(pair) => pair,
-            None => continue,
-        };
-        // A deletion names a/<path> b/<path>; a creation the same; a rename a/<old> b/<path>.
-        if b == wanted_b || (a == wanted_a && b == wanted_b) {
-            kept.extend_from_slice(section);
+        if let Some(header) = first.strip_prefix("diff --git ") {
+            if names_row(header, &wanted_a, &wanted_b) {
+                kept.extend_from_slice(section);
+            }
         }
     }
-    let _ = names_row;
     kept
 }
 
@@ -223,7 +180,7 @@ pub fn sections(raw: &[u8]) -> Vec<&[u8]> {
 }
 ```
 
-Then simplify: delete the `names_row` function and the `let _ = names_row;` line (they are vestiges of the copy; the match in `keep_sections` is the rule). Keep `split_header` public: Task 3 reuses it. Move the existing tests of `keep_sections`/`split_header` from `branch.rs` into this file's `#[cfg(test)] mod tests`, changing `&str` fixtures to `b"..."` where the function takes bytes. Add `pub mod sections;` to `src/engine/mod.rs`, and replace `branch.rs`'s `keep_sections`, `sections`, `quoted_end`, `split_header` and `names_row` with `use super::sections::{keep_sections, sections};`. In `branch::diff`, replace
+Keep `split_header` public: Task 3 reuses it. The moved tests of `keep_sections` change their `&str` fixtures to `b"..."` and compare `String::from_utf8_lossy(&kept)` where they compared strings. Add `pub mod sections;` to `src/engine/mod.rs`, and replace the moved items in `branch.rs` with `use super::sections::{keep_sections, sections};`. In `branch::diff`, replace
 
 ```rust
     let raw_diff = keep_sections(&String::from_utf8_lossy(&output.stdout), path, old);
@@ -336,9 +293,25 @@ mod tests {
                 .unwrap();
             let shape = |d: &FileDiff| d.hunks.iter().map(|h| (h.old_start, h.old_lines, h.new_start, h.new_lines, h.lines.len())).collect::<Vec<_>>();
             assert_eq!(shape(&ours.file_diff), shape(&theirs.file_diff), "{k:?}");
+            let content = |d: &FileDiff| {
+                d.hunks.iter().flat_map(|h| h.lines.iter().map(|l| {
+                    let sign = match l.line_type { crate::git::DiffLineType::Added => '+', crate::git::DiffLineType::Removed => '-', crate::git::DiffLineType::Context => ' ' };
+                    (sign, l.content.clone(), l.old_line_number, l.new_line_number)
+                })).collect::<Vec<_>>()
+            };
+            assert_eq!(content(&ours.file_diff), content(&theirs.file_diff), "{k:?}");
             assert_eq!(ours.file_diff.old_path, theirs.file_diff.old_path, "{k:?}");
             assert_eq!(String::from_utf8_lossy(&patch), ours.raw_diff, "{k:?}: raw_diff is the lossy patch");
-            assert!(!patch.is_empty(), "{k:?}");
+            // The bytes are what git prints with the same flags, run by the test itself.
+            let mut args = vec!["diff"];
+            if untracked { args.push("--no-index"); } else if staged { args.push("--cached"); }
+            args.extend(["--no-color", "--no-ext-diff", "--no-textconv", "-U3", "--src-prefix=a/", "--dst-prefix=b/"]);
+            if old.is_some() { args.push("-M"); }
+            args.push("--");
+            if untracked { args.push("/dev/null"); }
+            if let Some(o) = old { args.push(o); }
+            args.push(path);
+            assert_eq!(patch, git_out(p, &args), "{k:?}: the patch bytes are git's own");
         }
     }
 
@@ -1077,7 +1050,20 @@ use crate::engine::sections::sections;
 mod tests {
     use super::*;
 
-    const TWO_HUNKS: &[u8] = b"diff --git a/f.txt b/f.txt\nindex 0ff3bbb..7647ea4 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,5 +1,15 @@\n 1\n 2\n+ins\n 3\n 4\n 5\n@@ -25,7 +35,7 @@ f19\n f20\n blk\n one\n-two\n+TWO\n three\n blk-end\n";
+    /// A valid two-hunk diff of `old_text()` to `new_text()`: an insertion after line 2 shifts the
+    /// second hunk's new-side start by one.
+    const TWO_HUNKS: &[u8] = b"diff --git a/f.txt b/f.txt\nindex 0ff3bbb..7647ea4 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,5 +1,6 @@\n 1\n 2\n+ins\n 3\n 4\n 5\n@@ -24,7 +25,7 @@ f23\n f24\n blk\n one\n-two\n+TWO\n three\n blk-end\n tail\n";
+
+    fn old_text() -> String {
+        let mut s: String = (1..=5).map(|i| format!("{i}\n")).collect();
+        s.extend((6..=24).map(|i| format!("f{i}\n")));
+        s.push_str("blk\none\ntwo\nthree\nblk-end\ntail\n");
+        s
+    }
+
+    fn new_text() -> String {
+        old_text().replacen("2\n3\n", "2\nins\n3\n", 1).replacen("one\ntwo\n", "one\nTWO\n", 1)
+    }
 
     #[test]
     fn a_hunk_carries_its_header_and_only_itself() {
@@ -1092,13 +1078,45 @@ mod tests {
     #[test]
     fn coordinates_are_recounted_for_each_direction() {
         let forward = hunk_patch(TWO_HUNKS, 1, Direction::Forward).unwrap();
-        assert!(String::from_utf8_lossy(&forward).contains("\n@@ -25,7 +25,7 @@ f19\n"));
+        assert!(String::from_utf8_lossy(&forward).contains("\n@@ -24,7 +24,7 @@ f23\n"));
         let reverse = hunk_patch(TWO_HUNKS, 1, Direction::Reverse).unwrap();
-        assert!(String::from_utf8_lossy(&reverse).contains("\n@@ -35,7 +35,7 @@ f19\n"));
+        assert!(String::from_utf8_lossy(&reverse).contains("\n@@ -25,7 +25,7 @@ f23\n"));
         // A count of one is written as git writes it: no `,1`.
         let single: &[u8] = b"diff --git a/g b/g\n--- a/g\n+++ b/g\n@@ -3 +4 @@\n-x\n+y\n";
         let r = hunk_patch(single, 0, Direction::Reverse).unwrap();
         assert!(String::from_utf8_lossy(&r).contains("\n@@ -4 +4 @@\n"), "{}", String::from_utf8_lossy(&r));
+    }
+
+    /// The recount is proven against git: each slice applies alone, forward onto the old text and
+    /// reverse off the new text, and touches only its own lines.
+    #[test]
+    fn the_recounted_slices_apply_to_the_real_files() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        let run = |patch: &[u8], reverse: bool| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("-C").arg(dir.path()).arg("apply");
+            if reverse {
+                cmd.arg("-R");
+            }
+            let mut child = cmd.stdin(std::process::Stdio::piped()).spawn().unwrap();
+            child.stdin.as_mut().unwrap().write_all(patch).unwrap();
+            drop(child.stdin.take());
+            assert!(child.wait().unwrap().success());
+        };
+        std::fs::write(&path, old_text()).unwrap();
+        run(&hunk_patch(TWO_HUNKS, 1, Direction::Forward).unwrap(), false);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("one\nTWO\nthree\n") && !text.contains("ins\n"), "{text}");
+        std::fs::write(&path, old_text()).unwrap();
+        run(&hunk_patch(TWO_HUNKS, 0, Direction::Forward).unwrap(), false);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("2\nins\n3\n") && text.contains("one\ntwo\n"), "{text}");
+        std::fs::write(&path, new_text()).unwrap();
+        run(&hunk_patch(TWO_HUNKS, 1, Direction::Reverse).unwrap(), true);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("one\ntwo\nthree\n") && text.contains("2\nins\n3\n"), "{text}");
     }
 
     #[test]
@@ -1377,7 +1395,7 @@ pub fn hunk_patch(patch: &[u8], index: usize, direction: Direction) -> Option<Ve
 ```
 
 Run: `cargo test --locked --lib engine::actions`
-Expected: the seven tests pass. If `a_type_change_counts_hunks_across_its_two_sections` fails on the trailing `\ No newline` line, check `lines()`: the last line without `\n` must still be returned (it is, by the final `if`).
+Expected: the eight tests pass. If `a_type_change_counts_hunks_across_its_two_sections` fails on the trailing `\ No newline` line, check `lines()`: the last line without `\n` must still be returned (it is, by the final `if`).
 
 - [ ] **Step 4: Write the runner tests**
 
@@ -1447,6 +1465,13 @@ Append to the tests module:
         let timed = rt().block_on(apply_with(&slow, Duration::from_millis(200), &top, Form::StageHunk, b""));
         assert_eq!(timed, Err(Refusal::Failed("git apply timed out after 0s".into())));
         assert!(started.elapsed() < Duration::from_secs(2), "the child was not killed");
+        // A grandchild that keeps stdin open while the child dies: the writer must not outlive the timeout.
+        let holder = fake_git(dir.path(), "sleep 5 & wait");
+        let big: Vec<u8> = (0..120_000).map(|i| format!("line {i}\n")).collect::<String>().into_bytes();
+        let started = std::time::Instant::now();
+        let held = rt().block_on(apply_with(&holder, Duration::from_millis(200), &top, Form::StageHunk, &big));
+        assert!(matches!(held, Err(Refusal::Failed(ref m)) if m.contains("timed out")), "{held:?}");
+        assert!(started.elapsed() < Duration::from_secs(2), "the writer was left blocked on the grandchild's pipe");
         let silent = fake_git(dir.path(), "exit 3");
         let silent = rt().block_on(apply_with(&silent, Duration::from_secs(5), &top, Form::StageHunk, b""));
         assert_eq!(silent, Err(Refusal::Failed("git apply failed with status exit status: 3".into())));
@@ -1516,17 +1541,24 @@ pub async fn apply_with(
         drop(stdin);
         written
     });
-    let waited = tokio::time::timeout(timeout, child.wait_with_output()).await;
-    let _ = writer.await;
+    let abort = writer.abort_handle();
+    let waited = tokio::time::timeout(timeout, async {
+        let output = child.wait_with_output().await;
+        let _ = writer.await;
+        output
+    })
+    .await;
     let output = match waited {
         Ok(Ok(output)) => output,
         Ok(Err(e)) => return Err(Refusal::Failed(format!("git apply failed: {e}"))),
-        // The timed-out child is killed by kill_on_drop when the future is dropped.
         Err(_) => {
+            // The child is killed by kill_on_drop; the writer may still be blocked on a pipe a
+            // grandchild kept open, so it is aborted rather than awaited.
+            abort.abort();
             return Err(Refusal::Failed(format!(
                 "git apply timed out after {}s",
                 timeout.as_secs()
-            )))
+            )));
         }
     };
     if output.status.success() {
@@ -1552,7 +1584,7 @@ pub async fn apply_with(
 `wait_with_output` consumes the child; when the `timeout` future is dropped the child handle inside it is dropped too, and `kill_on_drop` sends SIGKILL. The D3 variables come from the process environment (`init_process_env` ran first), so nothing sets them here.
 
 Run: `cargo test --locked --lib engine::actions` (with the `HOME` of the global constraints).
-Expected: all ten tests pass. If the timeout message in the test reads `after 0s` for a 200 ms timeout, that is the integer seconds of `Duration::as_secs`, which is what the production 30 s prints as `30s`.
+Expected: all eleven tests pass. If the timeout message in the test reads `after 0s` for a 200 ms timeout, that is the integer seconds of `Duration::as_secs`, which is what the production 30 s prints as `30s`.
 
 - [ ] **Step 6: Gates and commit**
 
@@ -1779,8 +1811,9 @@ pub(crate) async fn check_pre_image(toplevel: &str, action: &Action, form: Form)
         if matches!(now.worktree, WorktreeKind::Directory | WorktreeKind::Other) {
             return Err(NOTICE_NOT_A_FILE.into());
         }
-        // git would recreate a missing file from the index and erase an unstaged deletion.
-        if form == Form::DiscardStaged && now.worktree == WorktreeKind::Absent {
+        // With an entry still in the index (MD), git would recreate the missing file and erase the
+        // unstaged deletion; a clean staged deletion has no entry, and --index -R restores it.
+        if form == Form::DiscardStaged && now.worktree == WorktreeKind::Absent && now.index.is_some() {
             return Err(format!("{}: does not match index", action.diff.key.path));
         }
     }
@@ -1822,8 +1855,8 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
     use crate::engine::{Action, ActionKind, WorktreeKind};
 
     /// mm.txt: two hunks staged, two unstaged. am.txt: staged creation plus an unstaged edit.
-    /// del.txt: worktree deletion. sdel.txt: staged deletion. ren.txt -> renamed.txt staged with two
-    /// hunks. u.txt untracked, empty.txt untracked and empty, bin.dat untracked and binary.
+    /// del.txt: worktree deletion. sdel.txt and sdel2.txt: staged deletions. ren.txt -> renamed.txt
+    /// staged with two hunks. u.txt untracked, empty.txt untracked and empty, bin.dat untracked and binary.
     fn action_fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
@@ -1835,6 +1868,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         std::fs::write(p.join("mm.txt"), &base).unwrap();
         std::fs::write(p.join("del.txt"), "d\n").unwrap();
         std::fs::write(p.join("sdel.txt"), "s\n").unwrap();
+        std::fs::write(p.join("sdel2.txt"), "s2\n").unwrap();
         std::fs::write(p.join("ren.txt"), format!("one\n{ctx}two\n")).unwrap();
         git(p, &["add", "-A"]);
         git(p, &["commit", "-q", "-m", "init"]);
@@ -1845,7 +1879,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         git(p, &["add", "am.txt"]);
         std::fs::write(p.join("am.txt"), "a\nb\n").unwrap();
         std::fs::remove_file(p.join("del.txt")).unwrap();
-        git(p, &["rm", "-q", "sdel.txt"]);
+        git(p, &["rm", "-q", "sdel.txt", "sdel2.txt"]);
         git(p, &["mv", "ren.txt", "renamed.txt"]);
         std::fs::write(p.join("renamed.txt"), format!("ONE\n{ctx}TWO\n")).unwrap();
         git(p, &["add", "renamed.txt"]);
@@ -1857,22 +1891,33 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
 
     // `git_out` already exists in this module (the branch-scope tests); reuse it.
 
-    /// Waits for the row to be listed first: a `Select` for an unlisted key is ignored (3.3).
-    fn select(h: &EngineHandle, path: &str, staged: bool, untracked: bool) -> Arc<Snapshot> {
-        let key = FileKey { path: path.into(), staged, untracked };
-        wait_for(h, &format!("{key:?} listed"), |s| s.files.iter().any(|f| FileKey::of(f) == key));
-        h.commands.send(Command::Select(key.clone())).unwrap();
-        wait_for(h, &format!("{key:?} ready"), |s| ready(s).is_some_and(|d| d.key == key))
+    /// Like `start`, with the poll an hour away: only commands and the watcher move the engine.
+    fn start_quiet(dir: &std::path::Path) -> (tokio::runtime::Runtime, EngineHandle) {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let handle = spawn(rt.handle(), SessionConfig {
+            scope: Scope::Worktree, base_ref: None, state_dir: None, path: dir.to_path_buf(),
+            poll_interval: Duration::from_secs(3600),
+            watcher: Arc::new(FlakyWatcher { allow: Arc::new(AtomicBool::new(true)) }),
+            git_check: ok_git(), diff_delay: None, diff_gate: None,
+        });
+        (rt, handle)
     }
 
-    /// Sends the action against the published diff and returns the snapshot that answers it.
+    /// A `Refresh` first, so the listing is republished even when its last snapshot was already
+    /// consumed (an unchanged repository publishes nothing); then a `Select` for a listed key.
+    fn select(h: &EngineHandle, path: &str, staged: bool, untracked: bool) -> Arc<Snapshot> {
+        let key = FileKey { path: path.into(), staged, untracked };
+        h.commands.send(Command::Refresh).unwrap();
+        wait_for(h, &format!("{key:?} listed"), |s| s.files.iter().any(|f| FileKey::of(f) == key));
+        h.commands.send(Command::Select(key.clone())).unwrap();
+        wait_for(h, &format!("{key:?} ready"), |s| !s.refreshing && ready(s).is_some_and(|d| d.key == key))
+    }
+
+    /// Sends the action against the very Arc the snapshot holds and returns the snapshot that answers it.
     fn act(h: &EngineHandle, s: &Snapshot, kind: ActionKind, hunk: Option<usize>) -> Arc<Snapshot> {
-        let diff = ready(s).expect("a ready diff").clone();
+        let diff = match &s.diff { DiffState::Ready(d) => d.clone(), _ => panic!("no ready diff") };
         let seq = s.action_seq + 1;
-        let action = Action { kind, diff: Arc::new((*diff).clone()), hunk };
-        // The engine compares pointers: send the very Arc the snapshot holds.
-        let action = Action { diff: match &s.diff { DiffState::Ready(d) => d.clone(), _ => unreachable!() }, ..action };
-        h.commands.send(Command::Act(action)).unwrap();
+        h.commands.send(Command::Act(Action { kind, diff, hunk })).unwrap();
         wait_for(h, "the answer", |n| n.action_seq == seq)
     }
 
@@ -1887,7 +1932,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
     fn a_hunk_is_staged_unstaged_and_discarded_and_the_rest_is_untouched() {
         let dir = action_fixture();
         let p = dir.path();
-        let (_rt, h) = start(p, Arc::new(AtomicBool::new(true)));
+        let (_rt, h) = start_quiet(p);
         let s = select(&h, "mm.txt", false, false);
         assert_eq!(ready(&s).unwrap().file_diff.hunks.len(), 2);
         let answered = act(&h, &s, ActionKind::Stage, Some(0));
@@ -1909,7 +1954,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         assert!(git_out(p, &["diff", "--", "mm.txt"]).contains("+GAMMA"));
         // Discard the unstaged GAMMA hunk: the file keeps DELTA and the staged hunks.
         let s = select(&h, "mm.txt", false, false);
-        let s = wait_for(&h, "two unstaged hunks", |s| ready(s).is_some_and(|d| d.key.staged == false && d.file_diff.hunks.len() == 2));
+        assert_eq!(ready(&s).unwrap().file_diff.hunks.len(), 2);
         let answered = act(&h, &s, ActionKind::Discard, Some(0));
         assert_eq!(answered.action_error, None);
         let text = std::fs::read_to_string(p.join("mm.txt")).unwrap();
@@ -1921,7 +1966,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
     fn a_staged_discard_is_atomic_and_refused_while_the_file_has_unstaged_changes() {
         let dir = action_fixture();
         let p = dir.path();
-        let (_rt, h) = start(p, Arc::new(AtomicBool::new(true)));
+        let (_rt, h) = start_quiet(p);
         let s = select(&h, "mm.txt", true, false);
         let answered = act(&h, &s, ActionKind::Discard, Some(0));
         let error = answered.action_error.clone().unwrap();
@@ -1935,7 +1980,8 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         assert_eq!(ready(&fresh).unwrap().file_diff.hunks.len(), 2);
         // Stage the rest, then the discard is clean and removes the hunk from both sides.
         git(p, &["add", "mm.txt"]);
-        let s = wait_for(&h, "four staged hunks", |s| ready(s).is_some_and(|d| d.key.staged && d.file_diff.hunks.len() == 4));
+        let s = select(&h, "mm.txt", true, false);
+        assert_eq!(ready(&s).unwrap().file_diff.hunks.len(), 4);
         let answered = act(&h, &s, ActionKind::Discard, Some(1));
         assert_eq!(answered.action_error, None);
         assert!(!git_out(p, &["diff", "--cached", "--", "mm.txt"]).contains("+BETA"));
@@ -1947,7 +1993,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
     fn whole_file_discards_follow_the_row_and_an_md_path_keeps_its_file_absent() {
         let dir = action_fixture();
         let p = dir.path();
-        let (_rt, h) = start(p, Arc::new(AtomicBool::new(true)));
+        let (_rt, h) = start_quiet(p);
         // D on the unstaged row of am.txt: the staged creation stays.
         let s = select(&h, "am.txt", false, false);
         assert_eq!(act(&h, &s, ActionKind::DiscardFile, None).action_error, None);
@@ -1962,14 +2008,18 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         let s = select(&h, "del.txt", false, false);
         assert_eq!(act(&h, &s, ActionKind::Discard, Some(0)).action_error, None);
         assert_eq!(std::fs::read_to_string(p.join("del.txt")).unwrap(), "d\n");
-        // s on a staged deletion moves it to the worktree side; D on that unstaged row recreates the file.
+        // D on a clean staged deletion: the index has no entry, so --index -R restores entry and file.
         let s = select(&h, "sdel.txt", true, false);
-        assert_eq!(act(&h, &s, ActionKind::Stage, Some(0)).action_error, None);
-        assert_eq!(git_out(p, &["status", "--porcelain=v1", "--", "sdel.txt"]).trim(), "D sdel.txt");
-        let s = settled(&h, "sdel.txt", false);
         assert_eq!(act(&h, &s, ActionKind::DiscardFile, None).action_error, None);
         assert_eq!(std::fs::read_to_string(p.join("sdel.txt")).unwrap(), "s\n");
         assert_eq!(git_out(p, &["status", "--porcelain=v1", "--", "sdel.txt"]).trim(), "");
+        // s on a staged deletion moves it to the worktree side; D on that unstaged row recreates the file.
+        let s = select(&h, "sdel2.txt", true, false);
+        assert_eq!(act(&h, &s, ActionKind::Stage, Some(0)).action_error, None);
+        assert_eq!(git_out(p, &["status", "--porcelain=v1", "--", "sdel2.txt"]).trim(), "D sdel2.txt");
+        let s = select(&h, "sdel2.txt", false, false);
+        assert_eq!(act(&h, &s, ActionKind::DiscardFile, None).action_error, None);
+        assert_eq!(std::fs::read_to_string(p.join("sdel2.txt")).unwrap(), "s2\n");
         // MD: staged edit, file removed from the worktree. D on the staged row must not recreate it.
         std::fs::write(p.join("md.txt"), "m\n").unwrap();
         git(p, &["add", "md.txt"]);
@@ -1977,7 +2027,6 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         std::fs::write(p.join("md.txt"), "M\n").unwrap();
         git(p, &["add", "md.txt"]);
         std::fs::remove_file(p.join("md.txt")).unwrap();
-        h.commands.send(Command::Refresh).unwrap();
         let s = select(&h, "md.txt", true, false);
         let answered = act(&h, &s, ActionKind::DiscardFile, None);
         assert_eq!(answered.action_error.as_deref(), Some("md.txt: does not match index"));
@@ -1990,7 +2039,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
     fn untracked_rows_are_staged_or_deleted_whole_and_a_binary_one_is_refused() {
         let dir = action_fixture();
         let p = dir.path();
-        let (_rt, h) = start(p, Arc::new(AtomicBool::new(true)));
+        let (_rt, h) = start_quiet(p);
         let s = select(&h, "u.txt", false, true);
         assert_eq!(act(&h, &s, ActionKind::Stage, None).action_error, None);
         assert_eq!(git_out(p, &["status", "--porcelain=v1", "--", "u.txt"]).trim(), "A  u.txt");
@@ -2003,7 +2052,6 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         assert_eq!(answered.action_error.as_deref(), Some(actions::NOTICE_BINARY));
         assert!(!answered.action_applied && p.join("bin.dat").exists());
         std::fs::write(p.join("gone.txt"), "g\n").unwrap();
-        h.commands.send(Command::Refresh).unwrap();
         let s = select(&h, "gone.txt", false, true);
         assert_eq!(act(&h, &s, ActionKind::Discard, Some(0)).action_error, None);
         assert!(!p.join("gone.txt").exists());
@@ -2020,7 +2068,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
     fn one_hunk_of_a_staged_rename_is_unstaged_and_the_rename_stands() {
         let dir = action_fixture();
         let p = dir.path();
-        let (_rt, h) = start(p, Arc::new(AtomicBool::new(true)));
+        let (_rt, h) = start_quiet(p);
         let s = select(&h, "renamed.txt", true, false);
         assert_eq!(ready(&s).unwrap().file_diff.old_path.as_deref(), Some("ren.txt"));
         assert_eq!(ready(&s).unwrap().file_diff.hunks.len(), 2);
@@ -2036,7 +2084,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         let p = dir.path();
         std::fs::remove_file(p.join("del.txt")).ok();
         std::os::unix::fs::symlink("u.txt", p.join("del.txt")).unwrap();
-        let (_rt, h) = start(p, Arc::new(AtomicBool::new(true)));
+        let (_rt, h) = start_quiet(p);
         let s = select(&h, "del.txt", false, false);
         assert_eq!(ready(&s).unwrap().file_diff.hunks.len(), 2, "a deletion and a creation");
         assert_eq!(act(&h, &s, ActionKind::DiscardFile, None).action_error, None);
@@ -2048,7 +2096,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
     fn every_act_is_answered_once_and_the_refusals_run_no_git() {
         let dir = action_fixture();
         let p = dir.path();
-        let (_rt, h) = start(p, Arc::new(AtomicBool::new(true)));
+        let (_rt, h) = start_quiet(p);
         let s = select(&h, "mm.txt", false, false);
         let diff = match &s.diff { DiffState::Ready(d) => d.clone(), _ => unreachable!() };
         // Out of range: the engine decides eligibility itself.
@@ -2076,10 +2124,36 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         // One of the two applied GAMMA, the other was refused as running; the index holds exactly one new hunk.
         let cached = git_out(p, &["diff", "--cached", "--", "mm.txt"]);
         assert!(cached.contains("+GAMMA") && !cached.contains("+DELTA"), "{cached}");
-        // The acted-on Arc is never eligible again.
-        h.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff: diff.clone(), hunk: Some(1) })).unwrap();
-        let a = wait_for(&h, "acted arc answer", |n| n.action_seq == 6);
-        assert_eq!(a.action_error.as_deref(), Some(actions::NOTICE_CHANGED));
+    }
+
+    #[test]
+    fn an_acted_on_arc_is_refused_until_its_replacement_arrives() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let gate = Arc::new(Semaphore::new(0));
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let h = spawn(rt.handle(), SessionConfig {
+            scope: Scope::Worktree, base_ref: None, state_dir: None, path: p.to_path_buf(),
+            poll_interval: Duration::from_secs(3600),
+            watcher: Arc::new(FlakyWatcher { allow: Arc::new(AtomicBool::new(true)) }),
+            git_check: ok_git(), diff_delay: None, diff_gate: Some(gate.clone()),
+        });
+        gate.add_permits(1);
+        wait_for(&h, "first", |s| ready(s).is_some());
+        gate.add_permits(2); // `select` requests the diff twice: once for its Refresh, once for the Select
+        let s = select(&h, "u.txt", false, true);
+        let diff = match &s.diff { DiffState::Ready(d) => d.clone(), _ => unreachable!() };
+        // The reload the carrying refresh requests waits at the gate, so the acted Arc stays on screen.
+        h.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff: diff.clone(), hunk: None })).unwrap();
+        let a = wait_for(&h, "answered", |n| n.action_seq == 1);
+        assert_eq!((a.action_error.as_deref(), a.action_applied), (None, true));
+        assert!(matches!(&a.diff, DiffState::Ready(d) if Arc::ptr_eq(d, &diff)), "the old Arc is still published");
+        h.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff: diff.clone(), hunk: None })).unwrap();
+        let a = wait_for(&h, "the acted arc's answer", |n| n.action_seq == 2);
+        assert_eq!((a.action_error.as_deref(), a.action_applied), (Some(actions::NOTICE_CHANGED), false));
+        assert_eq!(git_out(p, &["status", "--porcelain=v1", "--", "u.txt"]).trim(), "A  u.txt", "staged once");
+        gate.add_permits(1);
+        wait_for(&h, "a fresh arc", |n| matches!(&n.diff, DiffState::Ready(d) if !Arc::ptr_eq(d, &diff)));
     }
 
     #[test]
@@ -2113,9 +2187,9 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
     fn a_pre_image_that_changed_refuses_the_form_before_git() {
         let dir = action_fixture();
         let p = dir.path();
-        let (_rt, h) = start(p, Arc::new(AtomicBool::new(true)));
+        let (_rt, h) = start_quiet(p);
         let s = select(&h, "mm.txt", false, false);
-        // The watcher never emits and the poll is an hour away: the engine does not see this edit.
+        // The watcher never emits and the poll is an hour away (`start_quiet`): the engine does not see this edit.
         let ctx = "c1\nc2\nc3\nc4\nc5\nc6\nc7\n";
         std::fs::write(p.join("mm.txt"), format!("ALPHA\n{ctx}BETA\n{ctx}GAMMA\n{ctx}DELTA\nextra\n")).unwrap();
         let a = act(&h, &s, ActionKind::Discard, Some(0));
@@ -2123,7 +2197,8 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         assert!(!a.action_applied);
         assert!(std::fs::read_to_string(p.join("mm.txt")).unwrap().contains("GAMMA\n"));
         // A `--cached` form reads the index: an index change refuses it the same way.
-        let s = wait_for(&h, "reloaded", |n| ready(n).is_some_and(|d| d.raw_diff.contains("+extra")));
+        let s = select(&h, "mm.txt", false, false);
+        assert!(ready(&s).unwrap().raw_diff.contains("+extra"));
         git(p, &["add", "mm.txt"]);
         let a = act(&h, &s, ActionKind::Stage, Some(0));
         assert_eq!(a.action_error.as_deref(), Some(actions::NOTICE_CHANGED));
@@ -2140,7 +2215,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         std::fs::create_dir(p.join("tools")).unwrap();
         std::fs::write(p.join("tools/run"), "r\n").unwrap();
         git(p, &["add", "tools/run"]);
-        let (_rt, h) = start(p, Arc::new(AtomicBool::new(true)));
+        let (_rt, h) = start_quiet(p);
         let s = select(&h, "tools", true, false);
         assert_eq!(ready(&s).unwrap().pre_image.as_ref().map(|i| i.worktree.clone()), Some(WorktreeKind::Directory));
         let a = act(&h, &s, ActionKind::DiscardFile, None);
@@ -2182,7 +2257,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
     fn an_index_lock_is_retried_and_given_up_after_two_seconds() {
         let dir = action_fixture();
         let p = dir.path();
-        let (_rt, h) = start(p, Arc::new(AtomicBool::new(true)));
+        let (_rt, h) = start_quiet(p);
         let s = select(&h, "u.txt", false, true);
         // Held for half a second: the retry absorbs it.
         std::fs::write(p.join(".git/index.lock"), "").unwrap();
@@ -2199,7 +2274,6 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         assert!(git_out(p, &["ls-files", "--", "u.txt"]).contains("u.txt"));
         // Held past the bound: git's own message, after two seconds.
         std::fs::write(p.join("v.txt"), "v\n").unwrap();
-        h.commands.send(Command::Refresh).unwrap();
         let s = select(&h, "v.txt", false, true);
         std::fs::write(p.join(".git/index.lock"), "").unwrap();
         let started = Instant::now();
@@ -2238,7 +2312,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
     #[test]
     fn an_act_outside_a_repository_is_answered_not_a_git_repository() {
         let dir = tempfile::tempdir().unwrap();
-        let (_rt, h) = start(dir.path(), Arc::new(AtomicBool::new(true)));
+        let (_rt, h) = start_quiet(dir.path());
         let s = wait_for(&h, "not a repo", |s| matches!(s.repo, RepoState::NotARepo { .. }));
         let diff = Arc::new(LoadedDiff::build(
             FileKey { path: "x".into(), staged: false, untracked: true },
@@ -2257,7 +2331,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
     fn a_mark_and_an_action_queued_together_answer_in_order() {
         let dir = action_fixture();
         let p = dir.path();
-        let (_rt, h) = start(p, Arc::new(AtomicBool::new(true)));
+        let (_rt, h) = start_quiet(p);
         let s = select(&h, "u.txt", false, true);
         let head = git_out(p, &["rev-parse", "HEAD"]).trim().to_string();
         let diff = match &s.diff { DiffState::Ready(d) => d.clone(), _ => unreachable!() };
@@ -2468,7 +2542,9 @@ struct ActJob {
 8. Import `super::actions` and `Action` in `session.rs`.
 
 Run: `cargo test --locked --lib engine -- --test-threads=1` (with `HOME`).
-Expected: every test passes, including the sixteen new ones. Falsify three of them by hand before committing: comment out the `fresh_arc_pending` line (the staged-discard test must fail at "a fresh arc"); comment out the `DiscardStaged && Absent` check in `check_pre_image` (the MD test must fail at "git would have recreated it"); comment out the `acted` check in the command arm (the "acted arc answer" assertion must fail). Restore each.
+Expected: every test passes, including the seventeen new ones. Falsify three of them by hand before committing: comment out the `fresh_arc_pending` line (the staged-discard test must fail at "a fresh arc"); comment out the `DiscardStaged && Absent && index.is_some()` check in `check_pre_image` (the MD test must fail at "git would have recreated it"); comment out the `acted` check in the command arm (`an_acted_on_arc_is_refused_until_its_replacement_arrives` must fail at "the acted arc's answer", with the gate holding the reload so identity alone would have passed). Restore each.
+
+Note: the spec's sentence on `--index` forms and absent files was amended during planning (review round 2), so it already says what `check_pre_image` does.
 
 - [ ] **Step 6: Gates and commit**
 
@@ -2732,12 +2808,13 @@ mod tests {
         assert_eq!(lines.len(), 8);
         let text: Vec<String> = lines.iter().map(|l| l.iter().map(|s| s.text.as_str()).collect()).collect();
         assert!(text.iter().any(|l| l.contains("cannot be recovered")), "{text:?}");
-        assert!(text.last().unwrap().contains(FOOTER));
+        // The last line is the bottom border; the footer sits above it.
+        assert!(text[text.len() - 2].contains(FOOTER), "{text:?}");
     }
 }
 ```
 
-Run: `cargo test --locked --lib tui::confirm tui::format`. Expected: PASS. If the eight-line assertion fails because the frame draws fewer lines than asked, read `dialog::render`'s row loop: it pads to `height`; the test holds.
+Run: `cargo test --locked --lib tui::confirm` and then `cargo test --locked --lib tui::format` (cargo takes one filter). Expected: PASS. If the eight-line assertion fails because the frame draws fewer lines than asked, read `dialog::render`'s row loop: it pads to `height`; the test holds.
 
 - [ ] **Step 4: State: the guard, the answers, the notices**
 
@@ -3033,18 +3110,19 @@ fn open_box(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction) -> Ou
     fn an_action_answer_over_an_unread_warning_puts_it_back() {
         use crate::engine::{Mark, MarkState};
         let (mut snap, mut st) = setup(&[(1, "+")]);
-        snap.head_seen = Some("h1".repeat(20));
-        snap.mark = Some(Mark { commit: "m".repeat(40), at: 1, state: MarkState::Rewritten, classified_at: snap.head_seen.clone() });
-        st.observe(&snap);
-        assert!(st.notice.as_ref().unwrap().text.contains("no longer on this branch"));
         handle_key(&mut st, &snap, key("s"), 120);
         press_y(&mut st, &snap);
+        // One snapshot carries both the answer and a rewritten classification: the answer speaks
+        // first (8.5's rule), and the warning waits for the body key that acknowledges it.
+        snap.head_seen = Some("h1".repeat(20));
+        snap.mark = Some(Mark { commit: "m".repeat(40), at: 1, state: MarkState::Rewritten, classified_at: snap.head_seen.clone() });
         snap.action_seq = 1;
         snap.action_applied = true;
         st.observe(&snap);
         assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some("staged hunk 1/1 of a.rs"));
         handle_key(&mut st, &snap, key("t"), 120);
-        assert!(st.notice.as_ref().unwrap().text.contains("no longer on this branch"));
+        let notice = st.notice.as_ref().expect("the warning follows the answer");
+        assert!(notice.urgent && notice.text.contains("no longer on this branch"));
     }
 ```
 
@@ -3241,12 +3319,14 @@ impl Session {
         panic!("timed out waiting for {what}; last = {last:?}");
     }
 
-    /// Waits for the row to be listed first: a `Select` for an unlisted key is ignored (3.3).
+    /// A `Refresh` first, so the listing is republished even when its last snapshot was consumed;
+    /// then a `Select` for a listed key, answered by a settled `Ready` diff for it.
     fn select(&self, path: &str, staged: bool, untracked: bool) -> Arc<Snapshot> {
         let key = FileKey { path: path.into(), staged, untracked };
+        self.handle.commands.send(Command::Refresh).unwrap();
         self.recv(&format!("{key:?} listed"), |s| s.files.iter().any(|f| FileKey::of(f) == key));
         self.handle.commands.send(Command::Select(key.clone())).unwrap();
-        self.recv(&format!("{key:?} ready"), |s| matches!(&s.diff, DiffState::Ready(d) if d.key == key))
+        self.recv(&format!("{key:?} ready"), |s| !s.refreshing && matches!(&s.diff, DiffState::Ready(d) if d.key == key))
     }
 
     /// Sends the action against the published diff; returns the answer and the `apply` lines it caused.
@@ -3343,7 +3423,7 @@ fn every_action_runs_exactly_its_apply_forms_and_changes_exactly_what_the_row_sh
 
     // 2. Unstage it again from the staged row (its third hunk): one --cached -R apply; the worktree is untouched.
     let s = session.select("mm.txt", true, false);
-    let s = session.recv("three staged hunks", |n| matches!(&n.diff, DiffState::Ready(d) if d.key.staged && d.file_diff.hunks.len() == 3) && !n.refreshing);
+    assert!(matches!(&s.diff, DiffState::Ready(d) if d.file_diff.hunks.len() == 3));
     let tree_before = tree_hash(p);
     let (a, applies) = session.act(&s, ActionKind::Stage, Some(2));
     assert_eq!(a.action_error, None);
@@ -3354,14 +3434,15 @@ fn every_action_runs_exactly_its_apply_forms_and_changes_exactly_what_the_row_sh
 
     // 3. Discard both unstaged hunks: two -R applies; the index is untouched, the worktree loses GAMMA then DELTA.
     let s = session.select("mm.txt", false, false);
-    let s = session.recv("two unstaged hunks", |n| matches!(&n.diff, DiffState::Ready(d) if !d.key.staged && d.file_diff.hunks.len() == 2) && !n.refreshing);
+    assert!(matches!(&s.diff, DiffState::Ready(d) if d.file_diff.hunks.len() == 2));
     let index_before = std::fs::read(p.join(".git/index")).unwrap();
     let (a, applies) = session.act(&s, ActionKind::Discard, Some(0));
     assert_eq!(a.action_error, None);
     assert_eq!(applies, [form(" -R")]);
     assert_eq!(std::fs::read(p.join(".git/index")).unwrap(), index_before, "a worktree form left the index alone");
     assert!(std::fs::read_to_string(p.join("mm.txt")).unwrap().contains("gamma\n"));
-    let s = session.recv("one unstaged hunk", |n| matches!(&n.diff, DiffState::Ready(d) if !d.key.staged && d.file_diff.hunks.len() == 1) && !n.refreshing);
+    let s = session.select("mm.txt", false, false);
+    assert!(matches!(&s.diff, DiffState::Ready(d) if d.file_diff.hunks.len() == 1));
     let (a, applies) = session.act(&s, ActionKind::Discard, Some(0));
     assert_eq!(a.action_error, None);
     assert_eq!(applies, [form(" -R")]);
@@ -3370,7 +3451,7 @@ fn every_action_runs_exactly_its_apply_forms_and_changes_exactly_what_the_row_sh
     refs_same("discard");
 
     // 4. D on the staged row of the now-clean file: one --index -R apply; both sides return to HEAD.
-    let s = session.recv("staged row selected", |n| matches!(&n.diff, DiffState::Ready(d) if d.key.path == "mm.txt" && d.key.staged) && !n.refreshing);
+    let s = session.select("mm.txt", true, false);
     let (a, applies) = session.act(&s, ActionKind::DiscardFile, None);
     assert_eq!(a.action_error, None);
     assert_eq!(applies, [form(" --index -R")]);
@@ -3398,7 +3479,8 @@ fn every_action_runs_exactly_its_apply_forms_and_changes_exactly_what_the_row_sh
     session.handle.commands.send(Command::SetScope(Scope::Worktree)).unwrap();
 
     // 8. A stale Arc: refused, no apply.
-    let s = session.recv("worktree back", |s| s.scope == Scope::Worktree && matches!(s.diff, DiffState::Ready(_)) && !s.refreshing);
+    session.recv("worktree back", |s| s.scope == Scope::Worktree && !s.refreshing);
+    let s = session.select("md.txt", true, false);
     let stale = Action { kind: ActionKind::Stage, diff: Arc::new((**match &s.diff { DiffState::Ready(d) => d, _ => unreachable!() }).clone()), hunk: None };
     let before = std::fs::read_to_string(&log).unwrap().lines().count();
     session.handle.commands.send(Command::Act(stale)).unwrap();
@@ -3665,3 +3747,17 @@ reused, `Arc::as_ptr` on the `Arc` not the reference, `columns` instead of a sha
 `width`, and `observe` taking the pending action before it speaks. The runner is `pub`
 so the slicer task passes clippy before the engine task calls it, and the large-patch
 fixture is 120,000 lines.
+
+**Round 2 (codex, plan-complete, 2026-10-01).** Ten findings, all applied. One was a spec
+defect the plan surfaced: the absence guard for `--index` forms would have refused `D` on a
+clean staged deletion, where `--index -R` is the restore the table promises; the guard now
+applies only while the index still holds an entry (`MD`), the spec sentence is amended in
+this planning commit, and `D` on a staged deletion is tested directly. The section cutter is moved
+verbatim with its mixed-quoting tests instead of rewritten. The engine test helpers refresh
+before they select and never wait for a snapshot that may already have been consumed; the
+guard tests run with the poll an hour away and the acted-Arc case holds the reload behind the
+gate so identity alone would pass. The runner's stdin writer now sits inside the timeout and
+is aborted on expiry, with a grandchild-holds-the-pipe test. The slicer's fixture is a valid
+two-hunk diff whose slices are applied forward and reverse against real files, and the diff
+oracle compares line contents and the patch bytes against an independent `git diff`. The
+dialog footer assertion reads the penultimate line, and the two test filters run separately.
