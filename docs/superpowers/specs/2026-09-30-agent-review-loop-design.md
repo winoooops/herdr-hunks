@@ -1015,3 +1015,5 @@ Success criteria, in addition to 1.5, 7.9, 8.7 and section 9's:
     the clipboard and in `clipboard.md`.
 17. `docs/acceptance-p1.md` gains the row after section 9's with the same
     evidence columns; the release guard is unchanged.
+
+<!-- codex-reviewed: 2026-10-01T09:53:51Z -->
