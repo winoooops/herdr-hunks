@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- The vimeflow pin stays `91e45b1c` and `src/git/` is frozen. This section adds exactly one patch, `port/patches/0004-status-two-halves.patch` (Task 5), registered in `PORT-SURFACE.md`; `scripts/port-check.sh "$VIMEFLOW"` and `sh scripts/port-check-selftest.sh "$VIMEFLOW"` must pass after every task. `$VIMEFLOW` is a read-only checkout of vimeflow at that pin (on the author's machine `~/projects/vimeflow`).
+- The vimeflow pin stays `91e45b1c` and `src/git/` is frozen. This section adds exactly one patch, `port/patches/0004-status-two-halves.patch` (Task 2), registered in `PORT-SURFACE.md`; `scripts/port-check.sh "$VIMEFLOW"` and `sh scripts/port-check-selftest.sh "$VIMEFLOW"` must pass after every task. `$VIMEFLOW` is a read-only checkout of vimeflow at that pin (on the author's machine `~/projects/vimeflow`).
 - The guarantee of spec 9.6: the engine spawns only `git --version rev-parse status diff ls-files show cat-file symbolic-ref merge-base for-each-ref` and, from a confirmed `Act` only, `apply`. `tests/readonly_guarantee.rs` keeps its allow-list at ten. Every revision or object id is one argv element, never interpolated into a shell; a patch is bytes on stdin.
 - Every `apply` is `git -c apply.ignoreWhitespace=no -C <toplevel> apply --whitespace=nowarn [--cached | --index] [-R]`, run from `RepoState::Repo.toplevel`.
 - Every diff the engine builds carries `--no-color --no-ext-diff --no-textconv -U3 --src-prefix=a/ --dst-prefix=b/`; the frozen `get_git_diff_inner` is no longer called.
@@ -30,35 +30,35 @@
 
 Inputs the spec implies but no task's tests would otherwise exercise; each has its test added to the owning task.
 
-1. A path with a space and a tab in its name, which git quotes in the `diff --git` header: the section cutter, the rename header rewrite and the pre-image must all name the same file (Task 1 test `a_quoted_path_is_cut_and_pre_imaged`, Task 2 test `a_rename_section_keeps_gits_quoting`).
-2. A `y` pressed twice fast, or `s` held with key repeat: the second press after `y` must say `an action is still running` and never queue a second `Act`; the engine must still answer the first exactly once (Task 4 test `a_second_key_while_an_action_is_running_opens_nothing`, Task 3 test `a_second_act_while_one_is_queued_is_answered_without_git`).
-3. A row whose diff's first hunk the size cap cut: the hunk stepper reads `1/1` but `s` must refuse, and so must `D` (Task 4 test `a_cut_diff_refuses_every_key`).
-4. The watcher's own trigger for the files the action changed, arriving while the carrying refresh is in flight: exactly one follow-up refresh runs and the answer is published once (Task 3 test `the_watchers_trigger_for_the_actions_writes_coalesces`).
+1. A path with a space and a tab in its name, which git quotes in the `diff --git` header: the section cutter, the rename header rewrite and the pre-image must all name the same file (Task 1 test `a_quoted_path_is_cut_and_pre_imaged`, Task 3 test `a_rename_section_keeps_gits_quoting`).
+2. A `y` pressed twice fast, or `s` held with key repeat: the second press after `y` must say `an action is still running` and never queue a second `Act`; the engine must still answer the first exactly once (Task 5 test `a_second_key_while_an_action_is_running_opens_nothing`, Task 4 test `a_second_act_while_one_is_queued_is_answered_without_git`).
+3. A row whose diff's first hunk the size cap cut: the hunk stepper reads `1/1` but `s` must refuse, and so must `D` (Task 5 test `a_cut_diff_refuses_every_key`).
+4. The watcher's own trigger for the files the action changed, arriving while the carrying refresh is in flight: exactly one follow-up refresh runs and the answer is published once (Task 4 test `the_watchers_trigger_for_the_actions_writes_coalesces`).
 5. `D` on an untracked file inside a new directory (`newdir/deep/u.txt`): the patch's path has a directory, `apply -R` removes the file and git leaves the empty directory; the row disappears and nothing else changes (Task 6, in `tests/hunk_actions.rs`, case `delete_nested_untracked`).
 
 ## File Structure
 
 ```
 src/engine/types.rs        PreImage, WorktreeKind, LoadedDiff.{patch, pre_image}, Snapshot.{action_seq,
-                           action_error, action_applied}, ActionKind, Action, Command::Act (Tasks 1, 3)
+                           action_error, action_applied}, ActionKind, Action, Command::Act (Tasks 1, 4)
 src/engine/sections.rs     NEW: keep_sections/sections over bytes, moved out of branch.rs (Task 1)
 src/engine/worktree.rs     NEW: the two worktree diff commands, rename sources for both sides, the
                            pre-image reads and hash (Task 1)
 src/engine/branch.rs       diff() keeps bytes and uses sections.rs; untracked_diff() moves to worktree.rs (Task 1)
 src/engine/session.rs      the diff lane and supersession check (K6), load_rows' rename probes,
                            Change::Act, the carrying refresh, answers, the acted Arc, the fresh-Arc reload,
-                           the selection rule (Tasks 1, 3)
-src/engine/actions.rs      NEW: Form, Direction, classify, hunk_patch, whole_patch, the apply runner (Task 2)
-src/engine/mod.rs          module list (Tasks 1, 2)
-src/tui/keys.rs            s d D; RESERVED (Task 4)
-src/tui/confirm.rs         NEW: Confirm { kind, diff, hunk, title, body, warning, drawn }, panel() (Task 4)
-src/tui/state.rs           confirm, pending_action, observe for action answers (Task 4)
-src/tui/input.rs           the three keys, eligibility, the box's y/n, the guard (Task 4)
-src/tui/view.rs            the toolbar group, footer hints, the box overlay, body_is_drawn (Task 4)
-src/tui/shell.rs           confirm.drawn after each frame (Task 4)
-src/git/mod.rs             via port/patches/0004-status-two-halves.patch only (Task 5)
-PORT-SURFACE.md            patch 0004, D7, D4 amended, K1-K7 closed, the called-function list (Task 5)
-src/git_diff_response_tests.rs  MD and AD in the status fixture (Task 5)
+                           the selection rule (Tasks 1, 4)
+src/engine/actions.rs      NEW: Form, Direction, classify, hunk_patch, whole_patch, the apply runner (Task 3)
+src/engine/mod.rs          module list (Tasks 1, 3)
+src/tui/keys.rs            s d D; RESERVED (Task 5)
+src/tui/confirm.rs         NEW: Confirm { kind, diff, hunk, title, body, warning, drawn }, panel() (Task 5)
+src/tui/state.rs           confirm, pending_action, observe for action answers (Task 5)
+src/tui/input.rs           the three keys, eligibility, the box's y/n, the guard (Task 5)
+src/tui/view.rs            the toolbar group, footer hints, the box overlay, body_is_drawn (Task 5)
+src/tui/shell.rs           confirm.drawn after each frame (Task 5)
+src/git/mod.rs             via port/patches/0004-status-two-halves.patch only (Task 2)
+PORT-SURFACE.md            patch 0004, D7, D4 amended, K1-K7 closed, the called-function list (Task 2)
+src/git_diff_response_tests.rs  MD and AD in the status fixture (Task 2)
 tests/readonly_guarantee.rs  the four-flag and name-status assertions (Task 1)
 tests/hunk_actions.rs      NEW: the recording session of spec 9.6 (Task 6)
 tests/e2e_real_herdr.rs    presses s then y (Task 6)
@@ -223,7 +223,7 @@ pub fn sections(raw: &[u8]) -> Vec<&[u8]> {
 }
 ```
 
-Then simplify: delete the `names_row` function and the `let _ = names_row;` line (they are vestiges of the copy; the match in `keep_sections` is the rule). Keep `split_header` public: Task 2 reuses it. Move the existing tests of `keep_sections`/`split_header` from `branch.rs` into this file's `#[cfg(test)] mod tests`, changing `&str` fixtures to `b"..."` where the function takes bytes. Add `pub mod sections;` to `src/engine/mod.rs`, and replace `branch.rs`'s `keep_sections`, `sections`, `quoted_end`, `split_header` and `names_row` with `use super::sections::{keep_sections, sections};`. In `branch::diff`, replace
+Then simplify: delete the `names_row` function and the `let _ = names_row;` line (they are vestiges of the copy; the match in `keep_sections` is the rule). Keep `split_header` public: Task 3 reuses it. Move the existing tests of `keep_sections`/`split_header` from `branch.rs` into this file's `#[cfg(test)] mod tests`, changing `&str` fixtures to `b"..."` where the function takes bytes. Add `pub mod sections;` to `src/engine/mod.rs`, and replace `branch.rs`'s `keep_sections`, `sections`, `quoted_end`, `split_header` and `names_row` with `use super::sections::{keep_sections, sections};`. In `branch::diff`, replace
 
 ```rust
     let raw_diff = keep_sections(&String::from_utf8_lossy(&output.stdout), path, old);
@@ -653,16 +653,18 @@ initialised as `Arc::new(Semaphore::new(1))` and `Arc::new(AtomicU64::new(0))`. 
             // Open the bracket under the lane and before any delay or gate.
             let before = base::read_head(&toplevel).await;
             head_samples.fetch_add(1, Ordering::SeqCst);
+            // The first pre-image reading precedes the delay and the gate, so the two readings
+            // bracket everything that can wait; an edit landing in between leaves no pre-image.
+            let pre = match &comparison {
+                Comparison::Worktree => worktree::pre_image(&toplevel, &key.path).await.ok(),
+                Comparison::Branch { .. } => None,
+            };
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
             if let Some(gate) = gate {
                 gate.acquire().await.expect("diff gate closed").forget();
             }
-            let pre = match &comparison {
-                Comparison::Worktree => worktree::pre_image(&toplevel, &key.path).await.ok(),
-                Comparison::Branch { .. } => None,
-            };
             let result = match &comparison {
                 Comparison::Branch { merge_base } if !key.untracked => {
                     branch::diff(&toplevel, merge_base, &key.path, old.as_deref()).await
@@ -806,7 +808,211 @@ git commit -m "feat(engine): build the worktree diffs with bytes and a pre-image
 
 ---
 
-### Task 2: The slicer and the apply runner
+### Task 2: Patch 0004 (K5) and the port registry
+
+Implements spec 9.5 whole: the K5 patch, the K1-K7 table, D7 and the D4 amendment in `PORT-SURFACE.md`, and 9.8 item 6. Read 9.5 and the "Port method" paragraph of spec 2.2 before starting. The frozen tree is edited only through the patch file: edit `src/git/mod.rs`, produce the patch with `git diff`, and let `port-check` prove they agree.
+
+**Files:**
+- Create: `port/patches/0004-status-two-halves.patch`
+- Modify: `src/git/mod.rs` (by the patch: `parse_git_status`'s default arm and a test), `PORT-SURFACE.md`, `src/git_diff_response_tests.rs`
+
+**Interfaces:**
+- Consumes: nothing new.
+- Produces: `parse_git_status` yields two rows for `MD`, `AD`, `TM`, `MT` and one row with the right side for `T ` and ` T`.
+
+- [ ] **Step 1: Write the failing frozen-module test**
+
+In `src/git/mod.rs`'s test module, after `test_parse_git_status_renamed_deleted_dual_entry`:
+
+```rust
+    #[test]
+    fn test_parse_git_status_splits_every_two_sided_code() {
+        // X is the index side, Y the worktree side; each non-blank side is one row.
+        let output = "MD md.txt\0AD ad.txt\0T  t1.txt\0 T t2.txt\0TM tm.txt\0MT mt.txt\0";
+        let files = parse_git_status(output);
+        let rows: Vec<(&str, bool, &str)> = files
+            .iter()
+            .map(|f| {
+                let status = match f.status {
+                    ChangedFileStatus::Modified => "M",
+                    ChangedFileStatus::Added => "A",
+                    ChangedFileStatus::Deleted => "D",
+                    ChangedFileStatus::Renamed => "R",
+                    ChangedFileStatus::Untracked => "?",
+                };
+                (f.path.as_str(), f.staged, status)
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("md.txt", true, "M"),
+                ("md.txt", false, "D"),
+                ("ad.txt", true, "A"),
+                ("ad.txt", false, "D"),
+                ("t1.txt", true, "M"),
+                ("t2.txt", false, "M"),
+                ("tm.txt", true, "M"),
+                ("tm.txt", false, "M"),
+                ("mt.txt", true, "M"),
+                ("mt.txt", false, "M"),
+            ]
+        );
+        // A letter outside M A D T keeps the old single unstaged row.
+        let files = parse_git_status("ZZ odd.txt\0");
+        assert_eq!(files.len(), 1);
+        assert!(!files[0].staged);
+        assert!(matches!(files[0].status, ChangedFileStatus::Modified));
+    }
+```
+
+Run: `cargo test --locked --lib git::tests::test_parse_git_status_splits_every_two_sided_code`
+Expected: FAIL: `md.txt` is one unstaged `Modified` row (the K5 defect, seen before the fix).
+
+- [ ] **Step 2: Replace the default arm**
+
+In `parse_git_status`, the arm
+
+```rust
+            _ => {
+                // Default to modified unstaged for unknown codes
+                files.push(ChangedFile {
+                    path,
+                    status: ChangedFileStatus::Modified,
+                    staged: false,
+                    insertions: None,
+                    deletions: None,
+                });
+            }
+```
+
+becomes
+
+```rust
+            _ => {
+                // Each known side is its own row: X staged, Y unstaged. Unknown codes
+                // keep the old single unstaged Modified row.
+                let side = |code: u8| match code {
+                    b'M' | b'T' => Some(ChangedFileStatus::Modified),
+                    b'A' => Some(ChangedFileStatus::Added),
+                    b'D' => Some(ChangedFileStatus::Deleted),
+                    _ => None,
+                };
+                let bytes = xy.as_bytes();
+                let staged_half = side(bytes[0]);
+                let unstaged_half = side(bytes[1]);
+                if staged_half.is_none() && unstaged_half.is_none() {
+                    files.push(ChangedFile {
+                        path,
+                        status: ChangedFileStatus::Modified,
+                        staged: false,
+                        insertions: None,
+                        deletions: None,
+                    });
+                } else {
+                    if let Some(status) = staged_half {
+                        files.push(ChangedFile {
+                            path: path.clone(),
+                            status,
+                            staged: true,
+                            insertions: None,
+                            deletions: None,
+                        });
+                    }
+                    if let Some(status) = unstaged_half {
+                        files.push(ChangedFile {
+                            path,
+                            status,
+                            staged: false,
+                            insertions: None,
+                            deletions: None,
+                        });
+                    }
+                }
+            }
+```
+
+`xy` is two bytes long (the parser checked `entry.len() >= 3`), so the indexing holds; a `' '` side maps to `None`, which is what makes `T ` one staged row and ` T` one unstaged row. The explicit arms above it (`MM`, `AM`, `M `, ` M`, `A `, ` A`, `D `, ` D`, the rename arm, the conflict arms) are untouched, so every existing status test keeps passing.
+
+Run: `cargo test --locked --lib git::tests::test_parse_git_status` and `cargo fmt --check`.
+Expected: all status tests pass. If `rustfmt` reflows the arm, the patch must match the formatted text: run `cargo fmt` before producing the patch (spec `AGENTS.md`: a patch matching unformatted text silently tests the wrong thing).
+
+- [ ] **Step 3: Produce and register the patch**
+
+```bash
+git diff -- src/git/mod.rs > /tmp/0004.diff
+{
+  printf 'Reason: K5 (spec 9.5). parse_git_status split MM, AM and the rename codes into two rows but sent\n'
+  printf 'MD, AD and the T codes to its default arm, which produced one unstaged Modified row and hid the\n'
+  printf 'staged half. The default arm now splits X and Y into up to two rows; unknown letters keep the\n'
+  printf 'old row. One test added beside the other parse_git_status tests.\n\n'
+  cat /tmp/0004.diff
+} > port/patches/0004-status-two-halves.patch
+```
+
+Check the patch applies to the pristine pin the way `port-check` applies it: `scripts/port-check.sh "$VIMEFLOW"` must print `... + 4 patch(es)` once `PORT-SURFACE.md` names it (next step); until then it fails with `patch 0004-status-two-halves.patch is not registered`, which is the registry doing its job.
+
+- [ ] **Step 4: `PORT-SURFACE.md`**
+
+Edit the registry:
+
+1. "Pin" paragraph: `Four patches are registered: ... 0003-engine-visibility.patch (D6) and 0004-status-two-halves.patch (K5).`
+2. "Port surface" list of called frozen functions: remove `get_git_diff_inner` and add the sentence `get_git_diff_inner is no longer called from the engine (D7); git_diff_response_tests keeps testing it and the engine's diff tests use it as their oracle.` The line `The mutating git functions are copied but are not called in Phase 1.` becomes `The mutating git functions are copied and are not called; every mutation runs through engine::actions (spec 9.2).`
+3. After D6, add:
+
+```markdown
+**D7 (hunk actions): engine-built diffs.** Every diff the viewer shows is built
+by the engine (`src/engine/worktree.rs`, `src/engine/branch.rs`) with
+`--no-color --no-ext-diff --no-textconv -U3 --src-prefix=a/ --dst-prefix=b/`,
+in both scopes, and the output bytes are kept beside the parsed hunks
+(`LoadedDiff.patch`) so an action applies back exactly what was read: a
+converted text (textconv) cannot be applied, a hunk cut from a diff without
+context lands at the wrong line, and a prefix the user configured away cannot
+be parsed by `git apply` (spec 9.2). The frozen `get_git_diff_inner` is no
+longer called; it stays in the tree as the oracle of the engine's diff tests.
+**D4 is amended by D7:** textconv filters are no longer left on. A binary file
+with a textconv driver shows as binary and is refused by the actions; a text
+file with one shows its raw text. D4's patch is unchanged because the frozen
+calls it touches still exist.
+```
+
+4. "Known defects": retitle the paragraph `**K1-K7: known defects, closed in 0.0.4.**` and replace each bullet's last sentence with how 0.0.4 closes it, copying the "How 0.0.4 fixes it" column of spec 9.5's table: K1-K3 and K7 "not reached" (the engine's forms and diffs), K4 the slicer's header rewrite, K5 patch 0004, K6 the diff lane. Keep the original description of each defect so the history stays readable.
+
+Run: `scripts/port-check.sh "$VIMEFLOW" && sh scripts/port-check-selftest.sh "$VIMEFLOW"`
+Expected: `port-check: src/git matches 91e45b1c + 4 patch(es)` and the selftest's usual lines.
+
+- [ ] **Step 5: The status fixture**
+
+In `src/git_diff_response_tests.rs`, `status_rows_cover_the_criterion_one_fixture`: after the `AM` lines add
+
+```rust
+    std::fs::write(p.join("md.txt"), "m\n").unwrap();
+    std::fs::write(p.join("ad.txt"), "x\n").unwrap();
+    git(p, &["add", "md.txt"]);
+    git(p, &["commit", "-q", "-m", "md"]);
+    std::fs::write(p.join("md.txt"), "M\n").unwrap();
+    git(p, &["add", "md.txt", "ad.txt"]);
+    std::fs::remove_file(p.join("md.txt")).unwrap(); // MD
+    std::fs::remove_file(p.join("ad.txt")).unwrap(); // AD
+```
+
+(the `md.txt` commit must come before `del.txt` and `ren.txt` are staged, so place these lines right after the `init` commit and move the `am.txt` lines accordingly; the row order asserted below is by membership, not position) and extend the expected rows with `("md.txt", true), ("md.txt", false), ("ad.txt", true), ("ad.txt", false)`.
+
+Run: `cargo test --locked --lib git_diff_response_tests -- --test-threads=1` (with `HOME`).
+Expected: PASS. Falsify: revert the patch (`git stash`-free: `git checkout -- src/git/mod.rs` temporarily), run again, expect `missing row ("md.txt", true)`, restore with `patch -p1 < port/patches/0004-status-two-halves.patch`.
+
+- [ ] **Step 6: Gates and commit**
+
+Run the full gate line. Expected: all green, four patches.
+
+```bash
+git add port/patches/0004-status-two-halves.patch src/git/mod.rs PORT-SURFACE.md src/git_diff_response_tests.rs
+git commit -m "fix(git): split every two-sided status code into its rows"
+```
+
+---
+
+### Task 3: The slicer and the apply runner
 
 Implements spec 9.2 "The row decides the direction" (the forms), "Slicing a hunk" (sections, headers, coordinates), "What cannot be acted on" (the binary and submodule detection) and 9.4 "The runner". Read them before starting. Everything here is pure or runs git against a fixture; nothing touches the session yet.
 
@@ -849,9 +1055,9 @@ pub enum Refusal {
     /// git's first non-empty stderr line, or the spawn/timeout text.
     Failed(String),
 }
-pub(crate) async fn apply(toplevel: &str, form: Form, patch: &[u8]) -> Result<(), Refusal>;
+pub async fn apply(toplevel: &str, form: Form, patch: &[u8]) -> Result<(), Refusal>;   // pub: no caller until the engine task, and clippy's dead-code gate runs per task
 /// The same with the program and the timeout injected, for tests.
-pub(crate) async fn apply_with(program: &str, timeout: Duration, toplevel: &str, form: Form, patch: &[u8]) -> Result<(), Refusal>;
+pub async fn apply_with(program: &str, timeout: Duration, toplevel: &str, form: Form, patch: &[u8]) -> Result<(), Refusal>;
 ```
 
 - [ ] **Step 1: Write the slicer tests**
@@ -1249,7 +1455,7 @@ Append to the tests module:
     #[test]
     fn a_large_patch_on_stdin_applies() {
         let (dir, top) = repo();
-        let body: String = (0..70_000).map(|i| format!("line {i}\n")).collect();
+        let body: String = (0..120_000).map(|i| format!("line {i}\n")).collect();
         std::fs::write(dir.path().join("big.txt"), &body).unwrap();
         let patch = Proc::new("git").arg("-C").arg(dir.path()).args(["diff", "--no-index", "-U3", "--", "/dev/null", "big.txt"]).output().unwrap().stdout;
         assert!(patch.len() > 1 << 20, "the fixture must exceed the pipe buffer");
@@ -1274,12 +1480,12 @@ pub enum Refusal {
 
 const APPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(crate) async fn apply(toplevel: &str, form: Form, patch: &[u8]) -> Result<(), Refusal> {
+pub async fn apply(toplevel: &str, form: Form, patch: &[u8]) -> Result<(), Refusal> {
     apply_with("git", APPLY_TIMEOUT, toplevel, form, patch).await
 }
 
 /// `git -c apply.ignoreWhitespace=no -C <toplevel> apply --whitespace=nowarn <flags>`, the patch on stdin.
-pub(crate) async fn apply_with(
+pub async fn apply_with(
     program: &str,
     timeout: Duration,
     toplevel: &str,
@@ -1359,7 +1565,7 @@ git commit -m "feat(engine): slice hunk patches and run git apply"
 
 ---
 
-### Task 3: `Command::Act`: carried by one refresh, answered once, guarded three ways
+### Task 4: `Command::Act`: carried by one refresh, answered once, guarded three ways
 
 Implements spec 9.2 "The row decides the direction", "Discarding a file discards what the row shows", "What cannot be acted on" (the engine side), "Stale content", "After the action"; 9.4 "The command", "Carried by one refresh", "Answers", "Supersession"; and 9.7's engine rows. Read them before starting.
 
@@ -1369,7 +1575,7 @@ Implements spec 9.2 "The row decides the direction", "Discarding a file discards
 - Modify: `src/engine/session.rs` (`Change::Act`, `ActJob`, `Job.act`, `run_job`, `Done::Status.acted`, the `Command::Act` arm, the `Done::Status` and `Done::Diff` handlers, `State.{in_flight_act, acted, fresh_arc_pending, action_seq}`, `fingerprint`)
 
 **Interfaces:**
-- Consumes: Task 1's `LoadedDiff.{patch, pre_image}`, `worktree::pre_image`; Task 2's `Form`, `hunk_patch`, `hunk_count`, `classify`, `apply`, `Refusal`.
+- Consumes: Task 1's `LoadedDiff.{patch, pre_image}`, `worktree::pre_image`; Task 3's `Form`, `hunk_patch`, `hunk_count`, `classify`, `apply`, `Refusal`.
 - Produces:
 
 ```rust
@@ -1401,7 +1607,7 @@ pub(crate) async fn check_pre_image(toplevel: &str, action: &Action, form: Form)
 /// Check, apply, retry on `index.lock` for up to 2 s re-checking before each retry. `.1` is whether a form ran.
 pub(crate) async fn run(toplevel: &str, action: &Action, form: Form, patch: &[u8]) -> (Result<(), String>, bool);
 
-// notice texts, pub consts in actions.rs so the TUI (Task 4) shows the same words:
+// notice texts, pub consts in actions.rs so the TUI (Task 5) shows the same words:
 pub const NOTICE_SCOPE: &str = "switch to worktree scope (b) to stage or discard";
 pub const NOTICE_NO_HUNK: &str = "no hunk under the cursor";
 pub const NOTICE_CUT: &str = "diff cut by the size cap; use a shell";
@@ -1437,7 +1643,7 @@ In `src/engine/actions.rs` tests, add a builder and the eligibility cases:
     use std::sync::Arc;
 
     fn loaded(path: &str, staged: bool, untracked: bool, comparison: Comparison, patch: &[u8], cap: usize) -> Arc<LoadedDiff> {
-        let file_diff = crate::engine::worktree::tests::parse_for_tests(patch, path);
+        let file_diff = crate::engine::worktree::parse_for_tests(patch, path);
         let response = GetGitDiffResponse {
             file_diff,
             old_text: String::new(),
@@ -1496,7 +1702,7 @@ In `src/engine/actions.rs` tests, add a builder and the eligibility cases:
     }
 ```
 
-`parse_for_tests` is a one-line `#[cfg(test)] pub(crate)` wrapper in `worktree.rs`'s test module around the private `parse_sections` (add it: `pub(crate) fn parse_for_tests(patch: &[u8], path: &str) -> FileDiff { super::parse_sections(patch, path) }`).
+`parse_for_tests` is a one-line wrapper at module level in `worktree.rs`, outside its test module so another module's tests can reach it: `#[cfg(test)] pub(crate) fn parse_for_tests(patch: &[u8], path: &str) -> FileDiff { parse_sections(patch, path) }`.
 
 Run: `cargo test --locked --lib engine::actions::tests::the_plan`
 Expected: compile error, `plan` and the `NOTICE_*` constants undefined.
@@ -1613,7 +1819,7 @@ Expected: PASS.
 In `session.rs`'s test module, add a fixture with every row kind and a helper that sends an `Act` against the published diff and waits for its answer:
 
 ```rust
-    use crate::engine::{Action, ActionKind};
+    use crate::engine::{Action, ActionKind, WorktreeKind};
 
     /// mm.txt: two hunks staged, two unstaged. am.txt: staged creation plus an unstaged edit.
     /// del.txt: worktree deletion. sdel.txt: staged deletion. ren.txt -> renamed.txt staged with two
@@ -1649,13 +1855,12 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         dir
     }
 
-    fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
-        let out = Proc::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    }
+    // `git_out` already exists in this module (the branch-scope tests); reuse it.
 
+    /// Waits for the row to be listed first: a `Select` for an unlisted key is ignored (3.3).
     fn select(h: &EngineHandle, path: &str, staged: bool, untracked: bool) -> Arc<Snapshot> {
         let key = FileKey { path: path.into(), staged, untracked };
+        wait_for(h, &format!("{key:?} listed"), |s| s.files.iter().any(|f| FileKey::of(f) == key));
         h.commands.send(Command::Select(key.clone())).unwrap();
         wait_for(h, &format!("{key:?} ready"), |s| ready(s).is_some_and(|d| d.key == key))
     }
@@ -1726,7 +1931,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         assert!(git_out(p, &["diff", "--", "mm.txt"]).contains("+GAMMA"));
         // A refused form on unchanged content still publishes a fresh Arc.
         let before = match &s.diff { DiffState::Ready(d) => Arc::as_ptr(d), _ => unreachable!() };
-        let fresh = wait_for(&h, "a fresh arc", |n| ready(n).is_some_and(|d| d.key.staged && !std::ptr::eq(Arc::as_ptr(d), before)));
+        let fresh = wait_for(&h, "a fresh arc", |n| matches!(&n.diff, DiffState::Ready(d) if d.key.staged && !std::ptr::eq(Arc::as_ptr(d), before)));
         assert_eq!(ready(&fresh).unwrap().file_diff.hunks.len(), 2);
         // Stage the rest, then the discard is clean and removes the hunk from both sides.
         git(p, &["add", "mm.txt"]);
@@ -1757,12 +1962,14 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         let s = select(&h, "del.txt", false, false);
         assert_eq!(act(&h, &s, ActionKind::Discard, Some(0)).action_error, None);
         assert_eq!(std::fs::read_to_string(p.join("del.txt")).unwrap(), "d\n");
-        // s on a staged deletion moves it to the worktree side; D then recreates the file.
+        // s on a staged deletion moves it to the worktree side; D on that unstaged row recreates the file.
         let s = select(&h, "sdel.txt", true, false);
         assert_eq!(act(&h, &s, ActionKind::Stage, Some(0)).action_error, None);
         assert_eq!(git_out(p, &["status", "--porcelain=v1", "--", "sdel.txt"]).trim(), "D sdel.txt");
-        git(p, &["rm", "-q", "--cached", "sdel.txt"]);
-        git(p, &["add", "sdel.txt"]);
+        let s = settled(&h, "sdel.txt", false);
+        assert_eq!(act(&h, &s, ActionKind::DiscardFile, None).action_error, None);
+        assert_eq!(std::fs::read_to_string(p.join("sdel.txt")).unwrap(), "s\n");
+        assert_eq!(git_out(p, &["status", "--porcelain=v1", "--", "sdel.txt"]).trim(), "");
         // MD: staged edit, file removed from the worktree. D on the staged row must not recreate it.
         std::fs::write(p.join("md.txt"), "m\n").unwrap();
         git(p, &["add", "md.txt"]);
@@ -1847,12 +2054,15 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         // Out of range: the engine decides eligibility itself.
         let a = act(&h, &s, ActionKind::Stage, Some(9));
         assert_eq!((a.action_seq, a.action_error.as_deref(), a.action_applied), (1, Some(actions::NOTICE_NO_HUNK), false));
-        // A branch-scope Arc.
-        let mut branch = (*diff).clone();
-        branch.comparison = Comparison::Branch { merge_base: "m".repeat(40) };
-        h.commands.send(Command::Act(Action { kind: ActionKind::DiscardFile, diff: Arc::new(branch), hunk: None })).unwrap();
-        let a = wait_for(&h, "scope answer", |n| n.action_seq == 2);
-        assert_eq!(a.action_error.as_deref(), Some(actions::NOTICE_SCOPE));
+        // Scope: a diff really published in branch scope (the fixture's base is refs/heads/main).
+        h.commands.send(Command::SetScope(Scope::Branch)).unwrap();
+        let b = wait_for(&h, "branch diff", |n| n.scope == Scope::Branch && ready(n).is_some() && !n.refreshing);
+        let a = act(&h, &b, ActionKind::DiscardFile, None);
+        assert_eq!((a.action_seq, a.action_error.as_deref()), (2, Some(actions::NOTICE_SCOPE)));
+        h.commands.send(Command::SetScope(Scope::Worktree)).unwrap();
+        wait_for(&h, "worktree back", |n| n.scope == Scope::Worktree && !n.refreshing);
+        let s = select(&h, "mm.txt", false, false);
+        let diff = match &s.diff { DiffState::Ready(d) => d.clone(), _ => unreachable!() };
         // A stale Arc: a clone with the same content is not the published one.
         h.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff: Arc::new((*diff).clone()), hunk: Some(0) })).unwrap();
         let a = wait_for(&h, "stale answer", |n| n.action_seq == 3);
@@ -1863,8 +2073,6 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         h.commands.send(Command::Act(first.clone())).unwrap();
         h.commands.send(Command::Act(Action { hunk: Some(1), ..first })).unwrap();
         let a = wait_for(&h, "both answered", |n| n.action_seq == 5);
-        let errors: Vec<Option<String>> = vec![a.action_error.clone()];
-        let _ = errors;
         // One of the two applied GAMMA, the other was refused as running; the index holds exactly one new hunk.
         let cached = git_out(p, &["diff", "--cached", "--", "mm.txt"]);
         assert!(cached.contains("+GAMMA") && !cached.contains("+DELTA"), "{cached}");
@@ -1922,6 +2130,130 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
     }
 
     #[test]
+    fn a_working_tree_form_on_a_directory_is_refused() {
+        let dir = action_fixture();
+        let p = dir.path();
+        std::fs::write(p.join("tools"), "x\n").unwrap();
+        git(p, &["add", "tools"]);
+        git(p, &["commit", "-q", "-m", "tools"]);
+        git(p, &["rm", "-q", "tools"]);
+        std::fs::create_dir(p.join("tools")).unwrap();
+        std::fs::write(p.join("tools/run"), "r\n").unwrap();
+        git(p, &["add", "tools/run"]);
+        let (_rt, h) = start(p, Arc::new(AtomicBool::new(true)));
+        let s = select(&h, "tools", true, false);
+        assert_eq!(ready(&s).unwrap().pre_image.as_ref().map(|i| i.worktree.clone()), Some(WorktreeKind::Directory));
+        let a = act(&h, &s, ActionKind::DiscardFile, None);
+        assert_eq!(a.action_error.as_deref(), Some(actions::NOTICE_NOT_A_FILE));
+        assert!(!a.action_applied && p.join("tools/run").exists());
+        // The index-only form is fine: unstaging the deletion needs no file.
+        assert_eq!(act(&h, &settled(&h, "tools", true), ActionKind::Stage, Some(0)).action_error, None);
+        assert!(git_out(p, &["ls-files", "--", "tools"]).contains("tools"));
+    }
+
+    #[test]
+    fn an_edit_during_the_diff_read_leaves_no_pre_image_and_refuses_the_key() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let h = spawn(rt.handle(), SessionConfig {
+            scope: Scope::Worktree, base_ref: None, state_dir: None, path: p.to_path_buf(),
+            poll_interval: Duration::from_secs(3600),
+            watcher: Arc::new(FlakyWatcher { allow: Arc::new(AtomicBool::new(true)) }),
+            git_check: ok_git(), diff_delay: Some(Duration::from_millis(400)), diff_gate: None,
+        });
+        let s = select(&h, "u.txt", false, true);
+        assert!(ready(&s).unwrap().pre_image.is_some());
+        // The reload sleeps between its first pre-image read and the diff; the edit lands in that window.
+        h.commands.send(Command::Refresh).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        std::fs::write(p.join("u.txt"), "u\nmore\n").unwrap();
+        let s = wait_for(&h, "the reload", |n| !n.refreshing && ready(n).is_some_and(|d| d.raw_diff.contains("+more")));
+        assert!(ready(&s).unwrap().pre_image.is_none(), "the two readings disagreed");
+        let a = act(&h, &s, ActionKind::Stage, None);
+        assert_eq!((a.action_error.as_deref(), a.action_applied), (Some(actions::NOTICE_CHANGED), false));
+        // The next reload, with nothing moving, carries a pre-image again.
+        h.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&h, "settled reload", |n| !n.refreshing && ready(n).is_some_and(|d| d.pre_image.is_some()));
+        assert_eq!(act(&h, &s, ActionKind::Stage, None).action_error, None);
+    }
+
+    #[test]
+    fn an_index_lock_is_retried_and_given_up_after_two_seconds() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let (_rt, h) = start(p, Arc::new(AtomicBool::new(true)));
+        let s = select(&h, "u.txt", false, true);
+        // Held for half a second: the retry absorbs it.
+        std::fs::write(p.join(".git/index.lock"), "").unwrap();
+        let lock = p.join(".git/index.lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            std::fs::remove_file(lock).unwrap();
+        });
+        let started = Instant::now();
+        let a = act(&h, &s, ActionKind::Stage, None);
+        release.join().unwrap();
+        assert_eq!(a.action_error, None);
+        assert!(started.elapsed() >= Duration::from_millis(400), "the first attempt must have hit the lock");
+        assert!(git_out(p, &["ls-files", "--", "u.txt"]).contains("u.txt"));
+        // Held past the bound: git's own message, after two seconds.
+        std::fs::write(p.join("v.txt"), "v\n").unwrap();
+        h.commands.send(Command::Refresh).unwrap();
+        let s = select(&h, "v.txt", false, true);
+        std::fs::write(p.join(".git/index.lock"), "").unwrap();
+        let started = Instant::now();
+        let a = act(&h, &s, ActionKind::Stage, None);
+        std::fs::remove_file(p.join(".git/index.lock")).unwrap();
+        assert!(a.action_error.as_deref().is_some_and(|e| e.contains("index.lock")), "{:?}", a.action_error);
+        assert!(a.action_applied);
+        assert!(started.elapsed() >= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_diff_read_before_the_action_is_never_published_after_it() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let h = spawn(rt.handle(), SessionConfig {
+            scope: Scope::Worktree, base_ref: None, state_dir: None, path: p.to_path_buf(),
+            poll_interval: Duration::from_secs(3600),
+            watcher: Arc::new(FlakyWatcher { allow: Arc::new(AtomicBool::new(true)) }),
+            git_check: ok_git(), diff_delay: Some(Duration::from_millis(400)), diff_gate: None,
+        });
+        let s = select(&h, "u.txt", false, true);
+        let diff = match &s.diff { DiffState::Ready(d) => d.clone(), _ => unreachable!() };
+        let discarded_before = h.diffs_discarded.load(Ordering::SeqCst);
+        // A slow reload of the row is in flight when the action is queued.
+        h.commands.send(Command::Refresh).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        h.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff, hunk: None })).unwrap();
+        let answered = wait_for(&h, "answered", |n| n.action_seq == 1);
+        assert_eq!(answered.action_error, None);
+        let after = wait_for(&h, "the post-action diff", |n| !n.refreshing && ready(n).is_some_and(|d| d.key.path == "u.txt" && d.key.staged));
+        assert!(h.diffs_discarded.load(Ordering::SeqCst) > discarded_before, "the pre-action read was published");
+        assert!(ready(&after).unwrap().raw_diff.contains("+u"));
+    }
+
+    #[test]
+    fn an_act_outside_a_repository_is_answered_not_a_git_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, h) = start(dir.path(), Arc::new(AtomicBool::new(true)));
+        let s = wait_for(&h, "not a repo", |s| matches!(s.repo, RepoState::NotARepo { .. }));
+        let diff = Arc::new(LoadedDiff::build(
+            FileKey { path: "x".into(), staged: false, untracked: true },
+            Comparison::Worktree,
+            None,
+            crate::git::GetGitDiffResponse { file_diff: crate::git::FileDiff { file_path: "x".into(), old_path: None, new_path: None, hunks: Vec::new() }, old_text: String::new(), new_text: String::new(), raw_diff: String::new(), repo_root: String::new() },
+            Vec::new(),
+            None,
+        ));
+        h.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff, hunk: None })).unwrap();
+        let a = wait_for(&h, "answer", |n| n.action_seq == 1);
+        assert_eq!(a.action_error.as_deref(), Some("the diff changed; look again"), "no diff is published, so identity fails first; {}", s.revision);
+    }
+
+    #[test]
     fn a_mark_and_an_action_queued_together_answer_in_order() {
         let dir = action_fixture();
         let p = dir.path();
@@ -1964,8 +2296,6 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         assert_eq!(wait_for(&h, "settled", |n| !n.refreshing).action_seq, 1, "answered once");
     }
 ```
-
-In `every_act_is_answered_once_and_the_refusals_run_no_git`, delete the two throwaway lines `let errors: Vec<...>` and `let _ = errors;` once the test compiles (they only exist to keep `a` used).
 
 Run: `cargo test --locked --lib engine::session -- --test-threads=1` (with `HOME`).
 Expected: compile errors: `Command::Act` exists (Step 1), but the engine answers nothing: once compiled, every new test times out in `wait_for` with `last = ...` showing `action_seq: 0`. That is the failure to see before Step 5.
@@ -2063,7 +2393,18 @@ struct ActJob {
         };
 ```
 
-   and in the `scope`/`base` matches treat `Change::Act(_)` like `Change::Mark(_)` (same scope, `Keep` unless `resolve_pending`). Set `toplevel` on the `Job` from `self.snapshot.repo`.
+   then, still in `request_status`:
+
+```rust
+        if let Some(Change::Act(_)) = &change {
+            // Nothing read before the mutation may be published after it: superseded now, before any form runs.
+            self.diff_generation += 1;
+            self.latest_generation.store(self.diff_generation, Ordering::SeqCst);
+            self.diff_in_flight = None;
+        }
+```
+
+   and in the `scope`/`base` matches treat `Change::Act(_)` like `Change::Mark(_)` (same scope, `Keep` unless `resolve_pending`). Set `toplevel` on the `Job` from `self.snapshot.repo`, and give `Job` a `lane: Arc<Semaphore>` field cloned from `self.diff_lane`.
 
 5. In `run_job`, before `let sampled = ...`:
 
@@ -2071,7 +2412,11 @@ struct ActJob {
     let acted = match (&job.change, &job.toplevel) {
         (Some(Change::Act(act)), Some(toplevel)) => Some(match &act.refusal {
             Some(refusal) => (Err(refusal.clone()), false),
-            None => actions::run(toplevel, &act.action, act.form, &act.patch).await,
+            None => {
+                // No diff task reads git while a form runs; one started earlier was superseded at the pop.
+                let _lane = job.lane.acquire().await.expect("diff lane closed");
+                actions::run(toplevel, &act.action, act.form, &act.patch).await
+            }
         }),
         (Some(Change::Act(_)), None) => Some((Err("not a git repository".to_string()), false)),
         _ => None,
@@ -2090,10 +2435,6 @@ struct ActJob {
                             next.action_error = result.clone().err();
                             next.action_applied = *applied;
                             if *applied {
-                                // Nothing read before the mutation may be published after it.
-                                state.diff_generation += 1;
-                                state.latest_generation.store(state.diff_generation, Ordering::SeqCst);
-                                state.diff_in_flight = None;
                                 state.acted = Some(act.action.diff.clone());
                                 state.fresh_arc_pending = true;
                             }
@@ -2127,7 +2468,7 @@ struct ActJob {
 8. Import `super::actions` and `Action` in `session.rs`.
 
 Run: `cargo test --locked --lib engine -- --test-threads=1` (with `HOME`).
-Expected: every test passes, including the eleven new ones. Falsify three of them by hand before committing: comment out the `fresh_arc_pending` line (the staged-discard test must fail at "a fresh arc"); comment out the `DiscardStaged && Absent` check in `check_pre_image` (the MD test must fail at "git would have recreated it"); comment out the `acted` check in the command arm (the "acted arc answer" assertion must fail). Restore each.
+Expected: every test passes, including the sixteen new ones. Falsify three of them by hand before committing: comment out the `fresh_arc_pending` line (the staged-discard test must fail at "a fresh arc"); comment out the `DiscardStaged && Absent` check in `check_pre_image` (the MD test must fail at "git would have recreated it"); comment out the `acted` check in the command arm (the "acted arc answer" assertion must fail). Restore each.
 
 - [ ] **Step 6: Gates and commit**
 
@@ -2140,7 +2481,7 @@ git commit -m "feat(engine): stage, unstage and discard through one confirmed ap
 
 ---
 
-### Task 4: The keys, the y/n box, the toolbar group, the footer and the notices
+### Task 5: The keys, the y/n box, the toolbar group, the footer and the notices
 
 Implements spec 9.3 whole, and the TUI side of 9.2 "What cannot be acted on" and 9.7. Read 9.3, then 8.5's notice rules and the invariant-3 paragraph of `AGENTS.md`, before starting.
 
@@ -2149,7 +2490,7 @@ Implements spec 9.3 whole, and the TUI side of 9.2 "What cannot be acted on" and
 - Modify: `src/tui/keys.rs`, `src/tui/state.rs`, `src/tui/input.rs`, `src/tui/view.rs`, `src/tui/shell.rs`, `src/tui/format.rs`, `src/tui/mod.rs`
 
 **Interfaces:**
-- Consumes: `actions::{plan, NOTICE_*}` (Task 3), `Command::Act`, `Snapshot.{action_seq, action_error, action_applied}`.
+- Consumes: `actions::{plan, NOTICE_*}` (Task 4), `Command::Act`, `Snapshot.{action_seq, action_error, action_applied}`.
 - Produces:
 
 ```rust
@@ -2258,7 +2599,7 @@ Create `src/tui/confirm.rs`:
 use std::sync::Arc;
 
 use crate::engine::{Action, ActionKind, LoadedDiff};
-use crate::tui::dialog::{Panel, Row};
+use crate::tui::dialog::{self, Panel, Row};
 use crate::tui::format::{truncate_left, width};
 use crate::tui::sanitize::sanitize;
 
@@ -2301,27 +2642,43 @@ impl Confirm {
         }
     }
 
-    /// The body at `width`: the path shortened from the left until the sentence fits two lines.
-    pub fn body(&self, width: u16) -> String {
-        let inner = usize::from(width).saturating_sub(4);
-        let fixed = width(&self.before) + width(self.after);
-        let room = (2 * inner).saturating_sub(fixed).max(2);
-        let path = truncate_left(&sanitize(&self.action.diff.key.path), room);
-        format!("{}{path}{}", self.before, self.after)
-    }
-
-    pub fn panel(&self, width: u16) -> Panel {
-        let mut rows = vec![Row::Note(self.body(width))];
+    fn rows_with(&self, body: String) -> Vec<Row> {
+        let mut rows = vec![Row::Note(body)];
         if let Some(warning) = self.warning {
             rows.push(Row::Warn(warning.into()));
         }
+        rows
+    }
+
+    /// The body at `columns`: the path shortened from the left until the dialog's own wrapping
+    /// of the body and the warning fits four lines, so the frame makes eight.
+    pub fn body(&self, columns: u16) -> String {
+        let full = sanitize(&self.action.diff.key.path);
+        let mut keep = width(&full);
+        loop {
+            let body = format!("{}{}{}", self.before, truncate_left(&full, keep), self.after);
+            let probe = Panel { title: String::new(), rows: self.rows_with(body.clone()), footer: String::new(), cursor: None, offset: 0 };
+            if dialog::line_count(&probe, columns) <= 4 || keep <= 2 {
+                return body;
+            }
+            keep -= 1;
+        }
+    }
+
+    pub fn panel(&self, columns: u16) -> Panel {
         Panel {
             title: self.title.into(),
-            rows,
+            rows: self.rows_with(self.body(columns)),
             footer: FOOTER.into(),
             cursor: None,
             offset: 0,
         }
+    }
+
+    /// Whether the whole box fits a frame of `columns` by `height`: the drawn rule of spec 9.3.
+    pub fn fits(&self, columns: u16, height: u16) -> bool {
+        let panel_width = columns.min(60);
+        columns >= 40 && height >= 10 && dialog::line_count(&self.panel(panel_width), panel_width) + 4 <= usize::from(height) - 2
     }
 }
 ```
@@ -2368,6 +2725,7 @@ mod tests {
         let c = Confirm::open(ActionKind::DiscardFile, Arc::new(untracked), None, 1);
         let panel = c.panel(40);
         assert!(dialog::line_count(&panel, 40) <= 4, "{:?}", c.body(40));
+        assert!(c.fits(40, 10) && !c.fits(40, 9) && !c.fits(39, 10));
         assert!(c.body(40).contains("…"));
         assert!(c.body(40).ends_with("values.ts?"));
         let lines = dialog::render(&panel, 40, 8);
@@ -2402,7 +2760,7 @@ In `observe`, after the mark block and before the rewrite block:
         if snapshot.action_seq != self.seen_action_seq {
             self.seen_action_seq = snapshot.action_seq;
             answered_action = true;
-            if let Some(pending) = self.pending_action.as_mut() {
+            if let Some(pending) = self.pending_action.take() {
                 // The answer to the key the user just pressed is shown at once (8.5's rule for M).
                 if let Some(displaced) = self.notice.as_ref().filter(|n| n.urgent) {
                     match self.notice_kind {
@@ -2411,20 +2769,18 @@ In `observe`, after the mark block and before the rewrite block:
                         NoticeKind::Other => {}
                     }
                 }
-                let (done, verb) = (pending.done.clone(), pending.verb);
                 match &snapshot.action_error {
                     Some(error) => {
-                        let mut text = format!("{verb} failed: {}", crate::tui::sanitize::sanitize(error));
+                        let mut text = format!("{} failed: {}", pending.verb, crate::tui::sanitize::sanitize(error));
                         if error.contains("does not match index") {
                             text.push_str("; unstage it first (s)");
                         }
                         self.warn(text);
                     }
-                    None => self.notify(done),
+                    None => self.notify(pending.done.clone()),
                 }
-                pending.answered = true;
-                if !snapshot.action_applied {
-                    self.pending_action = None;
+                if snapshot.action_applied {
+                    self.pending_action = Some(PendingAction { answered: true, ..pending });
                 }
             }
         }
@@ -2755,7 +3111,7 @@ In `src/tui/view.rs`:
     }
 ```
 
-In `src/tui/shell.rs`, inside the draw closure after `drew_body = ...`, add `drew_frame = width >= 40 && area.height >= 10;` (declare `let mut drew_frame = false;` beside `drew_body`), and after `state.record_drawn(...)`: `if let Some(confirm) = state.confirm.as_mut() { confirm.drawn = drew_frame; }`.
+In `src/tui/shell.rs`, inside the draw closure after `drew_body = ...`, add `box_fits = state.confirm.as_ref().is_some_and(|c| c.fits(width, area.height));` (declare `let mut box_fits = false;` beside `drew_body`), and after `state.record_drawn(...)`: `if let Some(confirm) = state.confirm.as_mut() { confirm.drawn = box_fits; }`. A box that the frame clips, which the overlay's `.min(height - 2)` makes possible on a resize, is drawn but not confirmable.
 
 Tests in `view.rs`:
 
@@ -2833,210 +3189,6 @@ git commit -m "feat(tui): stage, discard and discard-file keys behind a y/n box"
 
 ---
 
-### Task 5: Patch 0004 (K5) and the port registry
-
-Implements spec 9.5 whole: the K5 patch, the K1-K7 table, D7 and the D4 amendment in `PORT-SURFACE.md`, and 9.8 item 6. Read 9.5 and the "Port method" paragraph of spec 2.2 before starting. The frozen tree is edited only through the patch file: edit `src/git/mod.rs`, produce the patch with `git diff`, and let `port-check` prove they agree.
-
-**Files:**
-- Create: `port/patches/0004-status-two-halves.patch`
-- Modify: `src/git/mod.rs` (by the patch: `parse_git_status`'s default arm and a test), `PORT-SURFACE.md`, `src/git_diff_response_tests.rs`
-
-**Interfaces:**
-- Consumes: nothing new.
-- Produces: `parse_git_status` yields two rows for `MD`, `AD`, `TM`, `MT` and one row with the right side for `T ` and ` T`.
-
-- [ ] **Step 1: Write the failing frozen-module test**
-
-In `src/git/mod.rs`'s test module, after `test_parse_git_status_renamed_deleted_dual_entry`:
-
-```rust
-    #[test]
-    fn test_parse_git_status_splits_every_two_sided_code() {
-        // X is the index side, Y the worktree side; each non-blank side is one row.
-        let output = "MD md.txt\0AD ad.txt\0T  t1.txt\0 T t2.txt\0TM tm.txt\0MT mt.txt\0";
-        let files = parse_git_status(output);
-        let rows: Vec<(&str, bool, &str)> = files
-            .iter()
-            .map(|f| {
-                let status = match f.status {
-                    ChangedFileStatus::Modified => "M",
-                    ChangedFileStatus::Added => "A",
-                    ChangedFileStatus::Deleted => "D",
-                    ChangedFileStatus::Renamed => "R",
-                    ChangedFileStatus::Untracked => "?",
-                };
-                (f.path.as_str(), f.staged, status)
-            })
-            .collect();
-        assert_eq!(
-            rows,
-            [
-                ("md.txt", true, "M"),
-                ("md.txt", false, "D"),
-                ("ad.txt", true, "A"),
-                ("ad.txt", false, "D"),
-                ("t1.txt", true, "M"),
-                ("t2.txt", false, "M"),
-                ("tm.txt", true, "M"),
-                ("tm.txt", false, "M"),
-                ("mt.txt", true, "M"),
-                ("mt.txt", false, "M"),
-            ]
-        );
-        // A letter outside M A D T keeps the old single unstaged row.
-        let files = parse_git_status("ZZ odd.txt\0");
-        assert_eq!(files.len(), 1);
-        assert!(!files[0].staged);
-        assert!(matches!(files[0].status, ChangedFileStatus::Modified));
-    }
-```
-
-Run: `cargo test --locked --lib git::tests::test_parse_git_status_splits_every_two_sided_code`
-Expected: FAIL: `md.txt` is one unstaged `Modified` row (the K5 defect, seen before the fix).
-
-- [ ] **Step 2: Replace the default arm**
-
-In `parse_git_status`, the arm
-
-```rust
-            _ => {
-                // Default to modified unstaged for unknown codes
-                files.push(ChangedFile {
-                    path,
-                    status: ChangedFileStatus::Modified,
-                    staged: false,
-                    insertions: None,
-                    deletions: None,
-                });
-            }
-```
-
-becomes
-
-```rust
-            _ => {
-                // Each known side is its own row: X staged, Y unstaged. Unknown codes
-                // keep the old single unstaged Modified row.
-                let side = |code: u8| match code {
-                    b'M' | b'T' => Some(ChangedFileStatus::Modified),
-                    b'A' => Some(ChangedFileStatus::Added),
-                    b'D' => Some(ChangedFileStatus::Deleted),
-                    _ => None,
-                };
-                let bytes = xy.as_bytes();
-                let staged_half = side(bytes[0]);
-                let unstaged_half = side(bytes[1]);
-                if staged_half.is_none() && unstaged_half.is_none() {
-                    files.push(ChangedFile {
-                        path,
-                        status: ChangedFileStatus::Modified,
-                        staged: false,
-                        insertions: None,
-                        deletions: None,
-                    });
-                } else {
-                    if let Some(status) = staged_half {
-                        files.push(ChangedFile {
-                            path: path.clone(),
-                            status,
-                            staged: true,
-                            insertions: None,
-                            deletions: None,
-                        });
-                    }
-                    if let Some(status) = unstaged_half {
-                        files.push(ChangedFile {
-                            path,
-                            status,
-                            staged: false,
-                            insertions: None,
-                            deletions: None,
-                        });
-                    }
-                }
-            }
-```
-
-`xy` is two bytes long (the parser checked `entry.len() >= 3`), so the indexing holds; a `' '` side maps to `None`, which is what makes `T ` one staged row and ` T` one unstaged row. The explicit arms above it (`MM`, `AM`, `M `, ` M`, `A `, ` A`, `D `, ` D`, the rename arm, the conflict arms) are untouched, so every existing status test keeps passing.
-
-Run: `cargo test --locked --lib git::tests::test_parse_git_status` and `cargo fmt --check`.
-Expected: all status tests pass. If `rustfmt` reflows the arm, the patch must match the formatted text: run `cargo fmt` before producing the patch (spec `AGENTS.md`: a patch matching unformatted text silently tests the wrong thing).
-
-- [ ] **Step 3: Produce and register the patch**
-
-```bash
-git diff -- src/git/mod.rs > /tmp/0004.diff
-{
-  printf 'Reason: K5 (spec 9.5). parse_git_status split MM, AM and the rename codes into two rows but sent\n'
-  printf 'MD, AD and the T codes to its default arm, which produced one unstaged Modified row and hid the\n'
-  printf 'staged half. The default arm now splits X and Y into up to two rows; unknown letters keep the\n'
-  printf 'old row. One test added beside the other parse_git_status tests.\n\n'
-  cat /tmp/0004.diff
-} > port/patches/0004-status-two-halves.patch
-```
-
-Check the patch applies to the pristine pin the way `port-check` applies it: `scripts/port-check.sh "$VIMEFLOW"` must print `... + 4 patch(es)` once `PORT-SURFACE.md` names it (next step); until then it fails with `patch 0004-status-two-halves.patch is not registered`, which is the registry doing its job.
-
-- [ ] **Step 4: `PORT-SURFACE.md`**
-
-Edit the registry:
-
-1. "Pin" paragraph: `Four patches are registered: ... 0003-engine-visibility.patch (D6) and 0004-status-two-halves.patch (K5).`
-2. "Port surface" list of called frozen functions: remove `get_git_diff_inner` and add the sentence `get_git_diff_inner is no longer called from the engine (D7); git_diff_response_tests keeps testing it and the engine's diff tests use it as their oracle.` The line `The mutating git functions are copied but are not called in Phase 1.` becomes `The mutating git functions are copied and are not called; every mutation runs through engine::actions (spec 9.2).`
-3. After D6, add:
-
-```markdown
-**D7 (hunk actions): engine-built diffs.** Every diff the viewer shows is built
-by the engine (`src/engine/worktree.rs`, `src/engine/branch.rs`) with
-`--no-color --no-ext-diff --no-textconv -U3 --src-prefix=a/ --dst-prefix=b/`,
-in both scopes, and the output bytes are kept beside the parsed hunks
-(`LoadedDiff.patch`) so an action applies back exactly what was read: a
-converted text (textconv) cannot be applied, a hunk cut from a diff without
-context lands at the wrong line, and a prefix the user configured away cannot
-be parsed by `git apply` (spec 9.2). The frozen `get_git_diff_inner` is no
-longer called; it stays in the tree as the oracle of the engine's diff tests.
-**D4 is amended by D7:** textconv filters are no longer left on. A binary file
-with a textconv driver shows as binary and is refused by the actions; a text
-file with one shows its raw text. D4's patch is unchanged because the frozen
-calls it touches still exist.
-```
-
-4. "Known defects": retitle the paragraph `**K1-K7: known defects, closed in 0.0.4.**` and replace each bullet's last sentence with how 0.0.4 closes it, copying the "How 0.0.4 fixes it" column of spec 9.5's table: K1-K3 and K7 "not reached" (the engine's forms and diffs), K4 the slicer's header rewrite, K5 patch 0004, K6 the diff lane. Keep the original description of each defect so the history stays readable.
-
-Run: `scripts/port-check.sh "$VIMEFLOW" && sh scripts/port-check-selftest.sh "$VIMEFLOW"`
-Expected: `port-check: src/git matches 91e45b1c + 4 patch(es)` and the selftest's usual lines.
-
-- [ ] **Step 5: The status fixture**
-
-In `src/git_diff_response_tests.rs`, `status_rows_cover_the_criterion_one_fixture`: after the `AM` lines add
-
-```rust
-    std::fs::write(p.join("md.txt"), "m\n").unwrap();
-    std::fs::write(p.join("ad.txt"), "x\n").unwrap();
-    git(p, &["add", "md.txt"]);
-    git(p, &["commit", "-q", "-m", "md"]);
-    std::fs::write(p.join("md.txt"), "M\n").unwrap();
-    git(p, &["add", "md.txt", "ad.txt"]);
-    std::fs::remove_file(p.join("md.txt")).unwrap(); // MD
-    std::fs::remove_file(p.join("ad.txt")).unwrap(); // AD
-```
-
-(the `md.txt` commit must come before `del.txt` and `ren.txt` are staged, so place these lines right after the `init` commit and move the `am.txt` lines accordingly; the row order asserted below is by membership, not position) and extend the expected rows with `("md.txt", true), ("md.txt", false), ("ad.txt", true), ("ad.txt", false)`.
-
-Run: `cargo test --locked --lib git_diff_response_tests -- --test-threads=1` (with `HOME`).
-Expected: PASS. Falsify: revert the patch (`git stash`-free: `git checkout -- src/git/mod.rs` temporarily), run again, expect `missing row ("md.txt", true)`, restore with `patch -p1 < port/patches/0004-status-two-halves.patch`.
-
-- [ ] **Step 6: Gates and commit**
-
-Run the full gate line. Expected: all green, four patches.
-
-```bash
-git add port/patches/0004-status-two-halves.patch src/git/mod.rs PORT-SURFACE.md src/git_diff_response_tests.rs
-git commit -m "fix(git): split every two-sided status code into its rows"
-```
-
----
-
 ### Task 6: The recording test, Tier B, documentation and version 0.0.4
 
 Implements spec 9.6's second test paragraph, 9.8 items 9-11 and criteria 12-15, 9.5's version and README paragraph, and 9.7's documentation of the overridden settings. Read 9.6, 9.7 "Configuration" and 9.8 before starting.
@@ -3089,8 +3241,10 @@ impl Session {
         panic!("timed out waiting for {what}; last = {last:?}");
     }
 
+    /// Waits for the row to be listed first: a `Select` for an unlisted key is ignored (3.3).
     fn select(&self, path: &str, staged: bool, untracked: bool) -> Arc<Snapshot> {
         let key = FileKey { path: path.into(), staged, untracked };
+        self.recv(&format!("{key:?} listed"), |s| s.files.iter().any(|f| FileKey::of(f) == key));
         self.handle.commands.send(Command::Select(key.clone())).unwrap();
         self.recv(&format!("{key:?} ready"), |s| matches!(&s.diff, DiffState::Ready(d) if d.key == key))
     }
@@ -3141,6 +3295,7 @@ fn fixture(real: &Path, p: &Path) {
     std::fs::write(p.join("bin.dat"), [0u8, 1, 3]).unwrap();
     std::fs::create_dir_all(p.join("newdir/deep")).unwrap();
     std::fs::write(p.join("newdir/deep/u.txt"), "u\n").unwrap();
+    std::fs::write(p.join("u2.txt"), "two\n").unwrap();
 }
 
 #[test]
@@ -3169,50 +3324,72 @@ fn every_action_runs_exactly_its_apply_forms_and_changes_exactly_what_the_row_sh
     let top = top.to_string_lossy();
     let form = |flags: &str| format!("-c apply.ignoreWhitespace=no -C {top} apply --whitespace=nowarn{flags}");
 
-    // 1. Stage one unstaged hunk: one --cached apply; the index gains GAMMA only.
+    // After every action: the refs are untouched, and the side the form does not name is untouched.
+    let refs_same = |what: &str| assert_eq!(git(&real, p, &["for-each-ref"]), refs_before, "refs changed after {what}");
+
+    // 1. Stage one unstaged hunk: one --cached apply; the index gains GAMMA only, the worktree is untouched.
     let s = session.select("mm.txt", false, false);
     let index_before = std::fs::read(p.join(".git/index")).unwrap();
+    let tree_before = tree_hash(p);
     let (a, applies) = session.act(&s, ActionKind::Stage, Some(0));
     assert_eq!((a.action_error.as_deref(), a.action_applied), (None, true));
     assert_eq!(applies, [form(" --cached")]);
     assert_ne!(std::fs::read(p.join(".git/index")).unwrap(), index_before, "the index changed");
+    assert_eq!(tree_hash(p), tree_before, "a --cached form left the worktree alone");
     let cached = git(&real, p, &["diff", "--cached", "--", "mm.txt"]);
     assert!(cached.contains("+GAMMA") && !cached.contains("+DELTA"), "{cached}");
     assert_eq!(git(&real, p, &["status", "--porcelain=v1", "--", "mm.txt"]).trim(), "MM mm.txt");
+    refs_same("stage");
 
-    // 2. Discard the remaining unstaged hunk: one -R apply; the worktree loses DELTA, the index is untouched.
-    let s = session.recv("one unstaged hunk", |s| matches!(&s.diff, DiffState::Ready(d) if !d.key.staged && d.file_diff.hunks.len() == 1) && !s.refreshing);
-    let index_before = std::fs::read(p.join(".git/index")).unwrap();
+    // 2. Unstage it again from the staged row (its third hunk): one --cached -R apply; the worktree is untouched.
+    let s = session.select("mm.txt", true, false);
+    let s = session.recv("three staged hunks", |n| matches!(&n.diff, DiffState::Ready(d) if d.key.staged && d.file_diff.hunks.len() == 3) && !n.refreshing);
     let tree_before = tree_hash(p);
+    let (a, applies) = session.act(&s, ActionKind::Stage, Some(2));
+    assert_eq!(a.action_error, None);
+    assert_eq!(applies, [form(" --cached -R")]);
+    assert_eq!(tree_hash(p), tree_before);
+    assert!(!git(&real, p, &["diff", "--cached", "--", "mm.txt"]).contains("+GAMMA"));
+    refs_same("unstage");
+
+    // 3. Discard both unstaged hunks: two -R applies; the index is untouched, the worktree loses GAMMA then DELTA.
+    let s = session.select("mm.txt", false, false);
+    let s = session.recv("two unstaged hunks", |n| matches!(&n.diff, DiffState::Ready(d) if !d.key.staged && d.file_diff.hunks.len() == 2) && !n.refreshing);
+    let index_before = std::fs::read(p.join(".git/index")).unwrap();
     let (a, applies) = session.act(&s, ActionKind::Discard, Some(0));
     assert_eq!(a.action_error, None);
     assert_eq!(applies, [form(" -R")]);
-    assert_eq!(std::fs::read(p.join(".git/index")).unwrap(), index_before, "the index is untouched by a worktree discard");
-    assert_ne!(tree_hash(p), tree_before);
+    assert_eq!(std::fs::read(p.join(".git/index")).unwrap(), index_before, "a worktree form left the index alone");
+    assert!(std::fs::read_to_string(p.join("mm.txt")).unwrap().contains("gamma\n"));
+    let s = session.recv("one unstaged hunk", |n| matches!(&n.diff, DiffState::Ready(d) if !d.key.staged && d.file_diff.hunks.len() == 1) && !n.refreshing);
+    let (a, applies) = session.act(&s, ActionKind::Discard, Some(0));
+    assert_eq!(a.action_error, None);
+    assert_eq!(applies, [form(" -R")]);
+    assert_eq!(std::fs::read(p.join(".git/index")).unwrap(), index_before);
     assert_eq!(git(&real, p, &["status", "--porcelain=v1", "--", "mm.txt"]).trim(), "M  mm.txt");
+    refs_same("discard");
 
-    // 3. D on the staged row of a now-clean file: one --index -R apply; everything goes.
-    let s = session.recv("staged row selected", |s| matches!(&s.diff, DiffState::Ready(d) if d.key.path == "mm.txt" && d.key.staged) && !s.refreshing);
+    // 4. D on the staged row of the now-clean file: one --index -R apply; both sides return to HEAD.
+    let s = session.recv("staged row selected", |n| matches!(&n.diff, DiffState::Ready(d) if d.key.path == "mm.txt" && d.key.staged) && !n.refreshing);
     let (a, applies) = session.act(&s, ActionKind::DiscardFile, None);
     assert_eq!(a.action_error, None);
     assert_eq!(applies, [form(" --index -R")]);
     assert_eq!(git(&real, p, &["status", "--porcelain=v1", "--", "mm.txt"]).trim(), "");
+    refs_same("discard file");
 
-    // 4. MD: refused by the engine before git; the file stays absent; no apply recorded.
+    // 5. MD: refused by the engine before git; the file stays absent; no apply recorded.
     let s = session.select("md.txt", true, false);
     let (a, applies) = session.act(&s, ActionKind::DiscardFile, None);
     assert_eq!(a.action_error.as_deref(), Some("md.txt: does not match index"));
     assert!(applies.is_empty() && !a.action_applied && !p.join("md.txt").exists());
 
-    // 5. A binary row: refused, no apply.
+    // 6. A binary row: refused, no apply.
     let s = session.select("bin.dat", false, false);
     let (a, applies) = session.act(&s, ActionKind::DiscardFile, None);
     assert_eq!(a.action_error.as_deref(), Some(NOTICE_BINARY));
     assert!(applies.is_empty());
 
-    // 6. Branch scope: refused, no apply, nothing changes.
-    let s = session.select("mm.txt", true, false).clone();
-    let _ = s;
+    // 7. Branch scope: refused, no apply, nothing changes.
     session.handle.commands.send(Command::SetScope(Scope::Branch)).unwrap();
     let s = session.recv("branch rows", |s| s.scope == Scope::Branch && matches!(s.diff, DiffState::Ready(_)));
     let (a, applies) = session.act(&s, ActionKind::DiscardFile, None);
@@ -3220,7 +3397,7 @@ fn every_action_runs_exactly_its_apply_forms_and_changes_exactly_what_the_row_sh
     assert!(applies.is_empty());
     session.handle.commands.send(Command::SetScope(Scope::Worktree)).unwrap();
 
-    // 7. A stale Arc: refused, no apply.
+    // 8. A stale Arc: refused, no apply.
     let s = session.recv("worktree back", |s| s.scope == Scope::Worktree && matches!(s.diff, DiffState::Ready(_)) && !s.refreshing);
     let stale = Action { kind: ActionKind::Stage, diff: Arc::new((**match &s.diff { DiffState::Ready(d) => d, _ => unreachable!() }).clone()), hunk: None };
     let before = std::fs::read_to_string(&log).unwrap().lines().count();
@@ -3229,14 +3406,27 @@ fn every_action_runs_exactly_its_apply_forms_and_changes_exactly_what_the_row_sh
     assert_eq!(a.action_error.as_deref(), Some(NOTICE_CHANGED));
     assert!(!std::fs::read_to_string(&log).unwrap().lines().skip(before).any(|l| subcommand(l) == "apply"));
 
-    // 8. Delete the nested untracked file: one -R apply; the file goes, the row goes.
+    // 9. Delete the nested untracked file: one -R apply; the file goes, the row goes, the index is untouched.
     let s = session.select("newdir/deep/u.txt", false, true);
+    let index_before = std::fs::read(p.join(".git/index")).unwrap();
     let (a, applies) = session.act(&s, ActionKind::DiscardFile, None);
     assert_eq!(a.action_error, None);
     assert_eq!(applies, [form(" -R")]);
     assert!(!p.join("newdir/deep/u.txt").exists());
+    assert_eq!(std::fs::read(p.join(".git/index")).unwrap(), index_before);
     let s = session.recv("row gone", |s| !s.files.iter().any(|f| f.path == "newdir/deep/u.txt") && !s.refreshing);
     assert!(s.files.iter().any(|f| Some(FileKey::of(f)) == s.selected));
+    refs_same("delete");
+
+    // 10. Stage an untracked file: one --cached apply; the worktree is untouched.
+    let s = session.select("u2.txt", false, true);
+    let tree_before = tree_hash(p);
+    let (a, applies) = session.act(&s, ActionKind::Stage, None);
+    assert_eq!(a.action_error, None);
+    assert_eq!(applies, [form(" --cached")]);
+    assert_eq!(tree_hash(p), tree_before);
+    assert_eq!(git(&real, p, &["status", "--porcelain=v1", "--", "u2.txt"]).trim(), "A  u2.txt");
+    refs_same("stage untracked");
 
     session.handle.commands.send(Command::Shutdown).unwrap();
     std::thread::sleep(Duration::from_millis(500));
@@ -3247,9 +3437,10 @@ fn every_action_runs_exactly_its_apply_forms_and_changes_exactly_what_the_row_sh
         assert!(ALLOWED.contains(&sub), "unexpected git subcommand `{sub}` in `{}`", fields[0]);
         assert_eq!(&fields[1..], ["0", "1", "1"], "D3 variables missing in `{}`", fields[0]);
     }
-    // Every apply is a confirmed action's form: exactly four ran, in the order above.
+    // Every apply is a confirmed action's form: exactly these seven ran, in this order.
     let applies: Vec<&str> = recorded.lines().map(|l| l.split('\t').next().unwrap()).filter(|l| subcommand(l) == "apply").collect();
-    assert_eq!(applies.len(), 4, "{applies:?}");
+    let expected = [" --cached", " --cached -R", " -R", " -R", " --index -R", " -R", " --cached"].map(|f| form(f));
+    assert_eq!(applies, expected.iter().map(String::as_str).collect::<Vec<_>>());
     assert_eq!(git(&real, p, &["for-each-ref"]), refs_before, "refs changed");
     let mut written: Vec<String> = std::fs::read_dir(state.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
     written.sort();
@@ -3258,10 +3449,10 @@ fn every_action_runs_exactly_its_apply_forms_and_changes_exactly_what_the_row_sh
 }
 ```
 
-Clean up the two throwaway lines (`let _ = s;`, `let _ = home;`) once the test compiles. Add `[[test]] name = "hunk_actions"` only if `Cargo.toml` lists tests explicitly (it does not; auto-discovery applies). `sha2` is already a dev-dependency for `tree_hash`.
+Clean up the throwaway line `let _ = home;` once the test compiles (or drop `home` if the HOME check of the readonly test is not copied). Add `[[test]] name = "hunk_actions"` only if `Cargo.toml` lists tests explicitly (it does not; auto-discovery applies). `sha2` is already a dev-dependency for `tree_hash`.
 
 Run: `HOME=... cargo test --locked --test hunk_actions -- --test-threads=1`
-Expected: PASS. Falsify: in `actions::plan`, swap `Form::DiscardStaged` for `Form::DiscardUnstaged` in the whole-file arm; step 3 must fail on `applies` (`" -R"` instead of `" --index -R"`); restore.
+Expected: PASS. Falsify: in `actions::plan`, swap `Form::DiscardStaged` for `Form::DiscardUnstaged` in the whole-file arm; case 4 must fail on `applies` (`" -R"` instead of `" --index -R"`); restore.
 
 - [ ] **Step 2: Tier B**
 
@@ -3422,7 +3613,7 @@ Check with `grep -n '0.0.3\|read-only\|只读\|読み取り専用' README*.md`: 
 | 9. Hunk actions | On an `MM` file with two hunks on each side, press `s` on an unstaged hunk, `s` on the staged row, `d` on an unstaged hunk, `d` on a staged hunk while the file has unstaged changes and again once it has none, comparing with `git diff` and `git diff --cached` after each step; `D` then `n` on an untracked row, `D` then `y`; the keys in branch scope; an edit by the agent between the frame and `y`; from a pane in a subdirectory (K1) a staged rename with edits (K4), an `MD` path (K5) and `tools` replaced by `tools/run` in the index (K7). | Each step changes exactly the hunk or row the box named and nothing else; the staged discard is refused with the unstage hint while unstaged edits remain and discards exactly that hunk once they are gone; `n` changes nothing and `y` deletes the file; branch scope shows the notice; the edited hunk is refused with `the diff changed; look again`; the four defect fixtures behave as spec 9 says. | PENDING | | | |
 ```
 
-Leave the first line `Status: PASS` as it is until row 9 is recorded; the orchestrator fills the row by hand (the release guard reads the first line).
+Change the first line to `Status: PENDING` in the same edit: the release guard reads that line, and 0.0.4 must not be publishable until row 9 is recorded. The orchestrator fills the row by hand and flips the line back to `Status: PASS` only then.
 
 - [ ] **Step 5: Gates and commit**
 
@@ -3439,21 +3630,38 @@ git commit -m "feat: hunk actions, documented and versioned 0.0.4"
 
 - **9.1** is prose; nothing to build.
 - **9.2 "The diff behind the row"**: Task 1 (`worktree::diff`, the flags, the cut, `patch`, `rename_sources` both sides, the branch command's two new flags, the oracle). The `-M <old>` for an unstaged intent-to-add rename: Task 1 test `an_intent_to_add_rename_is_found_on_the_unstaged_side`.
-- **9.2 the table and the forms**: Task 2 (`Form`), Task 3 (`plan`, the engine tests per row kind), Task 6 (recorded forms).
-- **9.2 "Discarding a file"**: Task 3 `whole_file_discards_follow_the_row...` and `a_staged_discard_is_atomic...`.
-- **9.2 "Slicing a hunk"** items 1-3: Task 2 tests `a_hunk_carries_its_header...`, `a_type_change_counts...`, `mode_lines_leave...`, `a_rename_section_keeps...`, `coordinates_are_recounted...`.
-- **9.2 "What cannot be acted on"**: Task 3 `plan` tests (every notice), Task 4 `open_box` and its tests; the binary rule on untracked rows (F7) in both.
-- **9.2 "Stale content"**: Task 1 pre-image bracket, Task 3 `check_pre_image` (`a_pre_image_that_changed_refuses...`, the MD case, the directory case in Task 6's K7 fixture is covered by `check_pre_image`'s `Directory` arm and tested in Task 3's `plan`/pre-image tests through `WorktreeKind::Directory`; add to Task 3's `whole_file_discards...` a `tools` directory case if time allows, it is the same code path as `Other`).
-- **9.2 "After the action"**: Task 3's same-path selection rule, tested in `untracked_rows_are_staged_or_deleted_whole...` (row gone) and `a_hunk_is_staged_unstaged_and_discarded...` (row survives).
-- **9.3** whole: Task 4; the eight-line box and the left-shortened path in `confirm.rs` tests; the drawn rule in `y_is_inert_until_the_box_was_drawn`; the guard in `a_second_key_while...`; the notices and invariant 3 in the two `observe` tests; the toolbar group, footer, branch scope in the view tests; `X` reserved in `keys.rs`.
-- **9.4** whole: Task 3 (`Command::Act`, the carrying refresh, answers decided before git, `action_applied`, the acted Arc, the fresh Arc, the runner's retry with re-check); Task 1 (the diffs, the lane). The `index.lock` retry re-check is in `actions::run`; its 2 s bound is tested at the runner level (`Locked`) and the loop by inspection: add to Task 2's runner test a fake git that fails with `index.lock` twice then succeeds, if the orchestrator wants the loop itself pinned (the fake script can count with a file).
-- **9.5**: Task 5 (patch 0004, `PORT-SURFACE.md`), Task 6 (version, README).
+- **9.2 the table and the forms**: Task 3 (`Form`), Task 4 (`plan`, the engine tests per row kind), Task 6 (recorded forms).
+- **9.2 "Discarding a file"**: Task 4 `whole_file_discards_follow_the_row...` and `a_staged_discard_is_atomic...`.
+- **9.2 "Slicing a hunk"** items 1-3: Task 3 tests `a_hunk_carries_its_header...`, `a_type_change_counts...`, `mode_lines_leave...`, `a_rename_section_keeps...`, `coordinates_are_recounted...`.
+- **9.2 "What cannot be acted on"**: Task 4 `plan` tests (every notice), Task 5 `open_box` and its tests; the binary rule on untracked rows (F7) in both.
+- **9.2 "Stale content"**: Task 1 pre-image bracket, Task 4 `check_pre_image` (`a_pre_image_that_changed_refuses...`, the MD case, `a_working_tree_form_on_a_directory_is_refused` on the K7 fixture, `an_edit_during_the_diff_read_leaves_no_pre_image_and_refuses_the_key`).
+- **9.2 "After the action"**: Task 4's same-path selection rule, tested in `untracked_rows_are_staged_or_deleted_whole...` (row gone) and `a_hunk_is_staged_unstaged_and_discarded...` (row survives).
+- **9.3** whole: Task 5; the eight-line box and the left-shortened path in `confirm.rs` tests; the drawn rule in `y_is_inert_until_the_box_was_drawn`; the guard in `a_second_key_while...`; the notices and invariant 3 in the two `observe` tests; the toolbar group, footer, branch scope in the view tests; `X` reserved in `keys.rs`.
+- **9.4** whole: Task 4 (`Command::Act`, the carrying refresh, answers decided before git, `action_applied`, the acted Arc, the fresh Arc, the runner's retry with re-check); Task 1 (the diffs, the lane). The `index.lock` retry and its 2 s bound are pinned by `an_index_lock_is_retried_and_given_up_after_two_seconds`, which holds a real `.git/index.lock`; the generation bump at the pop and the lane held across the forms by `a_diff_read_before_the_action_is_never_published_after_it`.
+- **9.5**: Task 2 (patch 0004, `PORT-SURFACE.md`), Task 6 (version, README).
 - **9.6**: Task 1 (readonly's D7 assertions, allow-list at ten), Task 6 (`hunk_actions.rs`: forms, refs, index and worktree differences, no apply on refusals, the state directory).
-- **9.7**: the table's rows map to: branch scope (Task 4/3), no hunk (3/4), cut/binary/submodule (3/4), running (3/4), changed (3), eligibility (3), the box below 40x10 (4), git refusal (3, `a_staged_discard...`), `does not match index` with and without the file (3), not a regular file (3 by code; see 9.2 note), index.lock (2), timeout (2), write failure (prose), no toplevel (3, the `not a git repository` arm, covered by the `toplevel.is_none()` branch; add a test on a non-repository directory if the orchestrator wants it pinned), status failure after forms (3 by ordering), HEAD moves (8.2's tests stand). Cost and configuration: README (Task 6).
-- **9.8 items 1-11**: 1 Task 2; 2 Task 2; 3 Task 1; 4 Task 3; 5 Task 1 (`superseded_selections_never_reach_git`); 6 Task 5; 7-8 Task 4; 9 Tasks 1 and 6; 10 Task 6; 11 Task 5. Criteria 12-15: acceptance row 9 (Task 6).
+- **9.7**: the table's rows map to: branch scope (Task 5/3), no hunk (3/4), cut/binary/submodule (3/4), running (3/4), changed (3), eligibility (3), the box below 40x10 (4), git refusal (3, `a_staged_discard...`), `does not match index` with and without the file (3), not a regular file (3), index.lock (2), timeout (2), write failure (prose), no toplevel (4: `an_act_outside_a_repository_is_answered_not_a_git_repository`; outside a repository no diff is ever published, so the identity check answers first, which is why the test expects `the diff changed; look again` and the `not a git repository` arm stays a guard for a repository that vanishes between publication and the key), status failure after forms (3 by ordering), HEAD moves (8.2's tests stand). Cost and configuration: README (Task 6).
+- **9.8 items 1-11**: 1 Task 3; 2 Task 3; 3 Task 1; 4 Task 4; 5 Task 1 (`superseded_selections_never_reach_git`); 6 Task 2; 7-8 Task 5; 9 Tasks 1 and 6; 10 Task 6; 11 Task 2. Criteria 12-15: acceptance row 9 (Task 6).
 
-Placeholder scan: none. Type consistency: `Action`, `ActionKind`, `Form`, `Direction`, `Kind`, `Refusal`, `PreImage`, `WorktreeKind`, `Confirm`, `PendingAction` are defined once and used by those names throughout; `LoadedDiff::build` takes six arguments from Task 1 on and every test helper passes `patch, pre_image`. Two deliberate simplifications are recorded above: `rename_sources` keyed by path (Task 1), and the dim chip drawn as a plain span (Task 4).
+Placeholder scan: none. Type consistency: `Action`, `ActionKind`, `Form`, `Direction`, `Kind`, `Refusal`, `PreImage`, `WorktreeKind`, `Confirm`, `PendingAction` are defined once and used by those names throughout; `LoadedDiff::build` takes six arguments from Task 1 on and every test helper passes `patch, pre_image`. Two deliberate simplifications are recorded above: `rename_sources` keyed by path (Task 1), and the dim chip drawn as a plain span (Task 5).
 
 ## Review notes
 
 Appended after each review round.
+
+**Round 1 (codex, plan-complete, 2026-10-01).** Thirteen findings, all applied. The
+patch task moved from fifth to second so the engine's `MD` tests have the rows they
+need. The box now sizes itself by `dialog::line_count` and `confirm.drawn` is set only
+when the whole box fits the frame. The diff generation is bumped when an `Act` is popped
+from the queue and the carrying job holds the diff lane across the forms, so no read
+started before the mutation is published after it (test
+`a_diff_read_before_the_action_is_never_published_after_it`). Four tests that the first
+draft left to inspection are now steps: the `index.lock` retry and bound, an edit during
+the diff read, the directory refusal, and an `Act` outside a repository; the recording
+test grew to seven applies with per-action refs, index and worktree checks. The
+acceptance file goes to `Status: PENDING` with row 9. Five snippets were corrected to
+compile: `parse_for_tests` at module level, the session tests' existing `git_out`
+reused, `Arc::as_ptr` on the `Arc` not the reference, `columns` instead of a shadowed
+`width`, and `observe` taking the pending action before it speaks. The runner is `pub`
+so the slicer task passes clippy before the engine task calls it, and the large-patch
+fixture is 120,000 lines.
