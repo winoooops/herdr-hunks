@@ -647,3 +647,5 @@ Success criteria, in addition to 1.5, 7.9 and 8.7:
     the index (K7) behave as this section says.
 15. `docs/acceptance-p1.md` gains row 9 with the same evidence columns; the
     release guard is unchanged.
+
+<!-- codex-reviewed: 2026-10-01T10:59:03Z -->
