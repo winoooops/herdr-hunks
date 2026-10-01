@@ -53,11 +53,12 @@ git -C <toplevel> diff --no-index --no-color --no-ext-diff --no-textconv -U3 --s
 
 The first is a tracked row, `--cached` when it is staged; the second an
 untracked row, whose exit status `1` means "differs" as the frozen helper
-already treats it. `-M` and `<old>` are present when the row is a staged
-rename, found as branch scope finds its renames: one
-`diff --cached --name-status -M -z --` per refresh fills `rename_sources` in
-worktree scope too (the index is the only place git can see a rename; the
-working tree against the index never has one). The output is cut into
+already treats it. `-M` and `<old>` are present when the row is a rename,
+found as branch scope finds its renames: one `diff --name-status -M -z --`
+per side and per refresh, with and without `--cached`, fills
+`rename_sources` in worktree scope too, keyed by `(path, staged)` there,
+because the unstaged side can carry a rename as well (a moved file whose
+destination was added with `git add -N`). The output is cut into
 sections with 7.2's cutter and only the sections naming the row's path, or
 its rename source, are kept, before anything is parsed: that is the K7 fix,
 and a descendant's patch can neither be shown as the file's nor applied as it.
@@ -170,9 +171,11 @@ engine acts only while that `Arc` is the diff it last published and no form
 has run on it; otherwise it answers `the diff changed; look again`, and the
 newer content is on screen by then. Second, the diff task records the
 pre-image of what it read: the index entry's blob id from
-`git ls-files -s -- <path>`, or its absence for an untracked row, and a hash
-of the working-tree file's bytes, or its absence for a deleted one. Neither
-read moves `HEAD`, so the bracket of 8.2 says nothing about them; the task
+`git ls-files -s -- <path>`, or its absence for an untracked row, and the
+working-tree path's kind from `lstat` with what that kind holds: a regular
+file's bytes hash, a symlink's target bytes, or the bare kind for a
+directory, anything else, an absence or a path that could not be read.
+Neither read moves `HEAD`, so the bracket of 8.2 says nothing about them; the task
 brackets the diff with them instead, reading both before and after the diff
 and keeping the pre-image only when the two readings agree. A diff whose
 readings disagree is published without a pre-image, which refuses every
@@ -182,8 +185,14 @@ not required. Immediately before each form, and again before each retry of
 9.4, the engine reads the same two things and refuses with the same notice
 when the one that form applies to differs: the blob, or its absence, for a
 `--cached` form; the file, or its absence, for a working-tree one; both for
-an `--index` form, whose working tree must also equal its index entry, which
-git checks itself. The bytes a form is applied to are then the bytes the
+an `--index` form, whose working-tree file must also be present, which the
+engine checks itself because git would recreate a missing one from the
+index and so erase an unstaged deletion (an `MD` path), and must equal its
+index entry, which git checks itself. A working-tree form runs only on a
+regular file, a symlink or an absence; a directory or anything else is
+refused with `not a regular file: not applied here`, and a path that could
+not be read leaves the diff without a pre-image. The bytes a form is
+applied to are then the bytes the
 patch was cut from, so the recounted coordinates match in place, and git's
 search for context, which could otherwise settle on an identical block
 elsewhere in the file, never runs. One window stays: an edit landing between
@@ -219,10 +228,12 @@ grows by the same three rows, and the lock of 5.2 item 7 moves with it.
 layer the key sheet and the picker use: a panel of at most 60 columns centred
 on the body, with a title, a body of at most two lines, a warning row when
 the action is unrecoverable, and the footer `y yes · n no`. The path is
-shortened from the left with `…` until the body fits two lines at the box's
-width, so the box is at most five lines tall and the 40x10 minimum of 4.2
-always draws all of it: nothing scrolls, and `y` never confirms a question
-that was only half shown. It opens only from the main view, so it never
+shortened from the left with `…` until the body fits two lines at the
+panel's inner width, and the warning wraps there to at most two; with the
+four lines the dialog's frame takes (two borders, the footer and its rule)
+the box is at most eight lines tall, which the 40x10 minimum of 4.2 holds,
+so all of it is always drawn: nothing scrolls, and `y` never confirms a
+question that was only half shown. It opens only from the main view, so it never
 shares the screen with the key sheet or the picker. While it is open `y`
 confirms, `n` cancels, and every other key and every mouse event is inert:
 the box has to be answered.
@@ -376,10 +387,10 @@ the pre-image of 9.2: before and after the diff the task runs
 `git -C <toplevel> ls-files -s -- <path>`, a read already on the allow-list,
 and hashes the working-tree file's bytes, and it keeps the pair only when
 both readings agree. `load_rows` in
-worktree scope adds one `git -C <toplevel> diff --cached --name-status -M -z
---` to its refresh and fills `rename_sources` from its `R` records with 7.2's
-`parse_name_status`, so `request_diff` passes `old` to the diff task in both
-scopes the same way. The frozen `get_git_diff_inner` is no longer called from
+worktree scope adds `git -C <toplevel> diff --name-status -M -z --` with and
+without `--cached` to its refresh and fills `rename_sources` from their `R`
+records with 7.2's `parse_name_status`, keyed by `(path, staged)`, so
+`request_diff` passes `old` to the diff task in both scopes the same way. The frozen `get_git_diff_inner` is no longer called from
 the engine (9.5).
 
 **K6.** Diff tasks run git one at a time: each task waits on a one-permit
@@ -451,8 +462,8 @@ without an `Act` must never record `apply`. It additionally asserts that
 every patch-producing `diff` the session records in either scope, one
 without `--name-status`, `--numstat` or `--name-only`, carries
 `--no-textconv -U3 --src-prefix=a/ --dst-prefix=b/`, and that the worktree
-refresh records `diff --cached --name-status -M -z --`, so D7's commands are
-covered by the recording and not by convention. The state directory's file list is
+refresh records `diff --name-status -M -z --` with and without `--cached`,
+so D7's commands are covered by the recording and not by convention. The state directory's file list is
 unchanged: this section writes no new file.
 
 A new `tests/hunk_actions.rs` uses the same recording wrapper and the same
@@ -483,6 +494,8 @@ leaves the index, the working tree and the rows untouched, and runs no
 | the terminal shrinks below 40x10 while the box is open | the box is not drawn; `y` is inert and `n` cancels; it is drawn again when the terminal grows |
 | the context no longer matches when git checks the patch (an edit landed between the diff read and the apply) | git refuses; the urgent `<verb> failed: <git's first stderr line>`; nothing changed; the next refresh shows the current content |
 | the file of a staged row has unstaged changes when `d` or `D` is confirmed | git refuses the `--index` form before writing: `discard failed: <path>: does not match index; unstage it first (s)`; nothing changes |
+| the file of a staged row is missing from the working tree (`MD`) when `d` or `D` is confirmed | the engine refuses the `--index` form with the same notice before git, which would otherwise recreate the file; the file stays absent |
+| the working-tree path is a directory or another non-file when a working-tree form would run | `not a regular file: not applied here`; no form runs |
 | the diff's two pre-image readings disagreed (an edit landed during the read) | the diff is shown without a pre-image; every key on it answers `the diff changed; look again` until the next reload |
 | `index.lock` is held by another process | the form is retried every 100 ms for up to 2 s, then answers with git's message |
 | `git apply` exceeds 30 s | killed; `git apply timed out after 30s`; nothing changed when git was still checking, and the next refresh shows the file's state otherwise |
@@ -496,8 +509,8 @@ Files under `core.autocrlf` or clean/smudge filters are converted by git's own
 `apply`, the same conversion `git add -p` relies on; the viewer adds nothing
 of its own.
 
-Cost. Per refresh in worktree scope, one `diff --cached --name-status -M -z
---` more than 3.3 ran, and per selected staged row one `diff --name-status`
+Cost. Per refresh in worktree scope, two `diff --name-status -M -z --` more
+than 3.3 ran, one per side, and per selected row one `diff --name-status`
 fewer, because the frozen diff probed renames per diff and the engine now
 knows them per refresh. Per confirmed action, one or two `apply` and the
 refresh that carries them, which the watcher's own trigger coalesces into
@@ -510,9 +523,9 @@ settings on purpose, for the reasons 9.2 gives: `diff.context`,
 `apply.ignoreWhitespace`; `apply.whitespace` is overridden by
 `--whitespace=nowarn`, and `diff.external` stays off (D4). `diff.algorithm`
 is honoured and shapes the hunks the reviewer reads and applies alike.
-Rename detection is always on for staged rows, whatever `diff.renames` says:
-the refresh's `--name-status -M` finds them and the row's diff passes `-M`
-with both endpoints, as the frozen status and diff already did.
+Rename detection is always on, whatever `diff.renames` says: the refresh's
+`--name-status -M` finds a rename on either side and the row's diff passes
+`-M` with both endpoints, as the frozen status and diff already did.
 
 The version becomes 0.0.4.
 
@@ -554,12 +567,17 @@ Test layers, added to 5.2, 7.9 and 8.7:
    yields zero hunks and a text file with one yields its raw hunks;
    `diff.noprefix=true` and `diff.context=0` in the fixture's config change
    nothing in `patch`; the pre-image blob and hash are the ones
-   `git ls-files -s` and the file give at that moment, and an edit landed
-   between the two readings leaves the diff without one.
+   `git ls-files -s` and the file give at that moment, a symlink's is its
+   target, a directory's is its kind, and an edit landed between the two
+   readings leaves the diff without one; a moved file whose destination was
+   added with `git add -N` is an unstaged rename row with `-M` and its
+   source.
 4. Engine, actions, through `Command::Act` against real fixtures: every row
    of 9.2's table (stage, unstage and discard a hunk; `D` on an unstaged row;
    `d` and `D` on a staged row of a clean file, and on one with unstaged
-   changes, the latter refused by git with nothing changed; stage and delete
+   changes, the latter refused by git with nothing changed, and on an `MD`
+   path, refused by the engine with the file still absent; a working-tree
+   form on the K7 directory refused as not a regular file; stage and delete
    an untracked file, an empty one included, and a binary one refused;
    `D` on a staged creation; `d` on a working-tree deletion; `s` and `D` on a
    staged deletion; one hunk of a staged rename, K4; a type change), each
@@ -588,7 +606,8 @@ Test layers, added to 5.2, 7.9 and 8.7:
    at 80, ` unstage ` on a staged row, absent in branch scope, dim while
    `Loading` with no hit; the footer hints in worktree scope only; each box of
    9.3 by title and body, the warning row, the path shortened from the left
-   at 40 columns, five lines at 40x10, `body_is_drawn` false while it is
+   at 40 columns, eight lines at 40x10 with the warning wrapped to two,
+   `body_is_drawn` false while it is
    open; the three key-sheet rows and the reserved set of 9.3 (the lock of
    5.2 item 7).
 8. Input: each key opens its box only from the main view with the right diff
