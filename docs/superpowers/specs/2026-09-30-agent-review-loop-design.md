@@ -2,15 +2,15 @@
 
 Addendum to the Phase 1 design
 (`2026-09-18-hunks-roadmap-p1-viewer-design.md`), its branch-scope section 7
-(`2026-09-22-branch-scope-design.md`, shipped as 0.0.2), its review-marks section
-8 (`2026-09-23-review-marks-design.md`, shipped as 0.0.3) and the hunk-actions
-section 9 (0.0.4, in progress). It is section 10, and every term (`Scope`,
-`Base`, `Comparison`, the picker, the chip, the files panel, the state directory,
-the Y/N box, the read-only guarantee G7) means what those documents say it
-means. The behaviour source is vimeflow `main` at `91e45b1c`, cited as
-`vimeflow:<path>:<line>`, and a run of its packaged build with Codex CLI 0.158 on
-2026-09-30; the interaction was settled first as a storyboard (v2) with the
-owner.
+(`2026-09-22-branch-scope-design.md`, shipped as 0.0.2), its review-marks
+section 8 (`2026-09-23-review-marks-design.md`, shipped as 0.0.3) and the
+hunk-actions section 9 (0.0.4, in progress). It is section 10, and every term
+(`Scope`, `Base`, `Comparison`, the picker, the chip, the files panel, the
+state directory, the Y/N box, the read-only guarantee G7) means what those
+documents say it means. The behaviour source is vimeflow `main` at `91e45b1c`,
+cited as `vimeflow:<path>:<line>`, and a run of its packaged build with Codex
+CLI 0.158 on 2026-09-30; the interaction was settled first as a storyboard (v2)
+with the owner.
 
 ## 10. Agent review loop, part 1
 
@@ -27,8 +27,8 @@ them.
 
 One thing is not a port. Vimeflow sends to the active terminal pane and to
 nothing else: its resolver accepts several candidates
-(`vimeflow:src/features/diff/services/activePanePicker.ts:41-66`) but its caller
-passes only the pane whose diff is on screen
+(`vimeflow:src/features/diff/services/activePanePicker.ts:41-66`) but its
+caller passes only the pane whose diff is on screen
 (`vimeflow:src/features/workspace/WorkspaceView.tsx:3072-3112`), and a review
 there belongs to that pane. The viewer here is a pane of its own, opened from
 another pane, beside any number of agent panes. So the pane that receives a
@@ -63,10 +63,10 @@ was chosen, and the title shown when it was chosen. `session` is
 `Option<SessionRef { kind, value }>`, the host's `agent_session` minus its
 `source`: `kind` is `id` or `path` (the host reports a path for a few agent
 kinds instead of an id) and `value` the string that came with it. An agent the
-host detected without a hook-reported session is as choosable as any other,
-and its record simply has none. `Target::Clipboard` is
-the other variant: a review written to be copied, not sent. The snapshot
-carries `target: Option<Target>` and `target_state`:
+host detected without a hook-reported session is as choosable as any other, and
+its record simply has none. `Target::Clipboard` is the other variant: a review
+written to be copied, not sent. The snapshot carries `target: Option<Target>`
+and `target_state`:
 
 | `target_state` | Meaning |
 | --- | --- |
@@ -118,18 +118,17 @@ engine writes it (below), publishes it, and the chip changes with the next
 snapshot.
 
 **The chip.** One toolbar chip after the stats, drawn from `target` and
-`target_state`: `→ codex w4:p2` (accent) for `Live` with `idle` or `done`;
-`→ codex w4:p2 · working` and `· blocked` (warn) and `· unknown` (dim) for the
-other statuses; `→ codex w4:p2 · ?` (dim) for `Unverified`;
-`→ w4:p2 · restarted` (warn) for `Restarted`; `→ w4:p2 · left` and
-`→ w4:p2 · gone` (bad) for `Left` and `Gone`; `→ no host` (dim) for `NoHost`;
-`→ clipboard` for the clipboard; `→ no agent` (dim) when there is no target
-and a host, and `→ no host` when there is neither: host absence outranks
-target absence, because the picker then has nothing but the clipboard to
-offer.
-Clicking it opens the picker, as clicking the scope chip toggles the scope. It
-drops from the toolbar last but one, before the stats, so it stays visible at
-the widths where the file pill still is.
+`target_state`: `→ codex w4:p2` (accent) for `Live` with `idle` or `done`; `→
+codex w4:p2 · working` and `· blocked` (warn) and `· unknown` (dim) for the
+other statuses; `→ codex w4:p2 · ?` (dim) for `Unverified`; `→ w4:p2 ·
+restarted` (warn) for `Restarted`; `→ w4:p2 · left` and `→ w4:p2 · gone` (bad)
+for `Left` and `Gone`; `→ no host` (dim) for `NoHost`; `→ clipboard` for the
+clipboard; `→ no agent` (dim) when there is no target and a host, and `→ no
+host` when there is neither: host absence outranks target absence, because the
+picker then has nothing but the clipboard to offer. Clicking it opens the
+picker, as clicking the scope chip toggles the scope. It drops from the toolbar
+last but one, before the stats, so it stays visible at the widths where the
+file pill still is.
 
 **Re-verification.** Every refresh of 3.3 asks `pane.get` for the target pane,
 in the same job as the status read, and the published `target_state` is that
@@ -143,12 +142,11 @@ belongs to the selection it was started for: every `SetTarget` advances a
 selection generation, the job carries it, and an answer from an earlier
 generation is discarded before any comparison, so re-picking the same pane
 after its agent restarted cannot be marked `Restarted` by a check that was
-already in flight; the new selection is published as `Unverified` until its
-own check answers. The comparison
-is by pane id and socket first, then `agent`, then the session rule above: a
-different session on the same pane is `Restarted`, not `Left`, because the pane
-is still the one the reviewer chose, and 10.4 lets the send go ahead after a
-confirmation.
+already in flight; the new selection is published as `Unverified` until its own
+check answers. The comparison is by pane id and socket first, then `agent`,
+then the session rule above: a different session on the same pane is
+`Restarted`, not `Left`, because the pane is still the one the reviewer chose,
+and 10.4 lets the send go ahead after a confirmation.
 
 **What is remembered.** `targets.json` beside `bases.json` and `marks.json`,
 keyed by the canonical toplevel like both, one record per worktree, written
@@ -201,11 +199,18 @@ the comment was made: `Worktree` or `Branch { merge_base, label }`, the label
 being the base's label at that moment (`main`, `origin/main`, `reviewed`), kept
 because 10.5 prints it and it cannot be recovered from the id later. The anchor
 never moves: a comment is drawn at whatever row now carries its number under
-its comparison, or nowhere when that row is gone, and it is counted and sent
-either way. Vimeflow does the same, and the agent's reply is matched by item
-number, not by position. A comment is drawn only while the viewer shows its
-comparison kind and, in worktree scope, its half; the panel count counts it
-regardless.
+its comparison, and it is counted and sent either way. Vimeflow does the same,
+and the agent's reply is matched by item number, not by position. A pending or
+unconfirmed comment whose row is no longer in the list -- the file was
+committed, the hunk discarded -- is not lost from the screen: it is drawn at
+the end of the body, after the last diff row, under the line `✎ on changes no
+longer shown (2)`, as a card whose title also names its path and place
+(`src/cart.py:16 · Bug · pending`). These cards are the one kind that is a
+cursor target: `j` reaches them past the last diff line, `u` edits and `x`
+deletes them, so a reviewer can always shorten or drop what an oversized or
+outdated review carries, and every other comment key is inert on them. A
+comment is drawn only while the viewer shows its comparison kind and, in
+worktree scope, its half; the panel count counts it regardless.
 
 **Cards.** A pending comment is a card under its line: a one-line rounded
 frame, the title `Bug · pending` on its top edge, the text wrapped inside at
@@ -267,35 +272,39 @@ settlement.
 
 **Remembered.** `comments.json` beside `targets.json`, keyed by the canonical
 toplevel, one array of records per worktree. Every add, edit, delete and send
-is one transaction under the lock: read the file as it is now, apply the
-change by comment id to what was read (an add appends, an edit and a delete
-find their id or do nothing, a send stamps the ids it sent), an add checks
-the cap of 50 against what was read, write through a temporary file and a
-rename, and publish the merged array. Two viewers on one worktree therefore
-never lose each other's comments, and a viewer also rereads the file in each
-refresh when its mtime moved, as `marks.json` is reread in 8.2. A transaction
-that cannot read or write the file keeps its operation in a journal of the
-viewer's own, applied by id to what the viewer shows, and every later
-transaction replays the journal on top of what it read before applying its
-own operation, so a write that succeeds carries the journal without undoing
-anything another viewer wrote in between; a send is never claimed while the
-journal is not empty (10.4). Every record is checked by shape on load: `path`
-relative, not empty, no `..` component; for a `Line` or `Range` span, `line`
-and `end` positive and `end` not before `line`; for a `File` span, `line` 0
-and no `end`; `category` one of the four; `text` within both caps with no
-control characters other than newline; a `merge_base` a 40- or 64-hex id
-(`base::is_object_id`) and its `label` a printable string without control
-characters; a nonce six to sixteen alphanumerics; a `to` that is `clipboard`
-or whose `pane`, `agent` and `session` pass the checks 10.2 applies to those
-three fields of a target record (it carries no socket). A `Sending` record
-whose claim is older than 60 seconds is rewritten as `Unconfirmed`, by nonce
-and only while it is still `Sending`, by whichever viewer notices first: on
-load, and in every refresh of 3.3, which checks the ages of the records it
-holds whether or not the file's mtime moved. The viewer that claimed it is
-gone with its answer, or its host call has long since timed out (10.6). A
-record that fails is dropped with a problem line in `config-problems.log`, and
-the next write rewrites the file without it. Without a state directory there
-is no shared store and no journal: the session's array is the store, every
+is one transaction under the lock: read the file as it is now, apply the change
+by comment id to what was read (an add appends, an edit and a delete find their
+id or do nothing, a send stamps the ids it sent), an add checks the cap of 50
+against what was read, write through a temporary file and a rename, and publish
+the merged array. Two viewers on one worktree therefore never lose each other's
+comments, and a viewer also rereads the file in each refresh when its mtime
+moved, as `marks.json` is reread in 8.2. A transaction that cannot read or
+write the file keeps its operation in a journal of the viewer's own, applied by
+id to what the viewer shows, and every later transaction replays the journal on
+top of what it read before applying its own operation, so a write that succeeds
+carries the journal without undoing anything another viewer wrote in between:
+every entry carries the record as the viewer saw it, a replayed add applies
+when its id is absent, and a replayed edit or delete applies only to a record
+still equal to the one it saw, so a comment another viewer edited, deleted or
+sent meanwhile keeps that viewer's version and the entry is dropped with the
+notice `a comment changed under you; your <edit|deletion> was dropped`; a send
+is never claimed while the journal is not empty (10.4). Every record is checked
+by shape on load: `path` relative, not empty, no `..` component; for a `Line`
+or `Range` span, `line` and `end` positive and `end` not before `line`; for a
+`File` span, `line` 0 and no `end`; `category` one of the four; `text` within
+both caps with no control characters other than newline; a `merge_base` a 40-
+or 64-hex id (`base::is_object_id`) and its `label` a printable string without
+control characters; a nonce six to sixteen alphanumerics; a `to` that is
+`clipboard` or whose `pane`, `agent` and `session` pass the checks 10.2 applies
+to those three fields of a target record (it carries no socket). A `Sending`
+record whose claim is older than 60 seconds is rewritten as `Unconfirmed`, by
+nonce and only while it is still `Sending`, by whichever viewer notices first:
+on load, and in every refresh of 3.3, which checks the ages of the records it
+holds whether or not the file's mtime moved. The viewer that claimed it is gone
+with its answer, or its host call has long since timed out (10.6). A record
+that fails is dropped with a problem line in `config-problems.log`, and the
+next write rewrites the file without it. Without a state directory there is no
+shared store and no journal: the session's array is the store, every
 transaction of this section runs on it in memory, claims and settlements
 included, both kinds of send work, and the first add shows `comments not
 remembered: no state directory`, once, which is also the warning that a quit
@@ -332,24 +341,33 @@ unconfirmed`, and the files they are on, across both scopes; the comments
 drawn under another comparison are sent too, each labelled with its own
 (10.5).
 
-**The send.** `Y` sends `Command::Send(SendRequest { kind: Feedback, force })`,
-`force` being true from a "send anyway" row. The engine, in one task:
+**The send.** `Y` sends `Command::Send(SendRequest { kind: Feedback,
+accepted })`, `accepted` being what a "send anyway" row stands for: `Accepted {
+busy: bool, restarted: Option<session> }`, `busy` from a box that showed
+`working` or `unknown`, `restarted` the session a box showed as the restart.
+The engine, in one task:
 
-1. verifies the target with `pane.get`, fresh, under the selection generation
-   of 10.2, and applies two gates that do not know about each other. The
-   continuity gate: `Left`, `Gone` and `NoHost` refuse; `Restarted` refuses
-   unless `force`; `Live` passes; `Unverified` is simply what the check now
-   answers. The status gate, on the status the check just returned whatever
-   the continuity: `blocked` refuses, always, because the host would type the
-   payload into the dialog (`herdr:src/app/api/agents.rs:62-111` checks
-   nothing of the kind); `working` and `unknown` refuse unless `force`; `idle`
-   and `done` pass. A check that cannot run -- a timeout, a malformed reply,
+1. takes the send lock (below), then verifies the target with `pane.get`,
+   fresh, under the selection generation of 10.2, and applies two gates that
+   do not know about each other. The continuity gate: `Left`, `Gone` and
+   `NoHost` refuse; `Restarted` refuses unless `accepted.restarted` is the
+   very session the check found; `Live` passes; `Unverified` is simply what
+   the check now answers. The status gate, on the status the check just
+   returned whatever the continuity: `blocked` refuses, always, because the
+   host would type the payload into the dialog
+   (`herdr:src/app/api/agents.rs:62-111` checks nothing of the kind);
+   `working` and `unknown` refuse unless `accepted.busy`; `idle` and `done`
+   pass. A condition the check finds that the box did not show is therefore
+   refused however the box was answered, and the box then shows it: a send is
+   never forced past something the reviewer has not seen. A check that cannot
+   run -- a timeout, a malformed reply,
    a socket error other than the three that make `NoHost` -- refuses with
    `could not verify w4:p2: <reason>`: the chip keeps its previous state, as
    10.2 says, and a previous state never authorizes a send. A `SetTarget`
    answered since the command was issued refuses too, with `the target
-   changed; press Y again`. When `force` carries a send past `Restarted`, the
-   check's session becomes the target record's, so the next Finish does not
+   changed; press Y again`. When an accepted restart carries a send past
+   `Restarted`, the check's session becomes the target record's, so the next
+   Finish does not
    ask again about a restart the reviewer has already accepted;
 2. makes a nonce: six characters of `[a-z0-9]` from a SHA-256 of the time, the
    pid and a counter (the crate carries `sha2`, not a random number crate),
@@ -367,8 +385,10 @@ drawn under another comparison are sent too, each labelled with its own
    order, numbers
    them `[#1..n]`, builds the payload of 10.5 from their text as read, encodes
    the whole `agent.prompt` request, and only then writes them back as
-   `Sending { at, nonce, item, to }`, `to` being the pane, agent and session
-   step 1 just verified. A viewer whose journal of 10.3 is not empty claims
+   `Sending { at, nonce, item, to, before }`, `to` being the pane, agent and
+   session step 1 just verified and `before` the `Unconfirmed` stamp this claim
+   replaced, when it replaced one. A viewer whose journal of 10.3 is not
+   empty claims
    nothing and refuses with `comments not saved: <reason>; fix it before
    sending`, because a claim no other viewer can read would let two viewers
    send one comment. A request longer than 512 KiB is refused
@@ -401,14 +421,29 @@ drawn under another comparison are sent too, each labelled with its own
    between by another viewer is never settled by this one. A definite answer
    -- an error before the request was written in full (connection refused, a
    write error), or the host's own error reply (`agent_not_ready`,
-   `agent_not_found`, `agent_prompt_failed`) -- returns the records to
-   `Pending` and answers with the message. A success reply stamps them `Sent`.
+   `agent_not_found`, `agent_prompt_failed`) -- returns the records to what
+   they were, `Pending`, or `Unconfirmed` with the stamp `before` kept, because
+   a retry that definitely failed proves nothing about the earlier send that
+   may have arrived, and answers with the message. A success reply stamps
+   them `Sent`.
    An uncertain outcome -- the request was written and no reply came within
    the client's deadline (10.6) -- stamps them `Unconfirmed`: the agent may
    well have the text, and a lost correlation is the costlier mistake;
-6. answers on the snapshot: `send_seq` advances once per request, `send_error`
-   carries the refusal or the host's message, and a success publishes the
-   stamped comments.
+6. releases the send lock once the host has answered and a further half
+   second has passed, longer than the 300 ms the host waits before it presses
+   Enter, and answers on the snapshot: `send_seq` advances once per request,
+   `send_error` carries the refusal or the host's message, and a success
+   publishes the stamped comments.
+
+The send lock is `send.lock` in the state directory, a `flock` like 7.3's, held
+from step 1 to step 6 by every send and request of every viewer of this user,
+on any worktree, so two viewers finishing to one pane paste one after the
+other: the host acknowledges a paste before its Enter
+(`herdr:src/app/api/agents.rs:103`), and two prompts pasted within that delay
+would go in as one submission, both recorded as sent. The lock is held for a
+few seconds at most, by 10.6's deadline; a viewer that finds it taken waits,
+and the box reads `another viewer is sending` while it does. A viewer that dies
+holding it releases it with its process, as a `flock` does.
 
 An unconfirmed record is drawn with the title `Bug · sent?`, is counted
 neither as pending nor as sent, and is claimed again by the next Finish along
@@ -421,8 +456,9 @@ into `Unconfirmed`.
 The box reads the answer by `send_seq` as the picker reads `pick_seq` in 7.4:
 success closes it and shows the notice `sent 2 items to codex · w4:p2`; a
 refusal keeps it open with the reason in place of its first line, and when the
-reason is one that `force` overrides -- working, unknown, restarted -- its `Y`
-row now reads `send anyway` and the next `Y` carries `force`; `A` or `c` is one
+reason is one that can be accepted -- working, unknown, restarted -- its `Y`
+row now reads `send anyway` and the next `Y` carries that condition in
+`accepted`, the restart with the session the refusal named; `A` or `c` is one
 key away in every case. Focus stays in the viewer: a popup viewer would close
 if focus left it, and the agent's pane is one keybinding away in the host.
 
@@ -453,50 +489,55 @@ the copy: <reason>`.
 **Request review.** `@` opens the Request box: `Scope  f this file   a all
 changes (4)` on its first line, the scope in reverse video; `Delegate a review
 of <scope> to codex · w4:p2?` with the target's state line as in the Finish
-box; `Y` delegate · `A` · `c` copy · `n` cancel. The scope starts on all
-changes; `f` is unavailable with no diff loaded and `a` with an empty list, and
-while the chosen scope is unavailable `Y` is not offered. With an empty list
-the box reads `nothing to review` with `n` alone; with exactly one row whose
-diff is loaded the two scopes coincide and the scope line is not drawn, and
-with one row whose diff is not loaded it is drawn with `f` unavailable. The
-request goes
-through the same six steps with `kind: Review { scope }`, under the same
-512 KiB bound, except that no comment is claimed: step 3 instead records the
-request in `requests.json` beside `comments.json`, under the lock, as `{
-nonce, at, target, files: [{ key, comparison, additions: [[start, end]…],
-deletions: [[start, end]…] }] }`, `key` being the row's `FileKey` of 7.2 as
-in 10.3's anchors (both halves of a partially staged file are two entries),
-and the ranges the hunks of each file in scope as they are now, which is the
-snapshot the next section anchors findings against, as Vimeflow's
-`pendingReviewRequests` does. `f` takes the selected row's ranges from its
-loaded diff, which its availability rule guarantees. `a` needs no loaded diff:
-for every row whose diff is not `Ready` in the snapshot, the selected one
-included, the task loads it the way 3.3 and 7.2 load a selected row -- the
-frozen `get_git_diff_inner` in worktree scope, `branch::diff` and
-`branch::untracked_diff` in branch scope, one row after another, each under
-the frozen 30 s timeout -- and keeps only the hunk headers. Those are the
-commands the allow-list of 7.6 already admits, so it does not grow; a row
-whose diff fails is recorded with no ranges and listed in the prompt all the
-same, and a request is never refused for one unreadable row. The reads come
-first, before step 1: the check of the target is then made with the payload
-ready and the dispatch a moment away, so an agent that was answered or
-restarted during a long read refuses the send, and a `SetTarget` during it
-refuses with `the target changed; press @ again`; and the record is written
-after the reads, so a request is never recorded with ranges it does not have.
-`target` in the record is the destination step 1 verified, as `to` is in
-10.3. Refusals, `A` and `c` behave as in the Finish box; success closes it
-with `review requested from codex · w4:p2`.
+box; `Y` delegate · `A` · `c` copy · `n` cancel. `c` here, and `Y` on a
+clipboard target, copy the request text and record the request too, with
+`target = clipboard`, so a `VIMEFLOW_REVIEW` block pasted back later can be
+anchored; the record is written only when the text reached a destination (the
+file was written, or the text is within the OSC 52 limit), and the reads of the
+ranges come first as for a send. `c` in the Finish box records nothing: the
+comments stay pending, and the next send gives them a new nonce. The scope
+starts on all changes; `f` is unavailable with no diff loaded and `a` with an
+empty list, and while the chosen scope is unavailable `Y` is not offered. With
+an empty list the box reads `nothing to review` with `n` alone; with exactly
+one row whose diff is loaded the two scopes coincide and the scope line is not
+drawn, and with one row whose diff is not loaded it is drawn with `f`
+unavailable. The request goes through the same six steps with `kind: Review {
+scope }`, under the same 512 KiB bound, except that no comment is claimed: step
+3 instead records the request in `requests.json` beside `comments.json`, under
+the lock, as `{ nonce, at, target, files: [{ key, comparison, additions:
+[[start, end]…], deletions: [[start, end]…] }] }`, `key` being the row's
+`FileKey` of 7.2 as in 10.3's anchors (both halves of a partially staged file
+are two entries), and the ranges the hunks of each file in scope as they are
+now, which is the snapshot the next section anchors findings against, as
+Vimeflow's `pendingReviewRequests` does. `f` takes the selected row's ranges
+from its loaded diff, which its availability rule guarantees. `a` needs no
+loaded diff: for every row whose diff is not `Ready` in the snapshot, the
+selected one included, the task loads it the way 3.3 and 7.2 load a selected
+row -- the frozen `get_git_diff_inner` in worktree scope, `branch::diff` and
+`branch::untracked_diff` in branch scope, one row after another, each under the
+frozen 30 s timeout -- and keeps only the hunk headers. Those are the commands
+the allow-list of 7.6 already admits, so it does not grow; a row whose diff
+fails is recorded with no ranges and listed in the prompt all the same, and a
+request is never refused for one unreadable row. The reads come first, before
+step 1: the check of the target is then made with the payload ready and the
+dispatch a moment away, so an agent that was answered or restarted during a
+long read refuses the send, and a `SetTarget` during it refuses with `the
+target changed; press @ again`; and the record is written after the reads, so a
+request is never recorded with ranges it does not have. `target` in the record
+is the destination step 1 verified, as `to` is in 10.3. Refusals, `A` and `c`
+behave as in the Finish box; success closes it with `review requested from
+codex · w4:p2`.
 
 ### 10.5 What is sent
 
 Both prompts are Vimeflow's, so that an agent, a reply parser and a reviewer
-who knows one tool know the other. Every line is a Markdown quote, which is
-why a reply parser accepts `>` in front of its markers. Before anything of the
+who knows one tool know the other. Every line is a Markdown quote, which is why
+a reply parser accepts `>` in front of its markers. Before anything of the
 reviewer's or the repository's enters the text, control characters
 (`0x00`–`0x1F` and `DEL`) are removed from paths, comment lines and labels,
 newline excepted where it separates the lines of a comment: a file name or a
-comment could otherwise carry a bracketed-paste terminator or a carriage
-return into the agent's input
+comment could otherwise carry a bracketed-paste terminator or a carriage return
+into the agent's input
 (`vimeflow:src/features/diff/services/feedbackDispatch.ts:14-28`). The host
 adds nothing and strips nothing (10.4).
 
@@ -595,28 +636,27 @@ Option<Arc<CopyOut>>`, the text the shell writes as OSC 52 once per
 change to it alone would never be published (AGENTS.md).
 
 **The host client.** `engine::host` declares `trait HostClient { pane_get,
-pane_list, agent_prompt }`, injected through `SessionConfig` as the watcher
-and the git check are, so engine tests run against a fake that records every
+pane_list, agent_prompt }`, injected through `SessionConfig` as the watcher and
+the git check are, so engine tests run against a fake that records every
 request and answers from a script, and the production value wraps
-`herdr::client::HerdrClient` -- the actions' client, unchanged in protocol:
-one request per connection, a three-second read timeout -- in
-`spawn_blocking`. Two changes in `src/herdr/client.rs`: `HerdrClientError`
-says whether the failure came before or after the request line was written in
-full, which 10.4's settlement reads, and one request gets one deadline, five
-seconds from its start, instead of a timeout per read. The connection is made
-non-blocking and polled against the deadline; every read and write timeout
-is set to the time the deadline has left before the call; the deadline is
-checked between calls; and a line that is not complete when it passes fails
-the request. A socket timeout bounds one call, not the exchange, and a host
-that answered a byte every two seconds would otherwise hold a request open
-for as long as it liked. The engine, for its part, waits at most ten seconds
-on the blocking call before it treats the outcome as uncertain, and an answer
-that arrives later is settled by nonce like any other, so 10.3's 60-second
-claim expiry is six times the longest a send can run: a viewer whose send is
-still running can never be mistaken for one that is gone. Nothing else about
-the client moves, and the actions keep the same client, with a deadline where
-they had a read timeout. The
-socket path is `HERDR_SOCKET_PATH`; unset, the client is `None` and every
+`herdr::client::HerdrClient` -- the actions' client, unchanged in protocol: one
+request per connection, a three-second read timeout -- in `spawn_blocking`. Two
+changes in `src/herdr/client.rs`: `HerdrClientError` says whether the failure
+came before or after the request line was written in full, which 10.4's
+settlement reads, and one request gets one deadline, five seconds from its
+start, instead of a timeout per read. The connection is made non-blocking and
+polled against the deadline; every read and write timeout is set to the time
+the deadline has left before the call; the deadline is checked between calls;
+and a line that is not complete when it passes fails the request. A socket
+timeout bounds one call, not the exchange, and a host that answered a byte
+every two seconds would otherwise hold a request open for as long as it liked.
+The engine, for its part, waits at most ten seconds on the blocking call before
+it treats the outcome as uncertain, and an answer that arrives later is settled
+by nonce like any other, so 10.3's 60-second claim expiry is six times the
+longest a send can run: a viewer whose send is still running can never be
+mistaken for one that is gone. Nothing else about the client moves, and the
+actions keep the same client, with a deadline where they had a read timeout.
+The socket path is `HERDR_SOCKET_PATH`; unset, the client is `None` and every
 pane target is `NoHost`, while `Target::Clipboard` is `Clipboard` with or
 without a host. The three methods are the whole host surface of this section:
 the engine never sends keys, never reads a pane, never focuses anything.
@@ -644,25 +684,26 @@ loads the other rows' diffs through the loaders 3.3 and 7.2 already use
 (10.4). The toplevel, the comparison and the rows come from the snapshot the
 command was issued against.
 
-**The view.** `tui::rows` gains `Row::Card { comment, lines }`, built after
-the row the anchor names, after the file header for a file comment, after the
-range's last line for a range comment; `rows::build` interleaves them from
-the snapshot's comments filtered by the current comparison, and
-`row_of_target` is unchanged because cards are never targets. The rebuild
-rule of 4.8 widens with them: `ViewState::reconcile` rebuilds when the diff's
-`Arc`, the mode, the comments' `Arc` or the body width changed, the last
-because a card's lines are wrapped at build time, and `Arc::ptr_eq` on the
-comments keeps the unchanged case free, as it is for the diff. `view.rs` draws
-a card as a rounded frame in the body's columns past the gutter, the title on
-the top edge, and a hit over its rows that moves the cursor to the anchor's
-line. The editor and the visual selection are `ViewState` modes beside the
-picker and the key sheet; the Finish and Request boxes are `dialog::Panel`
-values with entry rows for their keys, drawn where the picker is drawn.
-`tui::picker` takes its rows from `panes` as well as from `refs`, the quick
-rows of 8.4 replaced by the three groups of 10.2; `keys.rs` gains the bindings
-of 10.3 and 10.4, the key sheet lists them, and `RESERVED` shrinks to `/`:
-search is the one Vimeflow key still unbound. The toolbar gains the target
-chip (10.2) and the files panel the marks of 10.3.
+**The view.** `tui::rows` gains `Row::Card { comment, lines }`, built after the
+row the anchor names, after the file header for a file comment, after the
+range's last line for a range comment; `rows::build` interleaves them from the
+snapshot's comments filtered by the current comparison, with the orphan section
+of 10.3 after the last diff row; a card in place is never a target, an orphan
+card is, so `row_of_target` counts the orphans after the last diff target and
+nothing else changes in it. The rebuild rule of 4.8 widens with them:
+`ViewState::reconcile` rebuilds when the diff's `Arc`, the mode, the comments'
+`Arc` or the body width changed, the last because a card's lines are wrapped at
+build time, and `Arc::ptr_eq` on the comments keeps the unchanged case free, as
+it is for the diff. `view.rs` draws a card as a rounded frame in the body's
+columns past the gutter, the title on the top edge, and a hit over its rows
+that moves the cursor to the anchor's line. The editor and the visual selection
+are `ViewState` modes beside the picker and the key sheet; the Finish and
+Request boxes are `dialog::Panel` values with entry rows for their keys, drawn
+where the picker is drawn. `tui::picker` takes its rows from `panes` as well as
+from `refs`, the quick rows of 8.4 replaced by the three groups of 10.2;
+`keys.rs` gains the bindings of 10.3 and 10.4, the key sheet lists them, and
+`RESERVED` shrinks to `/`: search is the one Vimeflow key still unbound. The
+toolbar gains the target chip (10.2) and the files panel the marks of 10.3.
 
 **Keys that change meaning.** `y` inside a Y/N box of section 9 means yes;
 outside one it copies a visual selection and is inert without one, as in
@@ -676,16 +717,16 @@ only git this section runs is the diff loads of an all-changes request, through
 the loaders 3.3 and 7.2 already use, and the engine's writes stay in the state
 directory. `tests/readonly_guarantee.rs` gains the fake host of `tests/support`
 so the engine's socket traffic is seen: the test runs a session that picks a
-target, writes a comment, finishes, copies with `c` and requests a review of all
-changes, and asserts that the only methods the host saw are `pane.list`,
+target, writes a comment, finishes, copies with `c` and requests a review of
+all changes, and asserts that the only methods the host saw are `pane.list`,
 `pane.get` and `agent.prompt`, that `agent.prompt` was called exactly once per
 confirmed send with the text the test expects, that every git command was one
 of the ten, that the state directory afterwards holds `bases.json`,
 `marks.json`, `targets.json`, `comments.json`, `requests.json`, `clipboard.md`
-and the lock file and nothing else, and, as before, that the index, the refs
-and the worktree are byte for byte what they were. The fake answers `pane.get`
-from a table the test edits mid-run, which is how the `Gone`, `Left`,
-`Restarted` and `blocked` paths of 10.4 are exercised without a host.
+and the two lock files and nothing else, and, as before, that the index, the
+refs and the worktree are byte for byte what they were. The fake answers
+`pane.get` from a table the test edits mid-run, which is how the `Gone`,
+`Left`, `Restarted` and `blocked` paths of 10.4 are exercised without a host.
 
 **Standalone.** `herdr-hunks [PATH]` outside a host has no socket: the chip
 reads `→ no host`, the picker offers the clipboard alone, comments and copy
@@ -724,7 +765,11 @@ comment is a record beside the diff, never in it.
 | a file of an all-changes request has no loadable diff, the selected one included | listed in the prompt without ranges; the request goes out |
 | OSC 52 is dropped by the terminal or the host | `clipboard.md` has the text and the notice names it; a clipboard send with no file written is `Unconfirmed` |
 | the base moves (a merge into `main`, a fetch) under branch-scope comments | the anchors keep the merge-base they were made against and are drawn at their numbers; the prompt names that merge-base, so the agent sees what the reviewer saw |
-| a comment's row leaves the list (the file was committed, the hunk discarded) | the card is not drawn; the comment is counted and sent; `✎` leaves the panel with the row |
+| a comment's row leaves the list (the file was committed, the hunk discarded) | the card moves to the orphan section at the end of the body, where `u` and `x` still reach it; the comment is counted and sent; `✎` leaves the panel with the row |
+| another viewer holds the send lock | the box reads `another viewer is sending` and the send waits for it; the lock is released by the host's answer plus half a second, or by the death of the viewer holding it |
+| a retry of an `Unconfirmed` comment fails definitely | the record returns to `Unconfirmed` with its earlier stamp, never to `Pending`: the earlier send may have arrived |
+| the fresh check finds a condition the box did not show (a restart behind a `working` refusal) | refused and shown; `send anyway` accepts only what the box named |
+| a journaled edit or deletion meets a record another viewer changed | that viewer's version stays and the entry is dropped with `a comment changed under you; your <edit|deletion> was dropped` |
 | a popup viewer below 40×10 | 4.2's size notice; nothing of this section is drawn |
 
 Cost. One `pane.get` per refresh while a pane target exists, over the socket,
@@ -737,9 +782,9 @@ poll interval and the git allow-list are unchanged.
 
 Configuration is unchanged: no new keys. A target and a review are state, not
 preference, and the state directory rule of 4.7 covers `targets.json`,
-`comments.json`, `requests.json` and `clipboard.md` as it covers `bases.json`
--- written only under an absolute state directory, never relative to the
-repository.
+`comments.json`, `requests.json`, `clipboard.md` and `send.lock` as it covers
+`bases.json` -- written only under an absolute state directory, never relative
+to the repository.
 
 The version becomes 0.0.5. The roadmap table of 1.2 is amended to show the
 order decided on 2026-09-30, section 9 then this section, and AGENTS.md's
@@ -825,7 +870,10 @@ against the fake `HostClient` of 10.6, which records every request and answers
    journals its operation and the viewer shows the result; when the store
    can be written again after another viewer added and deleted comments in
    between, the next transaction's write holds the journal's operations and
-   the other viewer's both; `Send` refuses while the journal is not empty.
+   the other viewer's both, a journaled edit of a record the other viewer
+   edited meanwhile is dropped with its notice and the other's text stays,
+   and a journaled deletion of a record since sent is dropped too; `Send`
+   refuses while the journal is not empty.
 4. Engine, sending: with the fake accepting, `Send` claims the `Pending` and
    `Unconfirmed` records in creation order, never one another viewer holds as
    `Sending`, stamps them `Sending` before the host is called (the fake reads
@@ -834,12 +882,19 @@ against the fake `HostClient` of 10.6, which records every request and answers
    under the nonce the text carries, with `to` the pane, agent and session
    the check returned; a comment another viewer edited after the claim is
    refused there and sent as claimed; each gate of 10.4: `Left`, `Gone` and
-   `NoHost` refuse, `blocked` refuses with and without `force`, `working`,
-   `unknown` and `Restarted` refuse without `force` and send with it, a
-   forced send past `Restarted` rewrites the target record's session, the
-   status is the one read at the send, not the chip's, a check that cannot
-   run refuses with `could not verify`, and a `SetTarget` answered between
-   the command and the check refuses with `the target changed`;
+   `NoHost` refuse, `blocked` refuses whatever was accepted, `working` and
+   `unknown` refuse without `accepted.busy` and send with it, `Restarted`
+   refuses unless `accepted.restarted` names the session the check found and
+   a restart behind an accepted `working` is refused and shown, an accepted
+   restart rewrites the target record's session, the status is the one read
+   at the send, not the chip's, a check that cannot run refuses with `could
+   not verify`, and a `SetTarget` answered between the command and the check
+   refuses with `the target changed`; a definite failure of a retried
+   `Unconfirmed` record returns it to `Unconfirmed` with its earlier stamp;
+   two sessions sending to one pane through one fake take `send.lock` in
+   turn, the second's `agent.prompt` arriving after the first's answer plus
+   the half second, and the box of the second reads `another viewer is
+   sending` while it waits;
    `agent_not_ready`, `agent_not_found`, `agent_prompt_failed` and a refused
    connection return the claim to `Pending` with the host's words in
    `send_error`; a request written in full with no reply within the deadline
@@ -864,7 +919,11 @@ against the fake `HostClient` of 10.6, which records every request and answers
    the same, a selected row whose diff is `Failed` loaded by the task like
    the others; the reads precede the check and the write, so a table edit to
    `blocked` while they run refuses the request and nothing is recorded;
-   `target` is the destination the check returned; `f` with no loaded diff
+   `target` is the destination the check returned; `c` in the Request box
+   and `Y` on a clipboard target record the request with `target =
+   clipboard` when the file was written or the text is within the OSC 52
+   limit, and record nothing when neither holds; `c` in the Finish box
+   records nothing; `f` with no loaded diff
    and `a` with an empty list are refused; in branch scope the ranges are
    against the merge-base of the snapshot the command was issued against;
    the git commands the task ran are allow-listed ones and nothing else.
@@ -892,8 +951,10 @@ against the fake `HostClient` of 10.6, which records every request and answers
 8. View: the chip for every `target_state` and status, its colour and its
    place in the toolbar's drop order; cards under a line, a range's last line
    and a file header, wrapped at the card width, the four title colours, and
-   the titles `· pending`, `· sending`, `· sent?` and `· sent`; a comment
-   whose row is gone draws nothing and is counted; cards drawn only under
+   the titles `· pending`, `· sending`, `· sent?` and `· sent`; a pending
+   comment whose row is gone is drawn in the orphan section with its path and
+   place on the title and is counted, a sent one is not drawn; cards drawn
+   only under
    their comparison kind and, in worktree scope, their half; the editor with
    each category selected, a multi-line text, a narrow pane, and the limit
    title at either cap; `✎` in the panel and `CHANGED 3 · ✎ 2`; `Y finish
@@ -908,7 +969,9 @@ against the fake `HostClient` of 10.6, which records every request and answers
    and keeps the anchor, `Esc` there drops it, `Enter` on a row opens the
    editor on it; `v` with `j`/`k`, `h`/`l` in split mode, `Esc` and `y`; `u`
    and `x` take the most recent pending card of the line and `U` and `X` the
-   most recent pending file comment; `y` is inert without a selection; `n`
+   most recent pending file comment; `j` past the last diff line lands on an
+   orphan card, where `u` and `x` act and `i`, `I`, `v`, `U` and `X` are
+   inert; `y` is inert without a selection; `n`
    cancels a box and moves to the next file outside one; `c` is bound only
    inside the boxes; `/` is the whole reserved set and is inert; a box's
    other keys are inert while it is open; the picker and the key sheet leave
@@ -921,8 +984,8 @@ against the fake `HostClient` of 10.6, which records every request and answers
     git command the session ran, the request's diff loads included, is one of
     the ten; that the state directory holds exactly `bases.json`,
     `marks.json`, `targets.json`, `comments.json`, `requests.json`,
-    `clipboard.md` and the lock file; and that the repository is byte for
-    byte what it was.
+    `clipboard.md`, `split-panes.lock` and `send.lock`; and that the
+    repository is byte for byte what it was.
 11. Tier B (ignored, real host): after the existing `b` and `M`, the test
     presses `A` in a session whose only other pane is a shell, asserts the
     picker's no-agent line and the clipboard row through the real host's
