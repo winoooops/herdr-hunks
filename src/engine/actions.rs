@@ -152,11 +152,15 @@ fn a_side_of(plus: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Spec 9.2 "Headers": mode lines go; a rename's header is rebuilt from its `+++` line.
-fn rewrite_header(header: &[&[u8]]) -> Vec<u8> {
-    let is_rename = header
-        .iter()
-        .any(|l| l.starts_with(b"rename from ") || l.starts_with(b"copy from "));
+/// Spec 9.2 "Headers": mode lines go. A reverse slice of a rename is rebuilt from its `+++`
+/// line, so the hunk leaves the new name's index entry and the rename stands (K4); a forward
+/// slice keeps the rename header, because the hunk's pre-image is the old name's content and
+/// staging it stages the rename with it.
+fn rewrite_header(header: &[&[u8]], direction: Direction) -> Vec<u8> {
+    let is_rename = direction == Direction::Reverse
+        && header
+            .iter()
+            .any(|l| l.starts_with(b"rename from ") || l.starts_with(b"copy from "));
     let plus = header
         .iter()
         .find_map(|l| l.strip_prefix(b"+++ "))
@@ -233,7 +237,7 @@ pub fn hunk_patch(patch: &[u8], index: usize, direction: Direction) -> Option<Ve
         let (header, hunks) = split_section(section);
         if index < seen + hunks.len() {
             let hunk = &hunks[index - seen];
-            let mut out = rewrite_header(&header);
+            let mut out = rewrite_header(&header, direction);
             out.extend(recount(hunk[0], direction));
             for line in &hunk[1..] {
                 out.extend_from_slice(line);
@@ -550,6 +554,30 @@ mod tests {
         assert!(String::from_utf8_lossy(&hunk).starts_with(
             "diff --git a/new.txt b/new.txt\nindex ac33350..5dbdd84 100644\n--- a/new.txt\n+++ b/new.txt\n"
         ));
+    }
+
+    #[test]
+    fn a_forward_slice_of_a_rename_keeps_its_rename_header() {
+        let plain: &[u8] = b"diff --git a/old.txt b/new.txt\nsimilarity index 74%\nrename from old.txt\nrename to new.txt\nindex ac33350..5dbdd84 100644\n--- a/old.txt\n+++ b/new.txt\n@@ -1,4 +1,4 @@\n-alpha\n+ALPHA\n c\n c\n c\n@@ -6,4 +6,4 @@ c\n c\n c\n c\n-gamma\n+GAMMA\n";
+        let forward = hunk_patch(plain, 0, Direction::Forward).unwrap();
+        let text = String::from_utf8_lossy(&forward);
+        assert!(
+            text.starts_with("diff --git a/old.txt b/new.txt\nsimilarity index 74%\nrename from old.txt\nrename to new.txt\nindex ac33350..5dbdd84 100644\n--- a/old.txt\n+++ b/new.txt\n@@ -1,4 +1,4 @@\n"),
+            "{text}"
+        );
+        assert!(text.contains("+ALPHA") && !text.contains("+GAMMA"));
+        let reverse = hunk_patch(plain, 0, Direction::Reverse).unwrap();
+        assert!(String::from_utf8_lossy(&reverse).starts_with(
+            "diff --git a/new.txt b/new.txt\nindex ac33350..5dbdd84 100644\n--- a/new.txt\n+++ b/new.txt\n"
+        ));
+        // Mode lines leave a forward slice too.
+        let with_mode: &[u8] = b"diff --git a/old b/new\nold mode 100644\nnew mode 100755\nsimilarity index 90%\nrename from old\nrename to new\n--- a/old\n+++ b/new\n@@ -1 +1 @@\n-x\n+y\n";
+        let text = String::from_utf8_lossy(&hunk_patch(with_mode, 0, Direction::Forward).unwrap())
+            .into_owned();
+        assert!(
+            !text.contains("old mode") && text.contains("rename from old\n"),
+            "{text}"
+        );
     }
 
     #[test]

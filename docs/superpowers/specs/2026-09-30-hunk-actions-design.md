@@ -136,11 +136,15 @@ one hunk, as `extractHunkPatch` builds it
    are rebuilt from the section's own `+++` line, so git's quoting of the path
    is kept as git wrote it; `similarity index`, `rename from`, `rename to`,
    `copy from` and `copy to` are dropped; `index`, `new file mode` and
-   `deleted file mode` lines stay. A hunk of a staged rename then reverses
-   that hunk in the index entry of the new name and leaves the rename
-   standing: K4, re-verified as the brief asked (the row reads `RM`
-   afterwards, the rename survives with its other hunk, and the reversed hunk
-   reappears on the unstaged row). Other header lines are kept verbatim.
+   `deleted file mode` lines stay. This rewrite is for reverse forms: a hunk
+   of a staged rename then reverses that hunk in the index entry of the new
+   name and leaves the rename standing: K4, re-verified as the brief asked
+   (the row reads `RM` afterwards, the rename survives with its other hunk,
+   and the reversed hunk reappears on the unstaged row). A forward form
+   keeps the section's rename header, so staging one hunk of an unstaged
+   rename (a moved file whose destination was added with `git add -N`)
+   stages the rename together with that hunk and leaves the rest unstaged.
+   Other header lines are kept verbatim.
 3. Coordinates. The `@@` line of a hunk cut out of a multi-hunk diff names a
    new-side start that assumes the hunks before it were applied, and
    `git apply` begins matching there, so a context that repeats at that
@@ -204,9 +208,10 @@ context does not match is refused with git's message and nothing changes.
 
 **After the action**, the refresh that carried it (9.4) reloads the rows and
 the selected diff. When the acted row is gone, because its last hunk was
-staged, unstaged or discarded, the selection moves to the other row of the
-same path when one exists (the staged row after a stage, the unstaged row
-after an unstage), and otherwise 3.3's index rule applies. The cursor follows
+staged, unstaged or discarded, and it was still the selected row, the
+selection moves to the other row of the same path when one exists (the
+staged row after a stage, the unstaged row after an unstage), and otherwise
+3.3's index rule applies; a row the user selected meanwhile is kept. The cursor follows
 4.8: the same line when it survives, the nearest when it does not.
 
 ### 9.3 Keys, the box, the toolbar and the footer
@@ -344,10 +349,13 @@ snapshot has no toplevel. Once a form runs, its result is the answer, with
 `action_applied` true: `None` or git's reason. A status read that fails
 afterwards does not change it, and is shown as 3.6 shows a status error.
 
-**Supersession.** Any action that ran a form, whether it succeeded or not,
-increments `diff_generation` and clears `diff_in_flight`, the way a changed
-`Comparison` does: a diff read before the mutation is never published after
-it. The `Arc` the forms ran on is remembered as acted on, so no second `Act`
+**Supersession.** When an action is popped from the queue, before any form
+runs, `diff_generation` is incremented and `diff_in_flight` cleared, the way
+a changed `Comparison` does, and no diff task starts while an action is
+queued or being carried: a selection made meanwhile shows `Loading` and is
+read by the carrying refresh when it completes. A diff read before the
+mutation is therefore never published after it, and nothing read during it
+exists. The `Arc` the forms ran on is remembered as acted on, so no second `Act`
 can name it, until a diff published later replaces it; 3.3 keeps it on
 screen as `Ready(old)` meanwhile, which is why the TUI holds its keys (9.3).
 The refresh that carried the action requests the selected row's diff again
