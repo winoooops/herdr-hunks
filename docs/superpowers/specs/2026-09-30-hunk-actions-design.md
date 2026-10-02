@@ -175,10 +175,12 @@ engine acts only while that `Arc` is the diff it last published and no form
 has run on it; otherwise it answers `the diff changed; look again`, and the
 newer content is on screen by then. Second, the diff task records the
 pre-image of what it read: the index entry's blob id from
-`git ls-files -s -- <path>`, or its absence for an untracked row, and the
-working-tree path's kind from `lstat` with what that kind holds: a regular
-file's bytes hash, a symlink's target bytes, or the bare kind for a
-directory, anything else, an absence or a path that could not be read.
+`git ls-files -s -- <path>`, or its absence for an untracked row; for a
+rename row the same for its source, because a forward patch applies to the
+source's entry; and the working-tree path's kind from `lstat` with what that
+kind holds: a regular file's bytes hashed through a bounded buffer, a
+symlink's target bytes, or the bare kind for a directory, anything else, an
+absence or a path that could not be read.
 Neither read moves `HEAD`, so the bracket of 8.2 says nothing about them; the task
 brackets the diff with them instead, reading both before and after the diff
 and keeping the pre-image only when the two readings agree. A diff whose
@@ -187,8 +189,9 @@ action on it with the same notice until the next reload. The hash is one the
 engine computes; it detects edits, not forgeries, so a cryptographic one is
 not required. Immediately before each form, and again before each retry of
 9.4, the engine reads the same two things and refuses with the same notice
-when the one that form applies to differs: the blob, or its absence, for a
-`--cached` form; the file, or its absence, for a working-tree one; both for
+when the one that form applies to differs: the blob, or its absence, and
+the source's, for a `--cached` form; the file, or its absence, for a
+working-tree one; both for
 an `--index` form, whose working-tree file must be present whenever the
 index still holds an entry for it, which the engine checks itself because
 git would otherwise recreate the missing file from the index and so erase an

@@ -720,7 +720,9 @@ impl State {
             // The first pre-image reading precedes the delay and the gate, so the two readings
             // bracket everything that can wait; an edit landing in between leaves no pre-image.
             let pre = match &comparison {
-                Comparison::Worktree => worktree::pre_image(&toplevel, &key.path).await.ok(),
+                Comparison::Worktree => worktree::pre_image(&toplevel, &key.path, old.as_deref())
+                    .await
+                    .ok(),
                 Comparison::Branch { .. } => None,
             };
             pre_images.fetch_add(1, Ordering::SeqCst);
@@ -738,7 +740,9 @@ impl State {
                 Comparison::Worktree => worktree::diff(&toplevel, &key, old.as_deref()).await,
             };
             let post = match &comparison {
-                Comparison::Worktree => worktree::pre_image(&toplevel, &key.path).await.ok(),
+                Comparison::Worktree => worktree::pre_image(&toplevel, &key.path, old.as_deref())
+                    .await
+                    .ok(),
                 Comparison::Branch { .. } => None,
             };
             pre_images.fetch_add(1, Ordering::SeqCst);
@@ -4759,6 +4763,72 @@ mod tests {
             a.selected.as_ref(),
             Some(&other),
             "the newer selection stands"
+        );
+    }
+
+    #[test]
+    fn a_changed_rename_source_entry_refuses_the_forward_form_before_git() {
+        let dir = fixture();
+        let p = dir.path();
+        let ctx = "c1\nc2\nc3\nc4\nc5\nc6\nc7\n";
+        std::fs::write(p.join("old.txt"), format!("one\n{ctx}two\n")).unwrap();
+        git(p, &["add", "old.txt"]);
+        git(p, &["commit", "-q", "-m", "old"]);
+        std::fs::rename(p.join("old.txt"), p.join("new.txt")).unwrap();
+        git(p, &["add", "-N", "new.txt"]);
+        std::fs::write(p.join("new.txt"), format!("ONE\n{ctx}TWO\n")).unwrap();
+        let (_rt, h) = start_quiet(p);
+        let s = select(&h, "new.txt", false, false);
+        assert_eq!(
+            ready(&s).unwrap().file_diff.old_path.as_deref(),
+            Some("old.txt")
+        );
+        // The engine is quiet: the source's index entry changes under it, unseen.
+        let blob = {
+            let out = Proc::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(["hash-object", "-w", "--stdin"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            let mut child = out;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(format!("one\n{ctx}changed\n").as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(
+            p,
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("100644,{blob},old.txt"),
+            ],
+        );
+        let a = act(&h, &s, ActionKind::Stage, Some(0));
+        assert_eq!(
+            (a.action_error.as_deref(), a.action_applied),
+            (Some(actions::NOTICE_CHANGED), false)
+        );
+        // The index carries the harness's own edit of old.txt and nothing of the action.
+        let cached = git_out(p, &["diff", "--cached", "-M"]);
+        assert!(
+            !cached.contains("new.txt")
+                && !cached.contains("rename from")
+                && !cached.contains("+ONE"),
+            "{cached}"
+        );
+        assert_eq!(
+            git_out(p, &["status", "--porcelain=v1", "--", "new.txt"]).trim_end(),
+            " A new.txt"
         );
     }
 }

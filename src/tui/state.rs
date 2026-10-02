@@ -456,6 +456,7 @@ pub(crate) mod tests {
         }
         let pre_image = Some(crate::engine::PreImage {
             index: Some("100644 0000000000000000000000000000000000000000 0".into()),
+            source: None,
             worktree: crate::engine::WorktreeKind::File(0),
         });
         let loaded = LoadedDiff::build(

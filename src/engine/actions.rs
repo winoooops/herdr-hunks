@@ -383,8 +383,14 @@ pub(crate) async fn check_pre_image(
     let Some(recorded) = &action.diff.pre_image else {
         return Err(NOTICE_CHANGED.into());
     };
-    let now = worktree::pre_image(toplevel, &action.diff.key.path).await?;
-    if form.reads_index() && now.index != recorded.index {
+    let now = worktree::pre_image(
+        toplevel,
+        &action.diff.key.path,
+        action.diff.file_diff.old_path.as_deref(),
+    )
+    .await?;
+    // A forward form of a rename applies to the source's entry, so both entries must stand.
+    if form.reads_index() && (now.index != recorded.index || now.source != recorded.source) {
         return Err(NOTICE_CHANGED.into());
     }
     if form.reads_worktree() {
@@ -845,6 +851,7 @@ mod tests {
         };
         let pre = Some(PreImage {
             index: None,
+            source: None,
             worktree: WorktreeKind::Absent,
         });
         Arc::new(LoadedDiff::build_with_cap(

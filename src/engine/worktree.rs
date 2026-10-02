@@ -1,7 +1,7 @@
 //! Worktree scope's diffs, built by the engine (spec 9.2, D7): bytes an action can apply back.
 
 use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 
 use crate::engine::base;
 use crate::engine::branch::parse_name_status;
@@ -21,8 +21,26 @@ const DIFF_FLAGS: [&str; 6] = [
 /// SipHash with fixed keys: stable within a process, which is all the pre-image needs.
 pub fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
+    hasher.write(bytes);
     hasher.finish()
+}
+
+const HASH_BUFFER: usize = 64 * 1024;
+
+/// The same hash as `hash_bytes` of the file's contents, read through a bounded buffer: a large
+/// file never costs its size in memory for a pre-image.
+pub fn hash_file(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut buffer = vec![0u8; HASH_BUFFER];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hasher.finish());
+        }
+        hasher.write(&buffer[..read]);
+    }
 }
 
 fn parse_sections(patch: &[u8], path: &str) -> FileDiff {
@@ -93,8 +111,8 @@ pub(crate) async fn diff(
     Ok((response(toplevel, &key.path, &patch), patch))
 }
 
-/// The index entry and the working-tree kind at `path`, both read now.
-pub(crate) async fn pre_image(toplevel: &str, path: &str) -> Result<PreImage, String> {
+/// `<mode> <object id> <stage>` of the index entry at exactly `path`, or `None`.
+async fn index_entry(toplevel: &str, path: &str) -> Result<Option<String>, String> {
     validate_file_path(path)?;
     let listed = base::git(toplevel, &["ls-files", "-s", "-z", "--", path]).await?;
     if !listed.status.success() {
@@ -104,11 +122,25 @@ pub(crate) async fn pre_image(toplevel: &str, path: &str) -> Result<PreImage, St
         ));
     }
     // A pathspec matches its descendants too: only the record for this very path counts.
-    let index = String::from_utf8_lossy(&listed.stdout)
+    Ok(String::from_utf8_lossy(&listed.stdout)
         .split('\0')
         .filter_map(|record| record.split_once('\t'))
         .find(|(_, name)| *name == path)
-        .map(|(entry, _)| entry.to_string());
+        .map(|(entry, _)| entry.to_string()))
+}
+
+/// The index entry and the working-tree kind at `path`, and the entry of its rename source
+/// `old` when the row has one, all read now.
+pub(crate) async fn pre_image(
+    toplevel: &str,
+    path: &str,
+    old: Option<&str>,
+) -> Result<PreImage, String> {
+    let index = index_entry(toplevel, path).await?;
+    let source = match old {
+        Some(old) => index_entry(toplevel, old).await?,
+        None => None,
+    };
     let full = std::path::Path::new(toplevel).join(path);
     let worktree = match std::fs::symlink_metadata(&full) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => WorktreeKind::Absent,
@@ -120,13 +152,17 @@ pub(crate) async fn pre_image(toplevel: &str, path: &str) -> Result<PreImage, St
         }
         Ok(meta) if meta.is_dir() => WorktreeKind::Directory,
         Ok(meta) if meta.is_file() => {
-            let bytes = std::fs::read(&full).map_err(|e| format!("cannot read {path}: {e}"))?;
-            WorktreeKind::File(hash_bytes(&bytes))
+            let hash = hash_file(&full).map_err(|e| format!("cannot read {path}: {e}"))?;
+            WorktreeKind::File(hash)
         }
         // Fifos, sockets and devices: a kind no form may run on.
         Ok(_) => WorktreeKind::Other,
     };
-    Ok(PreImage { index, worktree })
+    Ok(PreImage {
+        index,
+        source,
+        worktree,
+    })
 }
 
 /// Renames on both sides, (destination, staged) -> source. A failed probe contributes nothing: the row then shows a creation.
@@ -414,7 +450,7 @@ mod tests {
         assert_eq!(response.file_diff.hunks[0].lines.len(), 1, "only `-x`");
         assert!(!response.raw_diff.contains("tools/run"));
         // The index holds tools/run, not tools: the pre-image must not borrow the descendant's entry.
-        let pre = rt().block_on(pre_image(&toplevel, "tools")).unwrap();
+        let pre = rt().block_on(pre_image(&toplevel, "tools", None)).unwrap();
         assert_eq!(pre.index, None);
         assert_eq!(pre.worktree, WorktreeKind::Directory);
     }
@@ -497,7 +533,7 @@ mod tests {
         git(p, &["add", "f.txt"]);
         git(p, &["commit", "-q", "-m", "init"]);
         let toplevel = top(&dir);
-        let before = rt().block_on(pre_image(&toplevel, "f.txt")).unwrap();
+        let before = rt().block_on(pre_image(&toplevel, "f.txt", None)).unwrap();
         let listed = String::from_utf8_lossy(&git_out(p, &["ls-files", "-s", "--", "f.txt"]))
             .trim()
             .to_string();
@@ -507,19 +543,19 @@ mod tests {
         );
         assert_eq!(before.worktree, WorktreeKind::File(hash_bytes(b"f\n")));
         std::fs::write(p.join("f.txt"), "F\n").unwrap();
-        let after = rt().block_on(pre_image(&toplevel, "f.txt")).unwrap();
+        let after = rt().block_on(pre_image(&toplevel, "f.txt", None)).unwrap();
         assert_eq!(after.index, before.index);
         assert_ne!(after.worktree, before.worktree);
         std::fs::remove_file(p.join("f.txt")).unwrap();
         assert_eq!(
-            rt().block_on(pre_image(&toplevel, "f.txt"))
+            rt().block_on(pre_image(&toplevel, "f.txt", None))
                 .unwrap()
                 .worktree,
             WorktreeKind::Absent
         );
         std::os::unix::fs::symlink("elsewhere", p.join("f.txt")).unwrap();
         assert_eq!(
-            rt().block_on(pre_image(&toplevel, "f.txt"))
+            rt().block_on(pre_image(&toplevel, "f.txt", None))
                 .unwrap()
                 .worktree,
             WorktreeKind::Symlink(hash_bytes(b"elsewhere"))
@@ -527,19 +563,74 @@ mod tests {
         std::fs::remove_file(p.join("f.txt")).unwrap();
         std::fs::create_dir(p.join("f.txt")).unwrap();
         assert_eq!(
-            rt().block_on(pre_image(&toplevel, "f.txt"))
+            rt().block_on(pre_image(&toplevel, "f.txt", None))
                 .unwrap()
                 .worktree,
             WorktreeKind::Directory
         );
-        let untracked = rt().block_on(pre_image(&toplevel, "nothere.txt")).unwrap();
+        let untracked = rt()
+            .block_on(pre_image(&toplevel, "nothere.txt", None))
+            .unwrap();
         assert_eq!(
             untracked,
             PreImage {
                 index: None,
+                source: None,
                 worktree: WorktreeKind::Absent
             }
         );
+    }
+
+    #[test]
+    fn the_pre_image_records_the_rename_sources_entry() {
+        let dir = repo();
+        let p = dir.path();
+        std::fs::write(p.join("ren.txt"), "r1\nr2\nr3\n").unwrap();
+        std::fs::write(p.join("old.txt"), "same\ncontent\nhere\n").unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-q", "-m", "init"]);
+        let toplevel = top(&dir);
+        // A staged rename: the source left the index, so the destination's pre-image records none.
+        git(p, &["mv", "ren.txt", "renamed.txt"]);
+        let staged = rt()
+            .block_on(pre_image(&toplevel, "renamed.txt", Some("ren.txt")))
+            .unwrap();
+        assert!(staged.index.is_some());
+        assert_eq!(staged.source, None);
+        // An intent-to-add rename: the source's entry is what a forward form applies to.
+        std::fs::rename(p.join("old.txt"), p.join("new.txt")).unwrap();
+        git(p, &["add", "-N", "new.txt"]);
+        let listed = String::from_utf8_lossy(&git_out(p, &["ls-files", "-s", "--", "old.txt"]))
+            .trim()
+            .to_string();
+        let entry = listed.split('\t').next().unwrap();
+        assert!(entry.starts_with("100644 "), "{listed}");
+        let unstaged = rt()
+            .block_on(pre_image(&toplevel, "new.txt", Some("old.txt")))
+            .unwrap();
+        assert_eq!(unstaged.source.as_deref(), Some(entry));
+        assert!(unstaged.index.is_some(), "the intent-to-add entry");
+        assert_ne!(unstaged.index, unstaged.source);
+        // Without a source nothing is read for one.
+        let plain = rt()
+            .block_on(pre_image(&toplevel, "new.txt", None))
+            .unwrap();
+        assert_eq!(plain.source, None);
+    }
+
+    #[test]
+    fn a_file_is_hashed_through_a_bounded_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bin");
+        let contents: Vec<u8> = (0..300 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &contents).unwrap();
+        assert_eq!(hash_file(&path).unwrap(), hash_bytes(&contents));
+        let prefix = &contents[..HASH_BUFFER];
+        assert_ne!(hash_file(&path).unwrap(), hash_bytes(prefix));
+        std::fs::write(&path, prefix).unwrap();
+        assert_eq!(hash_file(&path).unwrap(), hash_bytes(prefix));
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(hash_file(&path).unwrap(), hash_bytes(b""));
     }
 
     #[test]
@@ -585,7 +676,9 @@ mod tests {
         assert_eq!(sections(&patch).len(), 1);
         assert_eq!(response.file_diff.hunks.len(), 1);
         assert_eq!(
-            rt().block_on(pre_image(&toplevel, name)).unwrap().worktree,
+            rt().block_on(pre_image(&toplevel, name, None))
+                .unwrap()
+                .worktree,
             WorktreeKind::File(hash_bytes(b"A\n"))
         );
     }

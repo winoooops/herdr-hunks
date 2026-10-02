@@ -46,6 +46,9 @@ pub enum WorktreeKind {
 pub struct PreImage {
     /// `<mode> <object id> <stage>` of `ls-files -s`; `None` when the index has no entry.
     pub index: Option<String>,
+    /// The same for the row's rename source, whose entry a forward form applies to; `None` when
+    /// the row has no source or the source has no entry.
+    pub source: Option<String>,
     pub worktree: WorktreeKind,
 }
 
