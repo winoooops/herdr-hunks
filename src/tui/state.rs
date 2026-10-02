@@ -385,6 +385,8 @@ pub(crate) mod tests {
                 raw_diff: raw.into(),
                 repo_root: "/r".into(),
             },
+            Vec::new(),
+            None,
         );
         let mut s = Snapshot::empty("/r");
         s.revision = 1;

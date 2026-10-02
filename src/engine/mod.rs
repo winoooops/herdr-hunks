@@ -4,8 +4,10 @@ pub mod branch;
 pub mod gitver;
 pub mod marks;
 pub mod nav;
+pub mod sections;
 pub mod session;
 pub mod types;
+pub mod worktree;
 pub use session::{spawn, EngineHandle, SessionConfig};
 pub use types::*;
 

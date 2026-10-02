@@ -1,6 +1,6 @@
 //! Non-blocking repository sessions and immutable snapshots.
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -9,8 +9,8 @@ use tokio::sync::Semaphore;
 
 use super::base::{self, MarkRecord, ResolveInputs};
 use super::{
-    branch, gitver, marks, Base, BaseSource, Command, Comparison, DiffState, FileKey, LoadedDiff,
-    Mark, MarkState, QuickBase, RepoState, Scope, Snapshot, NO_BASE_NOTICE,
+    branch, gitver, marks, worktree, Base, BaseSource, Command, Comparison, DiffState, FileKey,
+    LoadedDiff, Mark, MarkState, PreImage, QuickBase, RepoState, Scope, Snapshot, NO_BASE_NOTICE,
 };
 use crate::git::{self, ChangedFile, GetGitDiffResponse, GitStatusResponse};
 use crate::runtime::EventSink;
@@ -38,6 +38,8 @@ pub struct SessionConfig {
     pub diff_delay: Option<Duration>,
     /// Test hook: each diff consumes one permit before running git.
     pub diff_gate: Option<Arc<Semaphore>>,
+    /// Test seam: a refresh sleeps this long before its status read; `None` in production.
+    pub status_delay: Option<Duration>,
 }
 
 pub struct EngineHandle {
@@ -51,6 +53,8 @@ pub struct EngineHandle {
     pub diffs_discarded: Arc<AtomicUsize>,
     /// Test hook: opening head samples taken by diff tasks.
     pub head_samples: Arc<AtomicUsize>,
+    /// Test hook: pre-image readings taken by diff tasks, two per worktree-scope diff.
+    pub pre_images: Arc<AtomicUsize>,
 }
 
 struct FrozenWatcher {
@@ -88,6 +92,7 @@ impl SessionConfig {
             git_check: Arc::new(gitver::check),
             diff_delay: None,
             diff_gate: None,
+            status_delay: None,
         }
     }
 }
@@ -146,6 +151,7 @@ struct Job {
     previous_mark: Option<Mark>,
     previous_unread: Option<(String, BTreeSet<String>)>,
     change: Option<Change>,
+    status_delay: Option<Duration>,
 }
 
 type Marked = (Mark, BTreeSet<String>, Result<(), String>, Option<String>);
@@ -161,6 +167,8 @@ struct Loaded {
     base_error: Option<String>,
     files: Vec<ChangedFile>,
     rename_sources: BTreeMap<String, String>,
+    /// Worktree scope's renames by side, (path, staged) -> source; empty in branch scope.
+    worktree_renames: BTreeMap<(String, bool), String>,
     /// `Some` after a pick or reset: whether `bases.json` took it.
     persisted: Option<Result<(), String>>,
     /// The mark answered by this refresh and whether it was remembered.
@@ -196,6 +204,13 @@ struct State {
     in_flight_resolve: bool,
     pick_seq: u64,
     mark_seq: u64,
+    /// The side map the diff task looks a worktree rename up in.
+    worktree_renames: BTreeMap<(String, bool), String>,
+    /// K6: diff tasks run git one at a time.
+    diff_lane: Arc<Semaphore>,
+    /// The newest generation, read by waiting tasks to skip superseded work.
+    latest_generation: Arc<AtomicU64>,
+    status_delay: Option<Duration>,
 }
 
 fn comparison_of(snapshot: &Snapshot) -> Comparison {
@@ -262,7 +277,8 @@ enum Done {
         key: FileKey,
         comparison: Comparison,
         read_at: Option<String>,
-        result: Result<GetGitDiffResponse, String>,
+        pre_image: Option<PreImage>,
+        result: Result<(GetGitDiffResponse, Vec<u8>), String>,
     },
     Refs {
         token: u64,
@@ -334,7 +350,7 @@ async fn load_rows(
     if job.scope == Scope::Branch && base.is_none() {
         base_error = base_error.or_else(|| Some(NO_BASE_NOTICE.to_string()));
     }
-    let (mut files, rename_sources) = match (scope, &base) {
+    let (mut files, rename_sources, worktree_renames) = match (scope, &base) {
         (Scope::Branch, Some(b)) => {
             let rows = branch::rows(
                 toplevel,
@@ -342,9 +358,17 @@ async fn load_rows(
                 status.files.clone(),
             )
             .await?;
-            (rows.files, rows.rename_sources)
+            (rows.files, rows.rename_sources, BTreeMap::new())
         }
-        _ => (status.files.clone(), BTreeMap::new()),
+        _ => {
+            let sides = worktree::rename_sources(toplevel).await;
+            // The panel shows the source on both rows of an RM path; the diff task asks by side.
+            let display = sides
+                .iter()
+                .map(|((path, _), old)| (path.clone(), old.clone()))
+                .collect();
+            (status.files.clone(), display, sides)
+        }
     };
     // Selection relies on unique keys; paths that decode alike keep only their first row.
     let mut seen = std::collections::HashSet::new();
@@ -460,12 +484,16 @@ async fn load_rows(
         base_error,
         files,
         rename_sources,
+        worktree_renames,
         persisted,
         marked,
     })
 }
 
 async fn run_job(job: Job) -> Done {
+    if let Some(delay) = job.status_delay {
+        tokio::time::sleep(delay).await;
+    }
     let sampled = base::read_head(&job.cwd).await;
     let response = git::git_status_inner(job.cwd.clone()).await;
     let head = if job.with_head {
@@ -559,6 +587,7 @@ impl State {
                 .clone()
                 .map(|at| (at, (*self.snapshot.unread).clone())),
             change,
+            status_delay: self.status_delay,
         };
         let results = results.clone();
         tokio::spawn(async move {
@@ -566,6 +595,8 @@ impl State {
         });
     }
 
+    // The test hooks ride along as parameters, the way `head_samples` already did.
+    #[allow(clippy::too_many_arguments)]
     fn request_diff(
         &mut self,
         key: FileKey,
@@ -574,6 +605,8 @@ impl State {
         gate: Option<Arc<Semaphore>>,
         results: &UnboundedSender<Done>,
         head_samples: &Arc<AtomicUsize>,
+        pre_images: &Arc<AtomicUsize>,
+        discarded: &Arc<AtomicUsize>,
     ) {
         let comparison = comparison_of(&self.snapshot);
         if matches!(&self.diff_in_flight, Some((_, pending, under)) if pending == &key && under == &comparison)
@@ -583,20 +616,44 @@ impl State {
         }
         self.diff_generation += 1;
         let generation = self.diff_generation;
+        self.latest_generation
+            .store(self.diff_generation, Ordering::SeqCst);
         self.diff_in_flight = Some((generation, key.clone(), comparison.clone()));
         self.diff_dirty = false;
         let toplevel = match &self.snapshot.repo {
             RepoState::Repo { toplevel, .. } => toplevel.clone(),
             _ => cwd.to_string(),
         };
-        let old = self.snapshot.rename_sources.get(&key.path).cloned();
-        let cwd = cwd.to_string();
+        let old = match &comparison {
+            Comparison::Worktree => self
+                .worktree_renames
+                .get(&(key.path.clone(), key.staged))
+                .cloned(),
+            Comparison::Branch { .. } => self.snapshot.rename_sources.get(&key.path).cloned(),
+        };
         let results = results.clone();
         let head_samples = head_samples.clone();
+        let pre_images = pre_images.clone();
+        let discarded = discarded.clone();
+        let lane = self.diff_lane.clone();
+        let latest = self.latest_generation.clone();
         tokio::spawn(async move {
-            // Open the bracket before any delay or gate.
+            // One git at a time; a request superseded while it waited never spawns one.
+            let _lane = lane.acquire().await.expect("diff lane closed");
+            if latest.load(Ordering::SeqCst) != generation {
+                discarded.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+            // Open the bracket under the lane and before any delay or gate.
             let before = base::read_head(&toplevel).await;
             head_samples.fetch_add(1, Ordering::SeqCst);
+            // The first pre-image reading precedes the delay and the gate, so the two readings
+            // bracket everything that can wait; an edit landing in between leaves no pre-image.
+            let pre = match &comparison {
+                Comparison::Worktree => worktree::pre_image(&toplevel, &key.path).await.ok(),
+                Comparison::Branch { .. } => None,
+            };
+            pre_images.fetch_add(1, Ordering::SeqCst);
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
@@ -607,11 +664,18 @@ impl State {
                 Comparison::Branch { merge_base } if !key.untracked => {
                     branch::diff(&toplevel, merge_base, &key.path, old.as_deref()).await
                 }
-                Comparison::Branch { .. } => branch::untracked_diff(cwd, key.path.clone()).await,
-                Comparison::Worktree => {
-                    git::get_git_diff_inner(cwd, key.path.clone(), key.staged, Some(key.untracked))
-                        .await
-                }
+                Comparison::Branch { .. } => worktree::untracked_diff(&toplevel, &key.path).await,
+                Comparison::Worktree => worktree::diff(&toplevel, &key, old.as_deref()).await,
+            };
+            let post = match &comparison {
+                Comparison::Worktree => worktree::pre_image(&toplevel, &key.path).await.ok(),
+                Comparison::Branch { .. } => None,
+            };
+            pre_images.fetch_add(1, Ordering::SeqCst);
+            // Kept only when both readings agree; a disagreement means an edit landed mid-read.
+            let pre_image = match (pre, post) {
+                (Some(a), Some(b)) if a == b => Some(a),
+                _ => None,
             };
             // Equal endpoints, not a proof of stillness: HEAD could have gone A -> B -> A
             // within this read. The bracket is kept as is because that window errs the safe
@@ -627,6 +691,7 @@ impl State {
                 key,
                 comparison,
                 read_at,
+                pre_image,
                 result,
             });
         });
@@ -752,6 +817,7 @@ fn key_of(file: &ChangedFile) -> FileKey {
     FileKey::of(file)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     config: SessionConfig,
     mut commands: UnboundedReceiver<Command>,
@@ -760,6 +826,7 @@ async fn run(
     refs_answered: Arc<AtomicUsize>,
     diffs_discarded: Arc<AtomicUsize>,
     head_samples: Arc<AtomicUsize>,
+    pre_images: Arc<AtomicUsize>,
 ) {
     let mut state = State {
         snapshot: Snapshot::empty(&config.path.to_string_lossy()),
@@ -790,6 +857,10 @@ async fn run(
         in_flight_resolve: false,
         pick_seq: 0,
         mark_seq: 0,
+        worktree_renames: BTreeMap::new(),
+        diff_lane: Arc::new(Semaphore::new(1)),
+        latest_generation: Arc::new(AtomicU64::new(0)),
+        status_delay: config.status_delay,
     };
     let path = match config.path.canonicalize() {
         Ok(path) if path.is_dir() => path,
@@ -940,7 +1011,7 @@ async fn run(
                             next.diff = DiffState::Loading;
                             next.head = None;
                             publish(&mut state, next, &snapshots);
-                            state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx, &head_samples);
+                            state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx, &head_samples, &pre_images, &diffs_discarded);
                         }
                     }
                 }
@@ -1067,6 +1138,7 @@ async fn run(
                                                 base_error: None,
                                                 files: response.files,
                                                 rename_sources: BTreeMap::new(),
+                                                worktree_renames: BTreeMap::new(),
                                                 persisted: None,
                                                 marked: None,
                                             },
@@ -1081,6 +1153,7 @@ async fn run(
                                         next.default_base = loaded.default_base;
                                         next.files = loaded.files;
                                         next.rename_sources = Arc::new(loaded.rename_sources);
+                                        state.worktree_renames = loaded.worktree_renames;
                                         next.mark = loaded.mark;
                                         next.unread = Arc::new(loaded.unread);
                                         state.unread_at = loaded.unread_at;
@@ -1181,7 +1254,7 @@ async fn run(
                         }
                         publish(&mut state, next, &snapshots);
                         if let Some(key) = selected {
-                            state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx, &head_samples);
+                            state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx, &head_samples, &pre_images, &diffs_discarded);
                         }
                         if state.status_dirty || !state.changes.is_empty() {
                             state.status_dirty = false;
@@ -1189,7 +1262,7 @@ async fn run(
                             state.request_status(&cwd, with_head, &results_tx, &refreshes);
                         }
                     }
-                    Done::Diff { generation, key, comparison, read_at, result } => {
+                    Done::Diff { generation, key, comparison, read_at, pre_image, result } => {
                         if generation != state.diff_generation || comparison != comparison_of(&state.snapshot) {
                             diffs_discarded.fetch_add(1, Ordering::SeqCst);
                             continue;
@@ -1197,10 +1270,11 @@ async fn run(
                         state.diff_in_flight = None;
                         if Some(&key) == next.selected.as_ref() {
                             match result {
-                                Ok(response) => {
-                                    let unchanged = matches!(&next.diff, DiffState::Ready(d) if d.key == key && d.comparison == comparison && d.raw_diff == response.raw_diff && d.read_at == read_at);
+                                Ok((response, patch)) => {
+                                    // A working-tree edit can change a staged row's pre-image without changing its diff.
+                                    let unchanged = matches!(&next.diff, DiffState::Ready(d) if d.key == key && d.comparison == comparison && d.raw_diff == response.raw_diff && d.read_at == read_at && d.pre_image == pre_image);
                                     if !unchanged {
-                                        next.diff = DiffState::Ready(Arc::new(LoadedDiff::build(key, comparison, read_at.clone(), response)));
+                                        next.diff = DiffState::Ready(Arc::new(LoadedDiff::build(key, comparison, read_at.clone(), response, patch, pre_image)));
                                     }
                                     // Only when the rows on screen came from this commit too.
                                     next.head =
@@ -1218,7 +1292,7 @@ async fn run(
                         }
                         if std::mem::take(&mut state.diff_dirty) {
                             if let Some(key) = state.snapshot.selected.clone() {
-                                state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx, &head_samples);
+                                state.request_diff(key, &cwd, config.diff_delay, config.diff_gate.clone(), &results_tx, &head_samples, &pre_images, &diffs_discarded);
                             }
                         }
                     }
@@ -1237,6 +1311,7 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
     let refs_answered = Arc::new(AtomicUsize::new(0));
     let diffs_discarded = Arc::new(AtomicUsize::new(0));
     let head_samples = Arc::new(AtomicUsize::new(0));
+    let pre_images = Arc::new(AtomicUsize::new(0));
     runtime.spawn(run(
         config,
         commands_rx,
@@ -1245,6 +1320,7 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
         refs_answered.clone(),
         diffs_discarded.clone(),
         head_samples.clone(),
+        pre_images.clone(),
     ));
     EngineHandle {
         commands,
@@ -1253,6 +1329,7 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
         refs_answered,
         diffs_discarded,
         head_samples,
+        pre_images,
     }
 }
 
@@ -1358,6 +1435,7 @@ mod tests {
                 git_check: ok_git(),
                 diff_delay: None,
                 diff_gate: None,
+                status_delay: None,
             },
         );
         (rt, handle)
@@ -1432,6 +1510,7 @@ mod tests {
                 git_check: ok_git(),
                 diff_delay: None,
                 diff_gate: None,
+                status_delay: None,
             },
         );
         wait_for(&h, "first ready diff", |s| ready(s).is_some());
@@ -1572,6 +1651,7 @@ mod tests {
                 git_check: ok_git(),
                 diff_delay: None,
                 diff_gate: None,
+                status_delay: None,
             },
         );
         wait_for(&h, "first", |s| ready(s).is_some());
@@ -1612,6 +1692,7 @@ mod tests {
                 git_check: ok_git(),
                 diff_delay: Some(Duration::from_millis(400)),
                 diff_gate: None,
+                status_delay: None,
             },
         );
         wait_for(&h, "a diff despite constant polling", |s| {
@@ -1642,6 +1723,7 @@ mod tests {
                 git_check: ok_git(),
                 diff_delay: None,
                 diff_gate: Some(gate.clone()),
+                status_delay: None,
             },
         );
         // release the initial load, then hold the selected diff (D1).
@@ -1746,6 +1828,7 @@ mod tests {
                 git_check: ok_git(),
                 diff_delay: None,
                 diff_gate: None,
+                status_delay: None,
             },
         );
         for _ in 0..3 {
@@ -1793,6 +1876,7 @@ mod tests {
                 git_check: ok_git(),
                 diff_delay: None,
                 diff_gate: None,
+                status_delay: None,
             },
         );
         h.commands.send(Command::Shutdown).unwrap();
@@ -1845,6 +1929,7 @@ mod tests {
                 }),
                 diff_delay: None,
                 diff_gate: None,
+                status_delay: None,
             },
         );
         let s = wait_for(&h, "missing git reported", |s| s.status_error.is_some());
@@ -1874,6 +1959,7 @@ mod tests {
                 }),
                 diff_delay: None,
                 diff_gate: None,
+                status_delay: None,
             },
         );
         wait_for(
@@ -1905,6 +1991,7 @@ mod tests {
                 git_check: ok_git(),
                 diff_delay: Some(Duration::from_millis(400)),
                 diff_gate: None,
+                status_delay: None,
             },
         );
         wait_for(&h, "first", |s| ready(s).is_some());
@@ -1924,6 +2011,100 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "superseded diffs were waited for: {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn superseded_selections_never_reach_git() {
+        let dir = fixture();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = spawn(
+            rt.handle(),
+            SessionConfig {
+                scope: Scope::Worktree,
+                base_ref: None,
+                state_dir: None,
+                path: dir.path().to_path_buf(),
+                poll_interval: Duration::from_secs(3600),
+                watcher: Arc::new(FlakyWatcher {
+                    allow: Arc::new(AtomicBool::new(true)),
+                }),
+                git_check: ok_git(),
+                diff_delay: Some(Duration::from_millis(300)),
+                diff_gate: None,
+                status_delay: None,
+            },
+        );
+        wait_for(&h, "first", |s| ready(s).is_some());
+        let samples_before = h.head_samples.load(Ordering::SeqCst);
+        for _ in 0..5 {
+            h.commands.send(Command::SelectNext).unwrap(); // ends on b.txt
+        }
+        wait_for(&h, "the last selection loaded", |s| {
+            ready(s).map(|d| d.key.path == "b.txt").unwrap_or(false) && !s.refreshing
+        });
+        // Let every queued task reach the lane before counting: with the check only the one in
+        // flight when the burst began and the last requested sample; without it all of them would.
+        std::thread::sleep(Duration::from_millis(1800));
+        let samples = h.head_samples.load(Ordering::SeqCst) - samples_before;
+        assert!(samples <= 2, "{samples} diff tasks reached git");
+        assert!(
+            h.diffs_discarded.load(Ordering::SeqCst) >= 3,
+            "the middle selections were not skipped"
+        );
+    }
+
+    #[test]
+    fn both_rows_of_a_renamed_path_load_their_own_patch() {
+        let dir = fixture();
+        let p = dir.path();
+        let ctx = "c1\nc2\nc3\nc4\nc5\nc6\nc7\n";
+        std::fs::write(p.join("old.txt"), format!("one\n{ctx}two\n")).unwrap();
+        git(p, &["add", "old.txt"]);
+        git(p, &["commit", "-q", "-m", "old"]);
+        git(p, &["mv", "old.txt", "new.txt"]);
+        std::fs::write(p.join("new.txt"), format!("ONE\n{ctx}two\n")).unwrap();
+        git(p, &["add", "new.txt"]);
+        std::fs::write(p.join("new.txt"), format!("ONE\n{ctx}TWO\n")).unwrap(); // RM
+        let (_rt, h) = start(p, Arc::new(AtomicBool::new(true)));
+        let key = |staged: bool| FileKey {
+            path: "new.txt".into(),
+            staged,
+            untracked: false,
+        };
+        wait_for(&h, "both rows listed", |s| {
+            s.files.iter().filter(|f| f.path == "new.txt").count() == 2
+        });
+        h.commands.send(Command::Select(key(true))).unwrap();
+        let s = wait_for(&h, "staged row", |s| {
+            ready(s).is_some_and(|d| d.key == key(true))
+        });
+        let d = ready(&s).unwrap();
+        assert_eq!(d.file_diff.old_path.as_deref(), Some("old.txt"));
+        assert!(
+            d.raw_diff.contains("+ONE") && !d.raw_diff.contains("+TWO"),
+            "{}",
+            d.raw_diff
+        );
+        h.commands.send(Command::Select(key(false))).unwrap();
+        let s = wait_for(&h, "unstaged row", |s| {
+            ready(s).is_some_and(|d| d.key == key(false))
+        });
+        let d = ready(&s).unwrap();
+        assert_eq!(d.file_diff.old_path, None);
+        assert!(
+            d.raw_diff.contains("+TWO") && !d.raw_diff.contains("+ONE"),
+            "{}",
+            d.raw_diff
+        );
+        assert_eq!(
+            s.rename_sources.get("new.txt").map(String::as_str),
+            Some("old.txt"),
+            "the panel's map"
         );
     }
 
@@ -1995,6 +2176,7 @@ mod tests {
                 git_check: ok_git(),
                 diff_delay: None,
                 diff_gate: gate,
+                status_delay: None,
                 scope,
                 base_ref: None,
                 state_dir,

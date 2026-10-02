@@ -390,6 +390,39 @@ fn the_engine_never_mutates_the_repository() {
         !recorded.lines().any(|l| l.contains("--merge-base")),
         "the merge-base must be pinned, never recomputed by git diff"
     );
+    // D7: every patch-producing diff carries the four fixed flags; the metadata commands do not.
+    let patch_diffs: Vec<&str> = recorded
+        .lines()
+        .map(|l| l.split('\t').next().unwrap_or(""))
+        .filter(|l| {
+            l.contains(" diff ")
+                && !l.contains("--name-status")
+                && !l.contains("--numstat")
+                && !l.contains("--name-only")
+        })
+        .collect();
+    assert!(
+        !patch_diffs.is_empty(),
+        "no patch-producing diff was recorded"
+    );
+    for line in &patch_diffs {
+        for flag in ["--no-textconv", "-U3", "--src-prefix=a/", "--dst-prefix=b/"] {
+            assert!(line.contains(flag), "`{line}` lacks {flag}");
+        }
+    }
+    for side in [
+        "diff --cached --name-status -M -z --",
+        "diff --name-status -M -z --",
+    ] {
+        assert!(
+            recorded.lines().any(|l| l.contains(side)),
+            "the worktree refresh never probed renames with `{side}`"
+        );
+    }
+    assert!(
+        recorded.lines().any(|l| l.contains("ls-files -s --")),
+        "no pre-image was read"
+    );
     let mut written: Vec<String> = std::fs::read_dir(state.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
