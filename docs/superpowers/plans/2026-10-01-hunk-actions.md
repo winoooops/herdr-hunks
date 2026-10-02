@@ -122,14 +122,14 @@ pub fn sections(raw: &[u8]) -> Vec<&[u8]>;
 pub(crate) async fn diff(toplevel: &str, key: &FileKey, old: Option<&str>) -> Result<(GetGitDiffResponse, Vec<u8>), String>;
 /// `ls-files -s` plus lstat of the working-tree path.
 pub(crate) async fn pre_image(toplevel: &str, path: &str) -> Result<PreImage, String>;
-/// `R` records of `diff --name-status -M -z --`, with and without `--cached`: destination -> source.
-pub(crate) async fn rename_sources(toplevel: &str) -> BTreeMap<String, String>;
+/// `R` records of `diff --name-status -M -z --`, with and without `--cached`: (destination, staged) -> source.
+pub(crate) async fn rename_sources(toplevel: &str) -> BTreeMap<(String, bool), String>;
 pub fn hash_bytes(bytes: &[u8]) -> u64;
 
 // src/engine/session.rs: EngineHandle is unchanged; SessionConfig is unchanged (the lane is internal).
 ```
 
-One deviation from the spec's letter, recorded here and in the spec by this task: `rename_sources` stays keyed by path alone, not `(path, staged)`. A destination cannot be a rename on both sides at once (a staged rename makes it a real index entry, an intent-to-add rename needs it to be an intent-to-add entry), so one map serves both rows, and the view's existing lookup (`view.rs:361`) and the branch-scope code stay as they are.
+The diff task looks a rename up by the row's side, as spec 9.2 says: for an `RM` path the staged row's patch names `a/old b/new` and needs `-M old new`, while the unstaged row's names `a/new b/new` and must not be given `old`, or the cutter drops it. The panel's display map (`Snapshot.rename_sources`, path to source, which `view.rs:361` reads) is the side map flattened.
 
 - [ ] **Step 1: Move the section cutter to its own module, over bytes**
 
@@ -156,18 +156,29 @@ pub fn keep_sections(output: &[u8], path: &str, old: Option<&str>) -> Vec<u8> {
             if names_row(header, &wanted_a, &wanted_b) {
                 kept.extend_from_slice(section);
             }
+        } else if let Some(named) = first
+            .strip_prefix("diff --cc ")
+            .or_else(|| first.strip_prefix("diff --combined "))
+        {
+            // A conflict's header carries the bare path, quoted the way git quotes it.
+            if decode_git_patch_path(named.trim_end()) == path {
+                kept.extend_from_slice(section);
+            }
         }
     }
     kept
 }
 
-/// Each section on its own: a `diff --git ` line at the start of the text or after a newline opens one.
+/// Each section on its own: a `diff --git `, `diff --cc ` or `diff --combined ` line at the start
+/// of the text or after a newline opens one. The combined forms are a worktree conflict's output;
+/// they parse to zero hunks (the frozen parser's rule) and the view reads them as unmerged.
 pub fn sections(raw: &[u8]) -> Vec<&[u8]> {
-    let marker = b"diff --git ";
+    let markers: [&[u8]; 3] = [b"diff --git ", b"diff --cc ", b"diff --combined "];
     let mut starts = Vec::new();
     let mut i = 0;
-    while i + marker.len() <= raw.len() {
-        if &raw[i..i + marker.len()] == marker && (i == 0 || raw[i - 1] == b'\n') {
+    while i < raw.len() {
+        let at_line_start = i == 0 || raw[i - 1] == b'\n';
+        if at_line_start && markers.iter().any(|m| raw[i..].starts_with(m)) {
             starts.push(i);
         }
         i += 1;
@@ -279,14 +290,15 @@ mod tests {
         let cwd = p.to_string_lossy().into_owned();
         let toplevel = top(&dir);
         let renames = rt().block_on(rename_sources(&toplevel));
-        assert_eq!(renames.get("renamed.txt").map(String::as_str), Some("ren.txt"));
+        assert_eq!(renames.get(&("renamed.txt".to_string(), true)).map(String::as_str), Some("ren.txt"));
+        assert!(renames.get(&("renamed.txt".to_string(), false)).is_none(), "the unstaged row has no rename");
         for (path, staged, untracked) in [
             ("mm.txt", true, false), ("mm.txt", false, false), ("am.txt", true, false), ("am.txt", false, false),
             ("del.txt", true, false), ("renamed.txt", true, false), ("renamed.txt", false, false),
             ("newdir/deep/u.txt", false, true),
         ] {
             let k = key(path, staged, untracked);
-            let old = renames.get(path).filter(|_| staged).map(String::as_str);
+            let old = renames.get(&(path.to_string(), staged)).map(String::as_str);
             let (ours, patch) = rt().block_on(diff(&toplevel, &k, old)).unwrap();
             let theirs = rt()
                 .block_on(crate::git::get_git_diff_inner(cwd.clone(), path.into(), staged, Some(untracked)))
@@ -344,6 +356,27 @@ mod tests {
         assert_eq!(response.file_diff.hunks.len(), 1);
         assert_eq!(response.file_diff.hunks[0].lines.len(), 1, "only `-x`");
         assert!(!response.raw_diff.contains("tools/run"));
+    }
+
+    #[test]
+    fn a_conflicts_combined_section_is_kept_for_the_view() {
+        let dir = repo();
+        let p = dir.path();
+        std::fs::write(p.join("c.txt"), "base\n").unwrap();
+        git(p, &["add", "c.txt"]);
+        git(p, &["commit", "-q", "-m", "base"]);
+        git(p, &["switch", "-q", "-c", "other"]);
+        std::fs::write(p.join("c.txt"), "theirs\n").unwrap();
+        git(p, &["commit", "-q", "-am", "theirs"]);
+        git(p, &["switch", "-q", "main"]);
+        std::fs::write(p.join("c.txt"), "ours\n").unwrap();
+        git(p, &["commit", "-q", "-am", "ours"]);
+        let _ = Proc::new("git").arg("-C").arg(p).args(["merge", "-q", "other"]).output(); // conflicts
+        let toplevel = top(&dir);
+        let (response, patch) = rt().block_on(diff(&toplevel, &key("c.txt", false, false), None)).unwrap();
+        assert!(String::from_utf8_lossy(&patch).starts_with("diff --cc c.txt\n"), "{}", String::from_utf8_lossy(&patch));
+        assert!(response.raw_diff.contains("@@@"));
+        assert!(response.file_diff.hunks.is_empty(), "combined diffs parse to zero hunks, as before");
     }
 
     #[test]
@@ -408,7 +441,7 @@ mod tests {
         git(p, &["add", "-N", "new.txt"]);
         let toplevel = top(&dir);
         let renames = rt().block_on(rename_sources(&toplevel));
-        assert_eq!(renames.get("new.txt").map(String::as_str), Some("old.txt"));
+        assert_eq!(renames.get(&("new.txt".to_string(), false)).map(String::as_str), Some("old.txt"));
         let (response, _) = rt().block_on(diff(&toplevel, &key("new.txt", false, false), Some("old.txt"))).unwrap();
         assert_eq!(response.file_diff.old_path.as_deref(), Some("old.txt"));
     }
@@ -562,8 +595,8 @@ pub(crate) async fn pre_image(toplevel: &str, path: &str) -> Result<PreImage, St
     Ok(PreImage { index, worktree })
 }
 
-/// Renames on both sides, destination -> source. A failed probe contributes nothing: the row then shows a creation.
-pub(crate) async fn rename_sources(toplevel: &str) -> BTreeMap<String, String> {
+/// Renames on both sides, (destination, staged) -> source. A failed probe contributes nothing: the row then shows a creation.
+pub(crate) async fn rename_sources(toplevel: &str) -> BTreeMap<(String, bool), String> {
     let mut sources = BTreeMap::new();
     for cached in [true, false] {
         let mut args = vec!["diff"];
@@ -575,7 +608,7 @@ pub(crate) async fn rename_sources(toplevel: &str) -> BTreeMap<String, String> {
             if output.status.success() {
                 for record in parse_name_status(&output.stdout) {
                     if let (true, Some(old)) = (record.status == 'R', record.old) {
-                        sources.insert(record.path, old);
+                        sources.insert((record.path, cached), old);
                     }
                 }
             }
@@ -666,13 +699,30 @@ initialised as `Arc::new(Semaphore::new(1))` and `Arc::new(AtomicU64::new(0))`. 
 
 The `Comparison::Branch` untracked arm used `cwd`; `worktree::untracked_diff` takes the toplevel instead, which is what `get_git_diff_inner` resolved from the cwd anyway.
 
-In `load_rows`, the worktree arm becomes:
+In `load_rows`, the two arms now yield three things, the display map and the side map:
 
 ```rust
-        _ => (
-            status.files.clone(),
-            worktree::rename_sources(toplevel).await,
-        ),
+    let (mut files, rename_sources, worktree_renames) = match (scope, &base) {
+        (Scope::Branch, Some(b)) => {
+            let rows = branch::rows(toplevel, b.merge_base.as_deref().unwrap_or_default(), status.files.clone()).await?;
+            (rows.files, rows.rename_sources, BTreeMap::new())
+        }
+        _ => {
+            let sides = worktree::rename_sources(toplevel).await;
+            // The panel shows the source on both rows of an RM path; the diff task asks by side.
+            let display = sides.iter().map(|((path, _), old)| (path.clone(), old.clone())).collect();
+            (status.files.clone(), display, sides)
+        }
+    };
+```
+
+`Loaded` gains `worktree_renames: BTreeMap<(String, bool), String>` (empty in branch scope and in the no-rows fallback literal of the `Done::Status` handler), `State` gains the same field, set from `loaded.worktree_renames` where the handler assigns `next.rename_sources`, and `request_diff`'s lookup becomes:
+
+```rust
+        let old = match &comparison {
+            Comparison::Worktree => self.worktree_renames.get(&(key.path.clone(), key.staged)).cloned(),
+            Comparison::Branch { .. } => self.snapshot.rename_sources.get(&key.path).cloned(),
+        };
 ```
 
 Add `use super::worktree;` next to `branch`.
@@ -724,8 +774,40 @@ Add to `session.rs` tests, after `rapid_selection_does_not_wait_for_superseded_d
     }
 ```
 
-Run: `cargo test --locked --lib superseded_selections_never_reach_git`
-Expected: PASS. Falsify it: temporarily remove the `if latest.load(...) != generation { ... return; }` block, run again, expect `5 diff tasks reached git` (or 6), then put it back.
+And, in the same test module, both rows of an `RM` path through a real session:
+
+```rust
+    #[test]
+    fn both_rows_of_a_renamed_path_load_their_own_patch() {
+        let dir = fixture();
+        let p = dir.path();
+        let ctx = "c1\nc2\nc3\nc4\nc5\nc6\nc7\n";
+        std::fs::write(p.join("old.txt"), format!("one\n{ctx}two\n")).unwrap();
+        git(p, &["add", "old.txt"]);
+        git(p, &["commit", "-q", "-m", "old"]);
+        git(p, &["mv", "old.txt", "new.txt"]);
+        std::fs::write(p.join("new.txt"), format!("ONE\n{ctx}two\n")).unwrap();
+        git(p, &["add", "new.txt"]);
+        std::fs::write(p.join("new.txt"), format!("ONE\n{ctx}TWO\n")).unwrap(); // RM
+        let (_rt, h) = start(p, Arc::new(AtomicBool::new(true)));
+        let key = |staged: bool| FileKey { path: "new.txt".into(), staged, untracked: false };
+        wait_for(&h, "both rows listed", |s| s.files.iter().filter(|f| f.path == "new.txt").count() == 2);
+        h.commands.send(Command::Select(key(true))).unwrap();
+        let s = wait_for(&h, "staged row", |s| ready(s).is_some_and(|d| d.key == key(true)));
+        let d = ready(&s).unwrap();
+        assert_eq!(d.file_diff.old_path.as_deref(), Some("old.txt"));
+        assert!(d.raw_diff.contains("+ONE") && !d.raw_diff.contains("+TWO"), "{}", d.raw_diff);
+        h.commands.send(Command::Select(key(false))).unwrap();
+        let s = wait_for(&h, "unstaged row", |s| ready(s).is_some_and(|d| d.key == key(false)));
+        let d = ready(&s).unwrap();
+        assert_eq!(d.file_diff.old_path, None);
+        assert!(d.raw_diff.contains("+TWO") && !d.raw_diff.contains("+ONE"), "{}", d.raw_diff);
+        assert_eq!(s.rename_sources.get("new.txt").map(String::as_str), Some("old.txt"), "the panel's map");
+    }
+```
+
+Run: `cargo test --locked --lib superseded_selections_never_reach_git` and `cargo test --locked --lib both_rows_of_a_renamed_path`
+Expected: PASS. Falsify the first: temporarily remove the `if latest.load(...) != generation { ... return; }` block, run again, expect `5 diff tasks reached git` (or 6), then put it back.
 
 - [ ] **Step 9: The read-only test covers D7's commands**
 
@@ -766,16 +848,12 @@ Note that the `-C <dir>` skipping loop in the filter is unnecessary; delete it a
 Run: `HOME=... cargo test --locked --test readonly_guarantee -- --test-threads=1`
 Expected: PASS, allow-list still `ALLOWED: [&str; 10]`. Falsify by removing `"-U3"` from `DIFF_FLAGS`: the test must fail naming the flag; put it back.
 
-- [ ] **Step 10: Amend the spec's rename-key sentence**
-
-In `docs/superpowers/specs/2026-09-30-hunk-actions-design.md`, 9.2's sentence `fills \`rename_sources\` in worktree scope too, keyed by \`(path, staged)\` there,` becomes `fills \`rename_sources\` in worktree scope too, keyed by path as in branch scope (a destination cannot be a rename on both sides at once),`; and 9.4's `keyed by \`(path, staged)\`,` is deleted. One commit carries the code and this amendment.
-
-- [ ] **Step 11: Gates and commit**
+- [ ] **Step 10: Gates and commit**
 
 Run the full gate line of the global constraints. Expected: all green, `port-check: src/git matches 91e45b1c + 3 patch(es)`.
 
 ```bash
-git add src/engine tests/readonly_guarantee.rs src/tui docs/superpowers/specs/2026-09-30-hunk-actions-design.md
+git add src/engine tests/readonly_guarantee.rs src/tui
 git commit -m "feat(engine): build the worktree diffs with bytes and a pre-image"
 ```
 
@@ -1161,6 +1239,9 @@ mod tests {
         assert_eq!(classify(b"diff --git a/b b/b\nindex 1..2\nBinary files a/b and b/b differ\n"), Kind::Binary);
         assert_eq!(classify(b"diff --git a/b b/b\nindex 1..2\nGIT binary patch\nliteral 3\n"), Kind::Binary);
         assert_eq!(classify(b"diff --git a/sub b/sub\nindex 1..2 160000\n--- a/sub\n+++ b/sub\n@@ -1 +1 @@\n-Subproject commit aaaa\n+Subproject commit bbbb\n"), Kind::Submodule);
+        assert_eq!(classify(b"diff --git a/sub b/sub\nnew file mode 160000\nindex 0..2\n--- /dev/null\n+++ b/sub\n@@ -0,0 +1 @@\n+Subproject commit bbbb\n"), Kind::Submodule);
+        // A text file that merely mentions the words is a text file.
+        assert_eq!(classify(b"diff --git a/notes b/notes\nindex 1..2 100644\n--- a/notes\n+++ b/notes\n@@ -1 +1 @@\n-x\n+Subproject commit aaaa\n"), Kind::Text);
     }
 
     #[test]
@@ -1240,6 +1321,7 @@ pub enum Kind {
     Submodule,
 }
 
+// `classify` below uses `split_section`; order the definitions as rustc needs (any order works in Rust).
 fn lines(section: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut start = 0;
@@ -1255,14 +1337,29 @@ fn lines(section: &[u8]) -> Vec<&[u8]> {
     out
 }
 
-/// `Binary files` and `GIT binary patch` carry no payload git could apply; a gitlink is not a file.
+/// `Binary files` and `GIT binary patch` carry no payload git could apply; a gitlink (mode 160000,
+/// named in the section's `index` or mode lines, never in its content) is not a file.
 pub fn classify(patch: &[u8]) -> Kind {
-    for line in lines(patch) {
-        if line.starts_with(b"Binary files ") || line.starts_with(b"GIT binary patch") {
-            return Kind::Binary;
+    for section in sections(patch) {
+        let (header, _) = split_section(section);
+        for line in &header {
+            let text = String::from_utf8_lossy(line);
+            let text = text.trim_end();
+            if text.starts_with("Binary files ") || text.starts_with("GIT binary patch") {
+                return Kind::Binary;
+            }
+            let is_gitlink = (text.starts_with("index ") && text.ends_with(" 160000"))
+                || text == "new file mode 160000"
+                || text == "deleted file mode 160000"
+                || text == "old mode 160000"
+                || text == "new mode 160000";
+            if is_gitlink {
+                return Kind::Submodule;
+            }
         }
-        if line.starts_with(b"-Subproject commit ") || line.starts_with(b"+Subproject commit ") {
-            return Kind::Submodule;
+        // `Binary files` sits after the headers in a section without hunks.
+        if lines(section).iter().any(|l| l.starts_with(b"Binary files ") || l.starts_with(b"GIT binary patch")) {
+            return Kind::Binary;
         }
     }
     Kind::Text
@@ -2141,17 +2238,19 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         gate.add_permits(1);
         wait_for(&h, "first", |s| ready(s).is_some());
         gate.add_permits(2); // `select` requests the diff twice: once for its Refresh, once for the Select
-        let s = select(&h, "u.txt", false, true);
+        // A hunk of mm.txt's unstaged row: the row survives (DELTA stays), so 3.3 keeps Ready(old) on screen.
+        let s = select(&h, "mm.txt", false, false);
         let diff = match &s.diff { DiffState::Ready(d) => d.clone(), _ => unreachable!() };
-        // The reload the carrying refresh requests waits at the gate, so the acted Arc stays on screen.
-        h.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff: diff.clone(), hunk: None })).unwrap();
+        // The reload the carrying refresh requests waits at the gate, so the acted Arc stays published.
+        h.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff: diff.clone(), hunk: Some(0) })).unwrap();
         let a = wait_for(&h, "answered", |n| n.action_seq == 1);
         assert_eq!((a.action_error.as_deref(), a.action_applied), (None, true));
         assert!(matches!(&a.diff, DiffState::Ready(d) if Arc::ptr_eq(d, &diff)), "the old Arc is still published");
-        h.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff: diff.clone(), hunk: None })).unwrap();
+        h.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff: diff.clone(), hunk: Some(0) })).unwrap();
         let a = wait_for(&h, "the acted arc's answer", |n| n.action_seq == 2);
         assert_eq!((a.action_error.as_deref(), a.action_applied), (Some(actions::NOTICE_CHANGED), false));
-        assert_eq!(git_out(p, &["status", "--porcelain=v1", "--", "u.txt"]).trim(), "A  u.txt", "staged once");
+        let cached = git_out(p, &["diff", "--cached", "--", "mm.txt"]);
+        assert!(cached.contains("+GAMMA") && !cached.contains("+DELTA"), "staged once: {cached}");
         gate.add_permits(1);
         wait_for(&h, "a fresh arc", |n| matches!(&n.diff, DiffState::Ready(d) if !Arc::ptr_eq(d, &diff)));
     }
@@ -2169,15 +2268,17 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
             git_check: ok_git(), diff_delay: None, diff_gate: Some(gate.clone()),
         });
         gate.add_permits(1);
-        let s = wait_for(&h, "first", |s| ready(s).is_some());
-        let s = { gate.add_permits(1); select(&h, "mm.txt", false, false) };
+        wait_for(&h, "first", |s| ready(s).is_some());
+        gate.add_permits(2); // `select` requests the diff twice: once for its Refresh, once for the Select
+        let s = select(&h, "mm.txt", false, false);
         let diff = match &s.diff { DiffState::Ready(d) => d.clone(), _ => unreachable!() };
+        // No permit is left: the first action's reload will wait at the gate, which holds it in flight.
         let before = h.refreshes.load(Ordering::SeqCst);
         h.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff: diff.clone(), hunk: Some(0) })).unwrap();
         h.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff: diff.clone(), hunk: Some(1) })).unwrap();
         let second = wait_for(&h, "the running refusal", |n| n.action_error.as_deref() == Some(actions::NOTICE_RUNNING));
         assert_eq!(second.action_seq, 1, "the refusal is answered first, without a refresh");
-        gate.add_permits(4);
+        gate.add_permits(1);
         let first = wait_for(&h, "the first answer", |n| n.action_seq == 2);
         assert_eq!(first.action_error, None);
         assert!(h.refreshes.load(Ordering::SeqCst) - before >= 1);
@@ -2221,9 +2322,17 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         let a = act(&h, &s, ActionKind::DiscardFile, None);
         assert_eq!(a.action_error.as_deref(), Some(actions::NOTICE_NOT_A_FILE));
         assert!(!a.action_applied && p.join("tools/run").exists());
-        // The index-only form is fine: unstaging the deletion needs no file.
-        assert_eq!(act(&h, &settled(&h, "tools", true), ActionKind::Stage, Some(0)).action_error, None);
-        assert!(git_out(p, &["ls-files", "--", "tools"]).contains("tools"));
+        // The index-only form needs no file, but git refuses an index holding both `tools2` and a
+        // descendant, so the restore is shown on a fixture whose descendant is untracked.
+        std::fs::write(p.join("tools2"), "y\n").unwrap();
+        git(p, &["add", "tools2"]);
+        git(p, &["commit", "-q", "-m", "tools2"]);
+        git(p, &["rm", "-q", "tools2"]);
+        std::fs::create_dir(p.join("tools2")).unwrap();
+        std::fs::write(p.join("tools2/run"), "r\n").unwrap();
+        let s = select(&h, "tools2", true, false);
+        assert_eq!(act(&h, &s, ActionKind::Stage, Some(0)).action_error, None);
+        assert!(git_out(p, &["ls-files", "--", "tools2"]).trim() == "tools2");
     }
 
     #[test]
@@ -2239,9 +2348,13 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         });
         let s = select(&h, "u.txt", false, true);
         assert!(ready(&s).unwrap().pre_image.is_some());
-        // The reload sleeps between its first pre-image read and the diff; the edit lands in that window.
+        // The reload sleeps 400 ms between its first pre-image reading and the diff. The opening head
+        // sample precedes that reading by microseconds, so once `head_samples` has advanced the task
+        // is inside its delay, and the edit lands between the two readings.
+        let samples = h.head_samples.load(Ordering::SeqCst);
         h.commands.send(Command::Refresh).unwrap();
-        std::thread::sleep(Duration::from_millis(150));
+        wait_until(|| (h.head_samples.load(Ordering::SeqCst) > samples).then_some(()));
+        std::thread::sleep(Duration::from_millis(50));
         std::fs::write(p.join("u.txt"), "u\nmore\n").unwrap();
         let s = wait_for(&h, "the reload", |n| !n.refreshing && ready(n).is_some_and(|d| d.raw_diff.contains("+more")));
         assert!(ready(&s).unwrap().pre_image.is_none(), "the two readings disagreed");
@@ -2359,6 +2472,8 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
         let before = h.refreshes.load(Ordering::SeqCst);
         let diff = match &s.diff { DiffState::Ready(d) => d.clone(), _ => unreachable!() };
         h.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff, hunk: None })).unwrap();
+        // The events arrive while the carrying refresh is in flight.
+        wait_until(|| (h.refreshes.load(Ordering::SeqCst) > before).then_some(()));
         for _ in 0..5 {
             sink.emit_json("git-status-changed", serde_json::json!({ "cwds": [] })).unwrap();
         }
@@ -3196,7 +3311,9 @@ Tests in `view.rs`:
 ```rust
     #[test]
     fn the_toolbar_group_sits_between_the_steppers_and_drops_first() {
-        let (r, _) = rendered(120, 20, FilesPanel::Hidden);
+        // The fixture's toolbar needs about 132 columns with the group; it shows at 140 and is the
+        // first thing dropped below that.
+        let (r, _) = rendered(140, 20, FilesPanel::Hidden);
         let bar = &r.plain()[0];
         let stepper = bar.find("‹  a.rs").unwrap();
         let group = bar.find(" stage ").unwrap();
@@ -3206,9 +3323,11 @@ Tests in `view.rs`:
         for action in [Action::StageHunk, Action::DiscardHunk, Action::DiscardFile] {
             assert!(r.hits.iter().any(|h| h.y == 0 && h.action == action), "{action:?}");
         }
-        let (r, _) = rendered(80, 20, FilesPanel::Hidden);
-        let bar = &r.plain()[0];
-        assert!(!bar.contains("discard") && bar.contains("{} 1/2"), "{bar}");
+        for columns in [120, 80] {
+            let (r, _) = rendered(columns, 20, FilesPanel::Hidden);
+            let bar = &r.plain()[0];
+            assert!(!bar.contains("discard") && bar.contains("{} 1/2"), "{columns}: {bar}");
+        }
     }
 
     #[test]
@@ -3219,16 +3338,16 @@ Tests in `view.rs`:
         }
         snap.selected.as_mut().unwrap().staged = true;
         let st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
-        let bar = render(&snap, &st, 120, 20).plain()[0].clone();
+        let bar = render(&snap, &st, 140, 20).plain()[0].clone();
         assert!(bar.contains(" unstage ") && !bar.contains(" stage "), "{bar}");
         snap.scope = Scope::Branch;
         snap.base = Some(crate::engine::Base { requested: "refs/heads/main".into(), commit: "c".repeat(40), merge_base: Some("m".repeat(40)), source: crate::engine::BaseSource::Default });
-        let r = render(&snap, &st, 120, 20);
+        let r = render(&snap, &st, 140, 20);
         assert!(!r.plain()[0].contains("discard"));
         assert!(!r.plain().last().unwrap().contains("s stage"));
         snap.scope = Scope::Worktree;
         snap.diff = DiffState::Loading;
-        let r = render(&snap, &st, 120, 20);
+        let r = render(&snap, &st, 140, 20);
         assert!(r.plain()[0].contains("discard"));
         assert!(!r.hits.iter().any(|h| matches!(h.action, Action::StageHunk | Action::DiscardHunk | Action::DiscardFile)));
     }
@@ -3285,6 +3404,7 @@ Create `tests/hunk_actions.rs`. Copy `real_git`, `git` and `tree_hash` verbatim 
 
 ```rust
 use herdr_hunks::engine::actions::{NOTICE_BINARY, NOTICE_CHANGED, NOTICE_SCOPE};
+// NOTICE_CUT, NOTICE_SUBMODULE, NOTICE_NO_HUNK and NOTICE_NOT_A_FILE are referenced by path below.
 use herdr_hunks::engine::{
     init_process_env, spawn, Action, ActionKind, Command, DiffState, FileKey, Scope, SessionConfig, Snapshot,
 };
@@ -3376,6 +3496,23 @@ fn fixture(real: &Path, p: &Path) {
     std::fs::create_dir_all(p.join("newdir/deep")).unwrap();
     std::fs::write(p.join("newdir/deep/u.txt"), "u\n").unwrap();
     std::fs::write(p.join("u2.txt"), "two\n").unwrap();
+    // The refusal cases of spec 9.6: a diff past the cap, a gitlink, a directory in a file's place,
+    // and a file with two unstaged hunks for the concurrent pair.
+    let big: String = (0..200_001).map(|i| format!("{i}\n")).collect();
+    std::fs::write(p.join("big.txt"), big).unwrap();
+    let head = git(real, p, &["rev-parse", "HEAD"]).trim().to_string();
+    git(real, p, &["update-index", "--add", "--cacheinfo", &format!("160000,{head},sub")]);
+    std::fs::write(p.join("tools"), "x\n").unwrap();
+    git(real, p, &["add", "tools"]);
+    let ctx = "c1\nc2\nc3\nc4\nc5\nc6\nc7\n";
+    std::fs::write(p.join("cc.txt"), format!("one\n{ctx}two\n")).unwrap();
+    git(real, p, &["add", "cc.txt"]);
+    git(real, p, &["commit", "-q", "-m", "more"]);
+    git(real, p, &["rm", "-q", "tools"]);
+    std::fs::create_dir(p.join("tools")).unwrap();
+    std::fs::write(p.join("tools/run"), "r\n").unwrap();
+    git(real, p, &["add", "tools/run"]);
+    std::fs::write(p.join("cc.txt"), format!("ONE\n{ctx}TWO\n")).unwrap();
 }
 
 #[test]
@@ -3397,7 +3534,7 @@ fn every_action_runs_exactly_its_apply_forms_and_changes_exactly_what_the_row_sh
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let state = tempfile::tempdir().unwrap();
     let mut config = SessionConfig::production(p.to_path_buf());
-    config.poll_interval = Duration::from_millis(100);
+    config.poll_interval = Duration::from_secs(3600); // the helpers refresh; the real watcher still runs
     config.state_dir = Some(state.path().to_path_buf());
     let session = Session { handle: spawn(rt.handle(), config), log: log.clone() };
     let top = p.canonicalize().unwrap();
@@ -3510,6 +3647,40 @@ fn every_action_runs_exactly_its_apply_forms_and_changes_exactly_what_the_row_sh
     assert_eq!(git(&real, p, &["status", "--porcelain=v1", "--", "u2.txt"]).trim(), "A  u2.txt");
     refs_same("stage untracked");
 
+    // 11-16. The remaining pre-git refusals of spec 9.2 and 9.4: each answers, and none records an apply.
+    let s = session.select("big.txt", false, true);
+    let (a, applies) = session.act(&s, ActionKind::Stage, None);
+    assert_eq!((a.action_error.as_deref(), applies.len()), (Some(herdr_hunks::engine::actions::NOTICE_CUT), 0));
+    let s = session.select("sub", true, false);
+    let (a, applies) = session.act(&s, ActionKind::DiscardFile, None);
+    assert_eq!((a.action_error.as_deref(), applies.len()), (Some(herdr_hunks::engine::actions::NOTICE_SUBMODULE), 0));
+    let s = session.select("cc.txt", false, false);
+    let (a, applies) = session.act(&s, ActionKind::Stage, Some(99));
+    assert_eq!((a.action_error.as_deref(), applies.len()), (Some(herdr_hunks::engine::actions::NOTICE_NO_HUNK), 0));
+    let s = session.select("tools", true, false);
+    let (a, applies) = session.act(&s, ActionKind::DiscardFile, None);
+    assert_eq!((a.action_error.as_deref(), applies.len()), (Some(herdr_hunks::engine::actions::NOTICE_NOT_A_FILE), 0));
+    // An edit after the frame: the real watcher may republish first (identity) or not (pre-image);
+    // either guard answers `the diff changed` and neither runs git.
+    let s = session.select("cc.txt", false, false);
+    std::fs::write(p.join("cc.txt"), format!("ONE\nc1\nc2\nc3\nc4\nc5\nc6\nc7\nTWO\nthree\n")).unwrap();
+    let (a, applies) = session.act(&s, ActionKind::Discard, Some(0));
+    assert_eq!((a.action_error.as_deref(), applies.len()), (Some(NOTICE_CHANGED), 0));
+    assert!(std::fs::read_to_string(p.join("cc.txt")).unwrap().starts_with("ONE\n"));
+    // Two keys back to back: one form runs, the other is refused as running.
+    let s = session.select("cc.txt", false, false);
+    let diff = match &s.diff { DiffState::Ready(d) => d.clone(), _ => unreachable!() };
+    let before = std::fs::read_to_string(&log).unwrap().lines().count();
+    session.handle.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff: diff.clone(), hunk: Some(0) })).unwrap();
+    session.handle.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff, hunk: Some(1) })).unwrap();
+    let both = session.recv("both answered", |n| n.action_seq == s.action_seq + 2);
+    assert_eq!(both.action_error, None, "the queued one is answered last, and it applied");
+    let pair: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().skip(before).map(|l| l.split('\t').next().unwrap_or("").to_string()).filter(|l| subcommand(l) == "apply").collect();
+    assert_eq!(pair, [form(" --cached")]);
+    let cached = git(&real, p, &["diff", "--cached", "--", "cc.txt"]);
+    assert!(cached.contains("+ONE") && !cached.contains("+TWO"), "{cached}");
+    refs_same("concurrent pair");
+
     session.handle.commands.send(Command::Shutdown).unwrap();
     std::thread::sleep(Duration::from_millis(500));
     let recorded = std::fs::read_to_string(&log).unwrap();
@@ -3519,9 +3690,9 @@ fn every_action_runs_exactly_its_apply_forms_and_changes_exactly_what_the_row_sh
         assert!(ALLOWED.contains(&sub), "unexpected git subcommand `{sub}` in `{}`", fields[0]);
         assert_eq!(&fields[1..], ["0", "1", "1"], "D3 variables missing in `{}`", fields[0]);
     }
-    // Every apply is a confirmed action's form: exactly these seven ran, in this order.
+    // Every apply is a confirmed action's form: exactly these eight ran, in this order.
     let applies: Vec<&str> = recorded.lines().map(|l| l.split('\t').next().unwrap()).filter(|l| subcommand(l) == "apply").collect();
-    let expected = [" --cached", " --cached -R", " -R", " -R", " --index -R", " -R", " --cached"].map(|f| form(f));
+    let expected = [" --cached", " --cached -R", " -R", " -R", " --index -R", " -R", " --cached", " --cached"].map(|f| form(f));
     assert_eq!(applies, expected.iter().map(String::as_str).collect::<Vec<_>>());
     assert_eq!(git(&real, p, &["for-each-ref"]), refs_before, "refs changed");
     let mut written: Vec<String> = std::fs::read_dir(state.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
@@ -3544,7 +3715,7 @@ In `tests/e2e_real_herdr.rs`, after the marker-clears block and before the focus
         // Phase 2: stage the one unstaged hunk of a.txt from the keyboard.
         std::fs::write(repo.join("a.txt"), "a\nSTAGE-ME\n").unwrap();
         iso.herdr(&["pane", "send-text", viewer_id, "b"]); // back to worktree scope
-        iso.herdr(&["pane", "wait-output", viewer_id, "--match", "UNSTAGED", "--source", "visible", "--timeout", "15000"]);
+        iso.herdr(&["pane", "wait-output", viewer_id, "--match", "+STAGE-ME", "--source", "visible", "--timeout", "15000"]); // the diff is loaded, not only the row
         iso.herdr(&["pane", "send-text", viewer_id, "s"]);
         iso.herdr(&["pane", "wait-output", viewer_id, "--match", "Stage hunk?", "--source", "visible", "--timeout", "15000"]);
         iso.herdr(&["pane", "send-text", viewer_id, "y"]);
@@ -3761,3 +3932,16 @@ is aborted on expiry, with a grandchild-holds-the-pipe test. The slicer's fixtur
 two-hunk diff whose slices are applied forward and reverse against real files, and the diff
 oracle compares line contents and the patch bytes against an independent `git diff`. The
 dialog footer assertion reads the penultimate line, and the two test filters run separately.
+
+**Round 3 (codex, plan-complete, 2026-10-01).** Nine findings, all applied. Two were
+structural: the rename map is side-specific again, as the spec says, because a path-only
+map handed the staged rename's source to the unstaged row of an `RM` path and the cutter
+dropped that row's patch (`both_rows_of_a_renamed_path_load_their_own_patch` now loads
+both through a session); and the byte cutter keeps `diff --cc`/`diff --combined` sections
+so a conflict still reads as unmerged (`a_conflicts_combined_section_is_kept_for_the_view`
+on a real merge conflict). Submodules are classified by the 160000 mode, with a text-file
+counterexample. The acted-Arc test acts on a row that survives, the second-action test
+accounts for the permits its helper needs, the directory test splits into the K7 refusal
+and a restore on a fixture git allows, the toolbar presence is asserted at 140 columns,
+three race tests synchronize on counters or visible text instead of sleeping, and the
+recording test covers the six remaining pre-git refusals with no `apply` recorded.
