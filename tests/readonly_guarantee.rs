@@ -420,7 +420,7 @@ fn the_engine_never_mutates_the_repository() {
         );
     }
     assert!(
-        recorded.lines().any(|l| l.contains("ls-files -s --")),
+        recorded.lines().any(|l| l.contains("ls-files -s -z --")),
         "no pre-image was read"
     );
     let mut written: Vec<String> = std::fs::read_dir(state.path())

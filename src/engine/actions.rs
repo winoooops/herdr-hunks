@@ -1,10 +1,21 @@
 //! Hunk patches and the apply runner (spec 9.2, 9.4). The only mutating git calls live here.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
 
 use crate::engine::sections::sections;
+use crate::engine::worktree;
+use crate::engine::{Action, ActionKind, Comparison, WorktreeKind};
+
+pub const NOTICE_SCOPE: &str = "switch to worktree scope (b) to stage or discard";
+pub const NOTICE_NO_HUNK: &str = "no hunk under the cursor";
+pub const NOTICE_CUT: &str = "diff cut by the size cap; use a shell";
+pub const NOTICE_BINARY: &str = "binary file: not applied here";
+pub const NOTICE_SUBMODULE: &str = "submodule: not applied here";
+pub const NOTICE_NOT_A_FILE: &str = "not a regular file: not applied here";
+pub const NOTICE_CHANGED: &str = "the diff changed; look again";
+pub const NOTICE_RUNNING: &str = "an action is still running";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -316,6 +327,105 @@ pub async fn apply_with(
             "git apply failed with status {}",
             output.status
         ))),
+    }
+}
+
+/// Spec 9.2's eligibility, from the Arc alone, in the order the TUI decides it too.
+pub fn plan(action: &Action) -> Result<(Form, Vec<u8>), String> {
+    let diff = &action.diff;
+    if diff.comparison != Comparison::Worktree {
+        return Err(NOTICE_SCOPE.into());
+    }
+    if diff.truncated_lines > 0 {
+        return Err(NOTICE_CUT.into());
+    }
+    let kind = classify(&diff.patch);
+    if kind == Kind::Submodule {
+        return Err(NOTICE_SUBMODULE.into());
+    }
+    let whole = action.kind == ActionKind::DiscardFile || diff.key.untracked;
+    if whole {
+        if kind == Kind::Binary {
+            return Err(NOTICE_BINARY.into());
+        }
+        let form = match (diff.key.untracked, action.kind, diff.key.staged) {
+            (true, ActionKind::Stage, _) => Form::StageUntracked,
+            (true, _, _) => Form::DeleteUntracked,
+            (false, _, true) => Form::DiscardStaged,
+            (false, _, false) => Form::DiscardUnstaged,
+        };
+        return Ok((form, diff.patch.clone()));
+    }
+    let Some(hunk) = action.hunk.filter(|&h| h < hunk_count(&diff.patch)) else {
+        return Err(NOTICE_NO_HUNK.into());
+    };
+    let form = match (action.kind, diff.key.staged) {
+        (ActionKind::Stage, false) => Form::StageHunk,
+        (ActionKind::Stage, true) => Form::UnstageHunk,
+        (_, false) => Form::DiscardUnstaged,
+        (_, true) => Form::DiscardStaged,
+    };
+    let patch = hunk_patch(&diff.patch, hunk, form.direction()).ok_or(NOTICE_NO_HUNK)?;
+    Ok((form, patch))
+}
+
+/// The side a form applies to must hold what the diff was read against; an `--index` form also
+/// needs the file present while the index still holds an entry.
+pub(crate) async fn check_pre_image(
+    toplevel: &str,
+    action: &Action,
+    form: Form,
+) -> Result<(), String> {
+    let Some(recorded) = &action.diff.pre_image else {
+        return Err(NOTICE_CHANGED.into());
+    };
+    let now = worktree::pre_image(toplevel, &action.diff.key.path).await?;
+    if form.reads_index() && now.index != recorded.index {
+        return Err(NOTICE_CHANGED.into());
+    }
+    if form.reads_worktree() {
+        if now.worktree != recorded.worktree {
+            return Err(NOTICE_CHANGED.into());
+        }
+        if matches!(now.worktree, WorktreeKind::Directory | WorktreeKind::Other) {
+            return Err(NOTICE_NOT_A_FILE.into());
+        }
+        // With an entry still in the index (MD), git would recreate the missing file and erase the
+        // unstaged deletion; a clean staged deletion has no entry, and --index -R restores it.
+        if form == Form::DiscardStaged
+            && now.worktree == WorktreeKind::Absent
+            && now.index.is_some()
+        {
+            return Err(format!("{}: does not match index", action.diff.key.path));
+        }
+    }
+    Ok(())
+}
+
+const LOCK_RETRY: Duration = Duration::from_secs(2);
+
+/// Check, apply, and retry an `index.lock` collision for up to 2 s, re-checking before each retry.
+/// `.1` is whether a form ran.
+pub(crate) async fn run(
+    toplevel: &str,
+    action: &Action,
+    form: Form,
+    patch: &[u8],
+) -> (Result<(), String>, bool) {
+    let deadline = Instant::now() + LOCK_RETRY;
+    let mut applied = false;
+    loop {
+        if let Err(e) = check_pre_image(toplevel, action, form).await {
+            return (Err(e), applied);
+        }
+        applied = true;
+        match apply(toplevel, form, patch).await {
+            Ok(()) => return (Ok(()), true),
+            Err(Refusal::Locked(_)) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(Refusal::Locked(m)) | Err(Refusal::Failed(m)) => return (Err(m), true),
+        }
     }
 }
 
@@ -676,5 +786,206 @@ mod tests {
         rt().block_on(apply(&top, Form::StageUntracked, &patch))
             .unwrap();
         assert!(git_out(dir.path(), &["ls-files", "--", "big.txt"]).contains("big.txt"));
+    }
+
+    use crate::engine::{
+        Action, ActionKind, Comparison, FileKey, LoadedDiff, PreImage, WorktreeKind,
+    };
+    use crate::git::GetGitDiffResponse;
+    use std::sync::Arc;
+
+    fn loaded(
+        path: &str,
+        staged: bool,
+        untracked: bool,
+        comparison: Comparison,
+        patch: &[u8],
+        cap: usize,
+    ) -> Arc<LoadedDiff> {
+        let file_diff = crate::engine::worktree::parse_for_tests(patch, path);
+        let response = GetGitDiffResponse {
+            file_diff,
+            old_text: String::new(),
+            new_text: String::new(),
+            raw_diff: String::from_utf8_lossy(patch).into_owned(),
+            repo_root: "/r".into(),
+        };
+        let key = FileKey {
+            path: path.into(),
+            staged,
+            untracked,
+        };
+        let pre = Some(PreImage {
+            index: None,
+            worktree: WorktreeKind::Absent,
+        });
+        Arc::new(LoadedDiff::build_with_cap(
+            key,
+            comparison,
+            None,
+            response,
+            patch.to_vec(),
+            pre,
+            cap,
+        ))
+    }
+
+    fn act(kind: ActionKind, diff: &Arc<LoadedDiff>, hunk: Option<usize>) -> Action {
+        Action {
+            kind,
+            diff: diff.clone(),
+            hunk,
+        }
+    }
+
+    #[test]
+    fn the_plan_follows_the_row_and_refuses_what_the_spec_refuses() {
+        let unstaged = loaded(
+            "f.txt",
+            false,
+            false,
+            Comparison::Worktree,
+            TWO_HUNKS,
+            1_000,
+        );
+        let staged = loaded("f.txt", true, false, Comparison::Worktree, TWO_HUNKS, 1_000);
+        assert_eq!(
+            plan(&act(ActionKind::Stage, &unstaged, Some(1))).unwrap().0,
+            Form::StageHunk
+        );
+        assert_eq!(
+            plan(&act(ActionKind::Stage, &staged, Some(1))).unwrap().0,
+            Form::UnstageHunk
+        );
+        assert_eq!(
+            plan(&act(ActionKind::Discard, &unstaged, Some(0)))
+                .unwrap()
+                .0,
+            Form::DiscardUnstaged
+        );
+        assert_eq!(
+            plan(&act(ActionKind::Discard, &staged, Some(0))).unwrap().0,
+            Form::DiscardStaged
+        );
+        let (form, whole) = plan(&act(ActionKind::DiscardFile, &staged, None)).unwrap();
+        assert_eq!((form, whole.as_slice()), (Form::DiscardStaged, TWO_HUNKS));
+        let (_, one) = plan(&act(ActionKind::Stage, &unstaged, Some(1))).unwrap();
+        assert_eq!(one, hunk_patch(TWO_HUNKS, 1, Direction::Forward).unwrap());
+        assert_eq!(
+            plan(&act(ActionKind::Stage, &unstaged, None)).unwrap_err(),
+            NOTICE_NO_HUNK
+        );
+        assert_eq!(
+            plan(&act(ActionKind::Discard, &unstaged, Some(2))).unwrap_err(),
+            NOTICE_NO_HUNK
+        );
+        let branch = loaded(
+            "f.txt",
+            false,
+            false,
+            Comparison::Branch {
+                merge_base: "m".repeat(40),
+            },
+            TWO_HUNKS,
+            1_000,
+        );
+        assert_eq!(
+            plan(&act(ActionKind::DiscardFile, &branch, None)).unwrap_err(),
+            NOTICE_SCOPE
+        );
+        let cut = loaded("f.txt", false, false, Comparison::Worktree, TWO_HUNKS, 3);
+        assert!(cut.truncated_lines > 0);
+        for (kind, hunk) in [
+            (ActionKind::Stage, Some(0)),
+            (ActionKind::DiscardFile, None),
+        ] {
+            assert_eq!(plan(&act(kind, &cut, hunk)).unwrap_err(), NOTICE_CUT);
+        }
+        let binary = loaded(
+            "b",
+            false,
+            false,
+            Comparison::Worktree,
+            b"diff --git a/b b/b\nindex 1..2\nBinary files a/b and b/b differ\n",
+            1_000,
+        );
+        assert_eq!(
+            plan(&act(ActionKind::Stage, &binary, Some(0))).unwrap_err(),
+            NOTICE_NO_HUNK
+        );
+        assert_eq!(
+            plan(&act(ActionKind::DiscardFile, &binary, None)).unwrap_err(),
+            NOTICE_BINARY
+        );
+        let untracked_binary = loaded(
+            "b",
+            false,
+            true,
+            Comparison::Worktree,
+            b"diff --git a/b b/b\nnew file mode 100644\nindex 0..2\nBinary files /dev/null and b/b differ\n",
+            1_000,
+        );
+        for kind in [
+            ActionKind::Stage,
+            ActionKind::Discard,
+            ActionKind::DiscardFile,
+        ] {
+            assert_eq!(
+                plan(&act(kind, &untracked_binary, None)).unwrap_err(),
+                NOTICE_BINARY
+            );
+        }
+        let sub = loaded("sub", true, false, Comparison::Worktree, b"diff --git a/sub b/sub\nindex 1..2 160000\n--- a/sub\n+++ b/sub\n@@ -1 +1 @@\n-Subproject commit a\n+Subproject commit b\n", 1_000);
+        assert_eq!(
+            plan(&act(ActionKind::Stage, &sub, Some(0))).unwrap_err(),
+            NOTICE_SUBMODULE
+        );
+        let untracked = loaded("u.txt", false, true, Comparison::Worktree, b"diff --git a/u.txt b/u.txt\nnew file mode 100644\nindex 0..1\n--- /dev/null\n+++ b/u.txt\n@@ -0,0 +1 @@\n+u\n", 1_000);
+        assert_eq!(
+            plan(&act(ActionKind::Stage, &untracked, None)).unwrap().0,
+            Form::StageUntracked
+        );
+        assert_eq!(
+            plan(&act(ActionKind::Discard, &untracked, Some(0)))
+                .unwrap()
+                .0,
+            Form::DeleteUntracked
+        );
+        assert_eq!(
+            plan(&act(ActionKind::DiscardFile, &untracked, None))
+                .unwrap()
+                .0,
+            Form::DeleteUntracked
+        );
+        let empty = loaded(
+            "e",
+            false,
+            true,
+            Comparison::Worktree,
+            b"diff --git a/e b/e\nnew file mode 100644\nindex 0000000..e69de29\n",
+            1_000,
+        );
+        assert_eq!(
+            plan(&act(ActionKind::Stage, &empty, None)).unwrap().0,
+            Form::StageUntracked
+        );
+        let mode_only = loaded(
+            "m",
+            false,
+            false,
+            Comparison::Worktree,
+            b"diff --git a/m b/m\nold mode 100644\nnew mode 100755\n",
+            1_000,
+        );
+        assert_eq!(
+            plan(&act(ActionKind::Stage, &mode_only, None)).unwrap_err(),
+            NOTICE_NO_HUNK
+        );
+        assert_eq!(
+            plan(&act(ActionKind::DiscardFile, &mode_only, None))
+                .unwrap()
+                .0,
+            Form::DiscardUnstaged
+        );
     }
 }

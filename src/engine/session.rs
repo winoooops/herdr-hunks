@@ -9,8 +9,9 @@ use tokio::sync::Semaphore;
 
 use super::base::{self, MarkRecord, ResolveInputs};
 use super::{
-    branch, gitver, marks, worktree, Base, BaseSource, Command, Comparison, DiffState, FileKey,
-    LoadedDiff, Mark, MarkState, PreImage, QuickBase, RepoState, Scope, Snapshot, NO_BASE_NOTICE,
+    actions, branch, gitver, marks, worktree, Action, Base, BaseSource, Command, Comparison,
+    DiffState, FileKey, LoadedDiff, Mark, MarkState, PreImage, QuickBase, RepoState, Scope,
+    Snapshot, NO_BASE_NOTICE,
 };
 use crate::git::{self, ChangedFile, GetGitDiffResponse, GitStatusResponse};
 use crate::runtime::EventSink;
@@ -129,6 +130,18 @@ enum Change {
     Scope(Scope),
     Base(Option<String>),
     Mark(String),
+    Act(ActJob),
+}
+
+/// A planned action: its form and patch are decided when the command arrives, the pre-image when
+/// the refresh runs it.
+#[derive(Debug, Clone)]
+struct ActJob {
+    action: Action,
+    form: actions::Form,
+    patch: Vec<u8>,
+    /// Decided when the refresh popped it: the Arc was replaced in the meantime.
+    refusal: Option<String>,
 }
 
 /// How the refresh obtains the base: keep and re-verify, run the resolution steps, or verify a pick
@@ -152,6 +165,10 @@ struct Job {
     previous_unread: Option<(String, BTreeSet<String>)>,
     change: Option<Change>,
     status_delay: Option<Duration>,
+    /// The repository the forms run in; `None` answers an action with `not a git repository`.
+    toplevel: Option<String>,
+    /// K6's lane: no diff task reads git while a form runs.
+    lane: Arc<Semaphore>,
 }
 
 type Marked = (Mark, BTreeSet<String>, Result<(), String>, Option<String>);
@@ -211,6 +228,13 @@ struct State {
     /// The newest generation, read by waiting tasks to skip superseded work.
     latest_generation: Arc<AtomicU64>,
     status_delay: Option<Duration>,
+    /// An action is queued or being carried; a second one is answered at once.
+    act_pending: bool,
+    /// The Arc a form ran on: never eligible again until a later diff replaces it.
+    acted: Option<Arc<LoadedDiff>>,
+    /// The first diff after an attempted action skips the unchanged shortcut.
+    fresh_arc_pending: bool,
+    action_seq: u64,
 }
 
 fn comparison_of(snapshot: &Snapshot) -> Comparison {
@@ -271,6 +295,8 @@ enum Done {
         /// `None` when the status failed or the directory is not a repository.
         loaded: Option<Result<Box<Loaded>, String>>,
         change: Option<Change>,
+        /// The carried action's result and whether a form ran; `None` without an action.
+        acted: Option<(Result<(), String>, bool)>,
     },
     Diff {
         generation: u64,
@@ -491,6 +517,19 @@ async fn load_rows(
 }
 
 async fn run_job(job: Job) -> Done {
+    // The forms run before the status read, so the rows published with the answer are git's after it.
+    let acted = match (&job.change, &job.toplevel) {
+        (Some(Change::Act(act)), Some(toplevel)) => Some(match &act.refusal {
+            Some(refusal) => (Err(refusal.clone()), false),
+            None => {
+                // No diff task reads git while a form runs; one started earlier was superseded at the pop.
+                let _lane = job.lane.acquire().await.expect("diff lane closed");
+                actions::run(toplevel, &act.action, act.form, &act.patch).await
+            }
+        }),
+        (Some(Change::Act(_)), None) => Some((Err("not a git repository".to_string()), false)),
+        _ => None,
+    };
     if let Some(delay) = job.status_delay {
         tokio::time::sleep(delay).await;
     }
@@ -530,6 +569,7 @@ async fn run_job(job: Job) -> Done {
         confirmed,
         loaded,
         change: job.change,
+        acted,
     }
 }
 
@@ -553,19 +593,38 @@ impl State {
         if let Some(Change::Mark(commit)) = &change {
             self.in_flight_mark = Some(commit.clone());
         }
+        let change = match change {
+            Some(Change::Act(mut job)) => {
+                // A diff result may have replaced the Arc while the action waited in the queue.
+                let same = matches!(&self.snapshot.diff, DiffState::Ready(d) if Arc::ptr_eq(d, &job.action.diff));
+                if !same {
+                    job.refusal = Some(actions::NOTICE_CHANGED.to_string());
+                }
+                Some(Change::Act(job))
+            }
+            other => other,
+        };
+        if let Some(Change::Act(_)) = &change {
+            // Nothing read before the mutation may be published after it: superseded now, before any form runs.
+            self.diff_generation += 1;
+            self.latest_generation
+                .store(self.diff_generation, Ordering::SeqCst);
+            self.diff_in_flight = None;
+        }
         let scope = match &change {
             Some(Change::Scope(scope)) => *scope,
             Some(Change::Base(_)) => Scope::Branch,
-            Some(Change::Mark(_)) | None => self.requested_scope,
+            Some(Change::Mark(_)) | Some(Change::Act(_)) | None => self.requested_scope,
         };
         // Explicit changes resolve preferences; polls only re-verify ids.
         let base = match (&change, std::mem::take(&mut self.resolve_pending)) {
             (Some(Change::Base(pick)), _) => BaseJob::Pick(pick.clone()),
-            // A mark changes no comparison, but it must not swallow a resolution `r` asked for.
-            (Some(Change::Scope(_)), _) | (Some(Change::Mark(_)), true) | (None, true) => {
-                BaseJob::Resolve
-            }
-            (Some(Change::Mark(_)), false) | (None, false) => {
+            // A mark or an action changes no comparison, but must not swallow a resolution `r` asked for.
+            (Some(Change::Scope(_)), _)
+            | (Some(Change::Mark(_)), true)
+            | (Some(Change::Act(_)), true)
+            | (None, true) => BaseJob::Resolve,
+            (Some(Change::Mark(_)), false) | (Some(Change::Act(_)), false) | (None, false) => {
                 BaseJob::Keep(self.snapshot.base.clone())
             }
         };
@@ -588,6 +647,11 @@ impl State {
                 .map(|at| (at, (*self.snapshot.unread).clone())),
             change,
             status_delay: self.status_delay,
+            toplevel: match &self.snapshot.repo {
+                RepoState::Repo { toplevel, .. } => Some(toplevel.clone()),
+                _ => None,
+            },
+            lane: self.diff_lane.clone(),
         };
         let results = results.clone();
         tokio::spawn(async move {
@@ -706,7 +770,7 @@ fn fingerprint(s: &Snapshot) -> String {
         DiffState::Ready(d) => format!("ready:{:p}", Arc::as_ptr(d)),
     };
     format!(
-        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}",
+        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{}",
         s.repo,
         serde_json::to_string(&s.files).unwrap_or_default(),
         s.selected,
@@ -730,7 +794,10 @@ fn fingerprint(s: &Snapshot) -> String {
         s.mark_seq,
         s.mark_error,
         s.unread,
-        s.quick.as_ref().map(Arc::as_ptr)
+        s.quick.as_ref().map(Arc::as_ptr),
+        s.action_seq,
+        s.action_error,
+        s.action_applied
     )
 }
 
@@ -861,6 +928,10 @@ async fn run(
         diff_lane: Arc::new(Semaphore::new(1)),
         latest_generation: Arc::new(AtomicU64::new(0)),
         status_delay: config.status_delay,
+        act_pending: false,
+        acted: None,
+        fresh_arc_pending: false,
+        action_seq: 0,
     };
     let path = match config.path.canonicalize() {
         Ok(path) if path.is_dir() => path,
@@ -992,6 +1063,46 @@ async fn run(
                             let _ = results.send(Done::Refs { token, result, quick });
                         });
                     }
+                    Command::Act(action) => {
+                        let published = match &state.snapshot.diff {
+                            DiffState::Ready(d) => Some(d),
+                            _ => None,
+                        };
+                        let same = published.is_some_and(|d| Arc::ptr_eq(d, &action.diff));
+                        let acted = state.acted.as_ref().is_some_and(|a| Arc::ptr_eq(a, &action.diff));
+                        let toplevel = match &state.snapshot.repo {
+                            RepoState::Repo { toplevel, .. } => Some(toplevel.clone()),
+                            _ => None,
+                        };
+                        // Decided here, without git: concurrency, identity, eligibility, a repository.
+                        let planned = if state.act_pending {
+                            Err(actions::NOTICE_RUNNING.to_string())
+                        } else if !same || acted {
+                            Err(actions::NOTICE_CHANGED.to_string())
+                        } else if toplevel.is_none() {
+                            Err("not a git repository".to_string())
+                        } else {
+                            actions::plan(&action)
+                        };
+                        match planned {
+                            Err(refusal) => {
+                                state.action_seq += 1;
+                                let mut next = state.snapshot.clone();
+                                next.action_seq = state.action_seq;
+                                next.action_error = Some(refusal);
+                                next.action_applied = false;
+                                publish(&mut state, next, &snapshots);
+                            }
+                            Ok((form, patch)) => {
+                                state.act_pending = true;
+                                state.changes.push_back(Change::Act(ActJob { action, form, patch, refusal: None }));
+                                let mut next = state.snapshot.clone();
+                                next.refreshing = true;
+                                publish(&mut state, next, &snapshots);
+                                state.request_status(&cwd, false, &results_tx, &refreshes);
+                            }
+                        }
+                    }
                     selection => {
                         let selected = match selection {
                             Command::Select(key) => state.snapshot.files.iter()
@@ -1076,9 +1187,20 @@ async fn run(
                         next.watcher_error = result.err();
                         publish(&mut state, next, &snapshots);
                     }
-                    Done::Status { response, head, head_seen, head_sampled, confirmed, loaded, change } => {
+                    Done::Status { response, head, head_seen, head_sampled, confirmed, loaded, change, acted } => {
                         state.status_in_flight = false;
                         state.in_flight_mark = None;
+                        if let (Some(Change::Act(act)), Some((result, applied))) = (&change, &acted) {
+                            state.act_pending = false;
+                            state.action_seq += 1;
+                            next.action_seq = state.action_seq;
+                            next.action_error = result.clone().err();
+                            next.action_applied = *applied;
+                            if *applied {
+                                state.acted = Some(act.action.diff.clone());
+                                state.fresh_arc_pending = true;
+                            }
+                        }
                         // The rows may only claim a commit the refresh bracketed: the opening
                         // sample alone would let rows loaded across a move name a commit whose
                         // files they never listed.
@@ -1122,7 +1244,7 @@ async fn run(
                                         Some(Change::Base(_)) => change_error = Some(e),
                                         Some(Change::Mark(_)) => mark_answer = Some(e),
                                         Some(Change::Scope(_)) => next.base_error = Some(e),
-                                        None => next.status_error = Some(e),
+                                        Some(Change::Act(_)) | None => next.status_error = Some(e),
                                     },
                                     other => {
                                         next.status_error = None;
@@ -1167,6 +1289,16 @@ async fn run(
                                                 .or_else(|| old_index.and_then(|i| next.files.get(i.min(next.files.len().saturating_sub(1))).map(key_of)))
                                         }
                                         .or_else(|| next.files.first().map(key_of));
+                                        if let Some(Change::Act(act)) = &change {
+                                            // The acted row is gone: the other row of the same path takes the selection.
+                                            let key = &act.action.diff.key;
+                                            let listed = next.files.iter().any(|f| &key_of(f) == key);
+                                            if !listed {
+                                                if let Some(sibling) = next.files.iter().find(|f| f.path == key.path) {
+                                                    next.selected = Some(key_of(sibling));
+                                                }
+                                            }
+                                        }
                                         if let Some(Change::Base(pick)) = &change {
                                             match loaded.persisted {
                                                 Some(Ok(())) => state.inputs.session_pick = None,
@@ -1271,10 +1403,16 @@ async fn run(
                         if Some(&key) == next.selected.as_ref() {
                             match result {
                                 Ok((response, patch)) => {
-                                    // A working-tree edit can change a staged row's pre-image without changing its diff.
-                                    let unchanged = matches!(&next.diff, DiffState::Ready(d) if d.key == key && d.comparison == comparison && d.raw_diff == response.raw_diff && d.read_at == read_at && d.pre_image == pre_image);
+                                    // A working-tree edit can change a staged row's pre-image without changing its diff,
+                                    // and the first diff after an attempted action is always a fresh Arc.
+                                    let fresh = std::mem::take(&mut state.fresh_arc_pending);
+                                    let unchanged = !fresh
+                                        && matches!(&next.diff, DiffState::Ready(d) if d.key == key && d.comparison == comparison && d.raw_diff == response.raw_diff && d.read_at == read_at && d.pre_image == pre_image);
                                     if !unchanged {
                                         next.diff = DiffState::Ready(Arc::new(LoadedDiff::build(key, comparison, read_at.clone(), response, patch, pre_image)));
+                                    }
+                                    if state.acted.as_ref().is_some_and(|a| !matches!(&next.diff, DiffState::Ready(d) if Arc::ptr_eq(a, d))) {
+                                        state.acted = None;
                                     }
                                     // Only when the rows on screen came from this commit too.
                                     next.head =
@@ -3597,5 +3735,878 @@ mod tests {
                 assert!(s.unread.contains("old.txt") && s.unread.contains("new.txt"));
             }
         }
+    }
+
+    use crate::engine::{ActionKind, WorktreeKind};
+
+    /// mm.txt: two hunks staged, two unstaged. am.txt: staged creation plus an unstaged edit.
+    /// del.txt: worktree deletion. sdel.txt and sdel2.txt: staged deletions. ren.txt -> renamed.txt
+    /// staged with two hunks. u.txt untracked, empty.txt untracked and empty, bin.dat untracked and binary.
+    fn action_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        git(p, &["config", "user.email", "t@example.com"]);
+        git(p, &["config", "user.name", "t"]);
+        let ctx = "c1\nc2\nc3\nc4\nc5\nc6\nc7\n";
+        let base = format!("alpha\n{ctx}beta\n{ctx}gamma\n{ctx}delta\n");
+        std::fs::write(p.join("mm.txt"), &base).unwrap();
+        std::fs::write(p.join("del.txt"), "d\n").unwrap();
+        std::fs::write(p.join("sdel.txt"), "s\n").unwrap();
+        std::fs::write(p.join("sdel2.txt"), "s2\n").unwrap();
+        std::fs::write(p.join("ren.txt"), format!("one\n{ctx}two\n")).unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-q", "-m", "init"]);
+        std::fs::write(
+            p.join("mm.txt"),
+            format!("ALPHA\n{ctx}BETA\n{ctx}gamma\n{ctx}delta\n"),
+        )
+        .unwrap();
+        git(p, &["add", "mm.txt"]);
+        std::fs::write(
+            p.join("mm.txt"),
+            format!("ALPHA\n{ctx}BETA\n{ctx}GAMMA\n{ctx}DELTA\n"),
+        )
+        .unwrap();
+        std::fs::write(p.join("am.txt"), "a\n").unwrap();
+        git(p, &["add", "am.txt"]);
+        std::fs::write(p.join("am.txt"), "a\nb\n").unwrap();
+        std::fs::remove_file(p.join("del.txt")).unwrap();
+        git(p, &["rm", "-q", "sdel.txt", "sdel2.txt"]);
+        git(p, &["mv", "ren.txt", "renamed.txt"]);
+        std::fs::write(p.join("renamed.txt"), format!("ONE\n{ctx}TWO\n")).unwrap();
+        git(p, &["add", "renamed.txt"]);
+        std::fs::write(p.join("u.txt"), "u\n").unwrap();
+        std::fs::write(p.join("empty.txt"), "").unwrap();
+        std::fs::write(p.join("bin.dat"), [0u8, 1, 2]).unwrap();
+        dir
+    }
+
+    /// Like `start`, with the poll an hour away: only commands and the watcher move the engine.
+    fn start_quiet(dir: &std::path::Path) -> (tokio::runtime::Runtime, EngineHandle) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = spawn(
+            rt.handle(),
+            SessionConfig {
+                scope: Scope::Worktree,
+                base_ref: None,
+                state_dir: None,
+                path: dir.to_path_buf(),
+                poll_interval: Duration::from_secs(3600),
+                watcher: Arc::new(FlakyWatcher {
+                    allow: Arc::new(AtomicBool::new(true)),
+                }),
+                git_check: ok_git(),
+                diff_delay: None,
+                diff_gate: None,
+                status_delay: None,
+            },
+        );
+        (rt, handle)
+    }
+
+    /// A gated session: every diff task waits for one permit before its git call.
+    fn start_gated(
+        dir: &std::path::Path,
+        gate: Arc<Semaphore>,
+    ) -> (tokio::runtime::Runtime, EngineHandle) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = spawn(
+            rt.handle(),
+            SessionConfig {
+                scope: Scope::Worktree,
+                base_ref: None,
+                state_dir: None,
+                path: dir.to_path_buf(),
+                poll_interval: Duration::from_secs(3600),
+                watcher: Arc::new(FlakyWatcher {
+                    allow: Arc::new(AtomicBool::new(true)),
+                }),
+                git_check: ok_git(),
+                diff_delay: None,
+                diff_gate: Some(gate),
+                status_delay: None,
+            },
+        );
+        (rt, handle)
+    }
+
+    /// A `Refresh` first, so the listing is republished even when its last snapshot was already
+    /// consumed (an unchanged repository publishes nothing); then a `Select` for a listed key.
+    /// The refresh's own reload can publish the key first (the previous row vanished, or the key
+    /// was already selected) and the `Select` then replaces that Arc, so the engine's last word
+    /// is taken: the snapshot that still stands once nothing new has arrived for a while.
+    fn select(h: &EngineHandle, path: &str, staged: bool, untracked: bool) -> Arc<Snapshot> {
+        let key = FileKey {
+            path: path.into(),
+            staged,
+            untracked,
+        };
+        h.commands.send(Command::Refresh).unwrap();
+        wait_for(h, &format!("{key:?} listed"), |s| {
+            s.files.iter().any(|f| FileKey::of(f) == key)
+        });
+        h.commands.send(Command::Select(key.clone())).unwrap();
+        let settled = |s: &Snapshot| !s.refreshing && ready(s).is_some_and(|d| d.key == key);
+        let mut last = wait_for(h, &format!("{key:?} ready"), settled);
+        loop {
+            std::thread::sleep(Duration::from_millis(150));
+            let mut newer = None;
+            while let Ok(s) = h.snapshots.try_recv() {
+                newer = Some(s);
+            }
+            match newer {
+                None => return last,
+                Some(s) if settled(&s) => last = s,
+                Some(_) => last = wait_for(h, &format!("{key:?} ready again"), settled),
+            }
+        }
+    }
+
+    /// Sends the action against the very Arc the snapshot holds and returns the snapshot that answers it.
+    fn act(h: &EngineHandle, s: &Snapshot, kind: ActionKind, hunk: Option<usize>) -> Arc<Snapshot> {
+        let diff = match &s.diff {
+            DiffState::Ready(d) => d.clone(),
+            _ => panic!("no ready diff"),
+        };
+        let seq = s.action_seq + 1;
+        h.commands
+            .send(Command::Act(Action { kind, diff, hunk }))
+            .unwrap();
+        wait_for(h, "the answer", |n| n.action_seq == seq)
+    }
+
+    /// The post-action rows and diff: waits until the refresh and the diff reload have settled.
+    fn settled(h: &EngineHandle, path: &str, staged: bool) -> Arc<Snapshot> {
+        wait_for(h, "settled", |s| {
+            !s.refreshing && ready(s).is_some_and(|d| d.key.path == path && d.key.staged == staged)
+        })
+    }
+
+    fn settled_any(h: &EngineHandle) -> Arc<Snapshot> {
+        wait_for(h, "settled", |s| !s.refreshing && ready(s).is_some())
+    }
+
+    fn arc_of(s: &Snapshot) -> Arc<LoadedDiff> {
+        match &s.diff {
+            DiffState::Ready(d) => d.clone(),
+            _ => unreachable!("no ready diff"),
+        }
+    }
+
+    #[test]
+    fn a_hunk_is_staged_unstaged_and_discarded_and_the_rest_is_untouched() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let (_rt, h) = start_quiet(p);
+        let s = select(&h, "mm.txt", false, false);
+        assert_eq!(ready(&s).unwrap().file_diff.hunks.len(), 2);
+        let answered = act(&h, &s, ActionKind::Stage, Some(0));
+        assert_eq!(answered.action_error, None);
+        assert!(answered.action_applied);
+        let cached = git_out(p, &["diff", "--cached", "--", "mm.txt"]);
+        assert!(
+            cached.contains("+GAMMA") && !cached.contains("+DELTA"),
+            "{cached}"
+        );
+        let worktree = git_out(p, &["diff", "--", "mm.txt"]);
+        assert!(
+            !worktree.contains("+GAMMA") && worktree.contains("+DELTA"),
+            "{worktree}"
+        );
+        // The unstaged row survives (DELTA); the diff on screen is reloaded.
+        let s = settled(&h, "mm.txt", false);
+        assert_eq!(ready(&s).unwrap().file_diff.hunks.len(), 1);
+        // Unstage it back from the staged row: it is the third hunk there.
+        let s = select(&h, "mm.txt", true, false);
+        assert_eq!(ready(&s).unwrap().file_diff.hunks.len(), 3);
+        let answered = act(&h, &s, ActionKind::Stage, Some(2));
+        assert_eq!(answered.action_error, None);
+        assert!(!git_out(p, &["diff", "--cached", "--", "mm.txt"]).contains("+GAMMA"));
+        assert!(git_out(p, &["diff", "--", "mm.txt"]).contains("+GAMMA"));
+        // Discard the unstaged GAMMA hunk: the file keeps DELTA and the staged hunks.
+        let s = select(&h, "mm.txt", false, false);
+        assert_eq!(ready(&s).unwrap().file_diff.hunks.len(), 2);
+        let answered = act(&h, &s, ActionKind::Discard, Some(0));
+        assert_eq!(answered.action_error, None);
+        let text = std::fs::read_to_string(p.join("mm.txt")).unwrap();
+        assert!(
+            text.contains("gamma\n") && text.contains("DELTA\n") && text.starts_with("ALPHA\n"),
+            "{text}"
+        );
+        assert!(git_out(p, &["diff", "--cached", "--", "mm.txt"]).contains("+BETA"));
+    }
+
+    #[test]
+    fn a_staged_discard_is_atomic_and_refused_while_the_file_has_unstaged_changes() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let (_rt, h) = start_quiet(p);
+        let s = select(&h, "mm.txt", true, false);
+        let answered = act(&h, &s, ActionKind::Discard, Some(0));
+        let error = answered.action_error.clone().unwrap();
+        assert!(error.contains("does not match index"), "{error}");
+        assert!(answered.action_applied, "git was asked and refused");
+        assert!(git_out(p, &["diff", "--cached", "--", "mm.txt"]).contains("+ALPHA"));
+        assert!(git_out(p, &["diff", "--", "mm.txt"]).contains("+GAMMA"));
+        // A refused form on unchanged content still publishes a fresh Arc.
+        let before = Arc::as_ptr(&arc_of(&s));
+        let fresh = wait_for(
+            &h,
+            "a fresh arc",
+            |n| matches!(&n.diff, DiffState::Ready(d) if d.key.staged && !std::ptr::eq(Arc::as_ptr(d), before)),
+        );
+        assert_eq!(ready(&fresh).unwrap().file_diff.hunks.len(), 2);
+        // Stage the rest, then the discard is clean and removes the hunk from both sides.
+        git(p, &["add", "mm.txt"]);
+        let s = select(&h, "mm.txt", true, false);
+        assert_eq!(ready(&s).unwrap().file_diff.hunks.len(), 4);
+        let answered = act(&h, &s, ActionKind::Discard, Some(1));
+        assert_eq!(answered.action_error, None);
+        assert!(!git_out(p, &["diff", "--cached", "--", "mm.txt"]).contains("+BETA"));
+        assert!(std::fs::read_to_string(p.join("mm.txt"))
+            .unwrap()
+            .contains("beta\n"));
+        assert_eq!(
+            git_out(p, &["status", "--porcelain=v1", "--", "mm.txt"]).trim(),
+            "M  mm.txt"
+        );
+    }
+
+    #[test]
+    fn whole_file_discards_follow_the_row_and_an_md_path_keeps_its_file_absent() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let (_rt, h) = start_quiet(p);
+        // D on the unstaged row of am.txt: the staged creation stays.
+        let s = select(&h, "am.txt", false, false);
+        assert_eq!(
+            act(&h, &s, ActionKind::DiscardFile, None).action_error,
+            None
+        );
+        assert_eq!(
+            git_out(p, &["status", "--porcelain=v1", "--", "am.txt"]).trim(),
+            "A  am.txt"
+        );
+        assert_eq!(std::fs::read_to_string(p.join("am.txt")).unwrap(), "a\n");
+        // D on the staged creation: index entry and file both go.
+        let s = settled(&h, "am.txt", true);
+        assert_eq!(
+            act(&h, &s, ActionKind::DiscardFile, None).action_error,
+            None
+        );
+        assert_eq!(
+            git_out(p, &["status", "--porcelain=v1", "--", "am.txt"]).trim(),
+            ""
+        );
+        assert!(!p.join("am.txt").exists());
+        // d on a worktree deletion recreates the file from the index.
+        let s = select(&h, "del.txt", false, false);
+        assert_eq!(act(&h, &s, ActionKind::Discard, Some(0)).action_error, None);
+        assert_eq!(std::fs::read_to_string(p.join("del.txt")).unwrap(), "d\n");
+        // D on a clean staged deletion: the index has no entry, so --index -R restores entry and file.
+        let s = select(&h, "sdel.txt", true, false);
+        assert_eq!(
+            act(&h, &s, ActionKind::DiscardFile, None).action_error,
+            None
+        );
+        assert_eq!(std::fs::read_to_string(p.join("sdel.txt")).unwrap(), "s\n");
+        assert_eq!(
+            git_out(p, &["status", "--porcelain=v1", "--", "sdel.txt"]).trim(),
+            ""
+        );
+        // s on a staged deletion moves it to the worktree side; D on that unstaged row recreates the file.
+        let s = select(&h, "sdel2.txt", true, false);
+        assert_eq!(act(&h, &s, ActionKind::Stage, Some(0)).action_error, None);
+        assert_eq!(
+            git_out(p, &["status", "--porcelain=v1", "--", "sdel2.txt"]).trim(),
+            "D sdel2.txt"
+        );
+        let s = select(&h, "sdel2.txt", false, false);
+        assert_eq!(
+            act(&h, &s, ActionKind::DiscardFile, None).action_error,
+            None
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("sdel2.txt")).unwrap(),
+            "s2\n"
+        );
+        // MD: staged edit, file removed from the worktree. D on the staged row must not recreate it.
+        std::fs::write(p.join("md.txt"), "m\n").unwrap();
+        git(p, &["add", "md.txt"]);
+        git(p, &["commit", "-q", "-m", "md"]);
+        std::fs::write(p.join("md.txt"), "M\n").unwrap();
+        git(p, &["add", "md.txt"]);
+        std::fs::remove_file(p.join("md.txt")).unwrap();
+        let s = select(&h, "md.txt", true, false);
+        let answered = act(&h, &s, ActionKind::DiscardFile, None);
+        assert_eq!(
+            answered.action_error.as_deref(),
+            Some("md.txt: does not match index")
+        );
+        assert!(!answered.action_applied, "refused before git");
+        assert!(!p.join("md.txt").exists(), "git would have recreated it");
+        assert!(git_out(p, &["diff", "--cached", "--", "md.txt"]).contains("+M"));
+    }
+
+    #[test]
+    fn untracked_rows_are_staged_or_deleted_whole_and_a_binary_one_is_refused() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let (_rt, h) = start_quiet(p);
+        let s = select(&h, "u.txt", false, true);
+        assert_eq!(act(&h, &s, ActionKind::Stage, None).action_error, None);
+        assert_eq!(
+            git_out(p, &["status", "--porcelain=v1", "--", "u.txt"]).trim(),
+            "A  u.txt"
+        );
+        let s = select(&h, "empty.txt", false, true);
+        assert_eq!(ready(&s).unwrap().file_diff.hunks.len(), 0);
+        assert_eq!(act(&h, &s, ActionKind::Stage, None).action_error, None);
+        assert_eq!(
+            git_out(p, &["status", "--porcelain=v1", "--", "empty.txt"]).trim(),
+            "A  empty.txt"
+        );
+        let s = select(&h, "bin.dat", false, true);
+        let answered = act(&h, &s, ActionKind::DiscardFile, None);
+        assert_eq!(
+            answered.action_error.as_deref(),
+            Some(actions::NOTICE_BINARY)
+        );
+        assert!(!answered.action_applied && p.join("bin.dat").exists());
+        std::fs::write(p.join("gone.txt"), "g\n").unwrap();
+        let s = select(&h, "gone.txt", false, true);
+        assert_eq!(act(&h, &s, ActionKind::Discard, Some(0)).action_error, None);
+        assert!(!p.join("gone.txt").exists());
+        // The row is gone; the selection moved to a listed row.
+        let s = settled_any(&h);
+        assert!(s.files.iter().any(|f| Some(FileKey::of(f)) == s.selected));
+    }
+
+    #[test]
+    fn one_hunk_of_a_staged_rename_is_unstaged_and_the_rename_stands() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let (_rt, h) = start_quiet(p);
+        let s = select(&h, "renamed.txt", true, false);
+        assert_eq!(
+            ready(&s).unwrap().file_diff.old_path.as_deref(),
+            Some("ren.txt")
+        );
+        assert_eq!(ready(&s).unwrap().file_diff.hunks.len(), 2);
+        assert_eq!(act(&h, &s, ActionKind::Stage, Some(0)).action_error, None);
+        assert_eq!(
+            git_out(
+                p,
+                &["status", "--porcelain=v1", "--", "ren.txt", "renamed.txt"]
+            )
+            .trim(),
+            "RM ren.txt -> renamed.txt"
+        );
+        assert!(git_out(p, &["diff", "--cached", "-M"]).contains("rename from ren.txt"));
+        assert!(git_out(p, &["diff", "--", "renamed.txt"]).contains("+ONE"));
+    }
+
+    #[test]
+    fn a_type_change_row_is_discarded_whole() {
+        let dir = action_fixture();
+        let p = dir.path();
+        std::fs::remove_file(p.join("del.txt")).ok();
+        std::os::unix::fs::symlink("u.txt", p.join("del.txt")).unwrap();
+        let (_rt, h) = start_quiet(p);
+        let s = select(&h, "del.txt", false, false);
+        assert_eq!(
+            ready(&s).unwrap().file_diff.hunks.len(),
+            2,
+            "a deletion and a creation"
+        );
+        assert_eq!(
+            act(&h, &s, ActionKind::DiscardFile, None).action_error,
+            None
+        );
+        assert!(p.join("del.txt").symlink_metadata().unwrap().is_file());
+        assert_eq!(std::fs::read_to_string(p.join("del.txt")).unwrap(), "d\n");
+    }
+
+    #[test]
+    fn every_act_is_answered_once_and_the_refusals_run_no_git() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let (_rt, h) = start_quiet(p);
+        let s = select(&h, "mm.txt", false, false);
+        // Out of range: the engine decides eligibility itself.
+        let a = act(&h, &s, ActionKind::Stage, Some(9));
+        assert_eq!(
+            (a.action_seq, a.action_error.as_deref(), a.action_applied),
+            (1, Some(actions::NOTICE_NO_HUNK), false)
+        );
+        // Scope: a diff really published in branch scope (the fixture's base is refs/heads/main).
+        h.commands.send(Command::SetScope(Scope::Branch)).unwrap();
+        let b = wait_for(&h, "branch diff", |n| {
+            n.scope == Scope::Branch && ready(n).is_some() && !n.refreshing
+        });
+        let a = act(&h, &b, ActionKind::DiscardFile, None);
+        assert_eq!(
+            (a.action_seq, a.action_error.as_deref()),
+            (2, Some(actions::NOTICE_SCOPE))
+        );
+        h.commands.send(Command::SetScope(Scope::Worktree)).unwrap();
+        wait_for(&h, "worktree back", |n| {
+            n.scope == Scope::Worktree && !n.refreshing
+        });
+        let s = select(&h, "mm.txt", false, false);
+        let diff = arc_of(&s);
+        // A stale Arc: a clone with the same content is not the published one.
+        h.commands
+            .send(Command::Act(Action {
+                kind: ActionKind::Stage,
+                diff: Arc::new((*diff).clone()),
+                hunk: Some(0),
+            }))
+            .unwrap();
+        let a = wait_for(&h, "stale answer", |n| n.action_seq == 3);
+        assert_eq!(a.action_error.as_deref(), Some(actions::NOTICE_CHANGED));
+        assert!(
+            git_out(p, &["diff", "--cached", "--", "mm.txt"]).contains("+ALPHA")
+                && !git_out(p, &["diff", "--cached"]).contains("+GAMMA")
+        );
+        // Two in a row: the second is answered without git while the first is queued or in flight.
+        let first = Action {
+            kind: ActionKind::Stage,
+            diff: diff.clone(),
+            hunk: Some(0),
+        };
+        h.commands.send(Command::Act(first.clone())).unwrap();
+        h.commands
+            .send(Command::Act(Action {
+                hunk: Some(1),
+                ..first
+            }))
+            .unwrap();
+        let _ = wait_for(&h, "both answered", |n| n.action_seq == 5);
+        // One of the two applied GAMMA, the other was refused as running; the index holds exactly one new hunk.
+        let cached = git_out(p, &["diff", "--cached", "--", "mm.txt"]);
+        assert!(
+            cached.contains("+GAMMA") && !cached.contains("+DELTA"),
+            "{cached}"
+        );
+    }
+
+    #[test]
+    fn an_acted_on_arc_is_refused_until_its_replacement_arrives() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let gate = Arc::new(Semaphore::new(0));
+        let (_rt, h) = start_gated(p, gate.clone());
+        gate.add_permits(1);
+        wait_for(&h, "first", |s| ready(s).is_some());
+        gate.add_permits(2); // `select` requests the diff twice: once for its Refresh, once for the Select
+                             // A hunk of mm.txt's unstaged row: the row survives (DELTA stays), so 3.3 keeps Ready(old) on screen.
+        let s = select(&h, "mm.txt", false, false);
+        let diff = arc_of(&s);
+        // The reload the carrying refresh requests waits at the gate, so the acted Arc stays published.
+        h.commands
+            .send(Command::Act(Action {
+                kind: ActionKind::Stage,
+                diff: diff.clone(),
+                hunk: Some(0),
+            }))
+            .unwrap();
+        let a = wait_for(&h, "answered", |n| n.action_seq == 1);
+        assert_eq!((a.action_error.as_deref(), a.action_applied), (None, true));
+        assert!(
+            matches!(&a.diff, DiffState::Ready(d) if Arc::ptr_eq(d, &diff)),
+            "the old Arc is still published"
+        );
+        h.commands
+            .send(Command::Act(Action {
+                kind: ActionKind::Stage,
+                diff: diff.clone(),
+                hunk: Some(0),
+            }))
+            .unwrap();
+        let a = wait_for(&h, "the acted arc's answer", |n| n.action_seq == 2);
+        assert_eq!(
+            (a.action_error.as_deref(), a.action_applied),
+            (Some(actions::NOTICE_CHANGED), false)
+        );
+        let cached = git_out(p, &["diff", "--cached", "--", "mm.txt"]);
+        assert!(
+            cached.contains("+GAMMA") && !cached.contains("+DELTA"),
+            "staged once: {cached}"
+        );
+        gate.add_permits(1);
+        wait_for(
+            &h,
+            "a fresh arc",
+            |n| matches!(&n.diff, DiffState::Ready(d) if !Arc::ptr_eq(d, &diff)),
+        );
+    }
+
+    #[test]
+    fn a_second_act_while_one_is_queued_is_answered_without_git() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let gate = Arc::new(Semaphore::new(0));
+        let (_rt, h) = start_gated(p, gate.clone());
+        gate.add_permits(1);
+        wait_for(&h, "first", |s| ready(s).is_some());
+        gate.add_permits(2); // `select` requests the diff twice: once for its Refresh, once for the Select
+        let s = select(&h, "mm.txt", false, false);
+        let diff = arc_of(&s);
+        // No permit is left: the first action's reload will wait at the gate, which holds it in flight.
+        let before = h.refreshes.load(Ordering::SeqCst);
+        h.commands
+            .send(Command::Act(Action {
+                kind: ActionKind::Stage,
+                diff: diff.clone(),
+                hunk: Some(0),
+            }))
+            .unwrap();
+        h.commands
+            .send(Command::Act(Action {
+                kind: ActionKind::Stage,
+                diff: diff.clone(),
+                hunk: Some(1),
+            }))
+            .unwrap();
+        let second = wait_for(&h, "the running refusal", |n| {
+            n.action_error.as_deref() == Some(actions::NOTICE_RUNNING)
+        });
+        assert_eq!(
+            second.action_seq, 1,
+            "the refusal is answered first, without a refresh"
+        );
+        gate.add_permits(1);
+        let first = wait_for(&h, "the first answer", |n| n.action_seq == 2);
+        assert_eq!(first.action_error, None);
+        assert!(h.refreshes.load(Ordering::SeqCst) - before >= 1);
+    }
+
+    #[test]
+    fn a_pre_image_that_changed_refuses_the_form_before_git() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let (_rt, h) = start_quiet(p);
+        let s = select(&h, "mm.txt", false, false);
+        // The watcher never emits and the poll is an hour away (`start_quiet`): the engine does not see this edit.
+        let ctx = "c1\nc2\nc3\nc4\nc5\nc6\nc7\n";
+        std::fs::write(
+            p.join("mm.txt"),
+            format!("ALPHA\n{ctx}BETA\n{ctx}GAMMA\n{ctx}DELTA\nextra\n"),
+        )
+        .unwrap();
+        let a = act(&h, &s, ActionKind::Discard, Some(0));
+        assert_eq!(a.action_error.as_deref(), Some(actions::NOTICE_CHANGED));
+        assert!(!a.action_applied);
+        assert!(std::fs::read_to_string(p.join("mm.txt"))
+            .unwrap()
+            .contains("GAMMA\n"));
+        // A `--cached` form reads the index: an index change refuses it the same way.
+        let s = select(&h, "mm.txt", false, false);
+        assert!(ready(&s).unwrap().raw_diff.contains("+extra"));
+        git(p, &["add", "mm.txt"]);
+        let a = act(&h, &s, ActionKind::Stage, Some(0));
+        assert_eq!(a.action_error.as_deref(), Some(actions::NOTICE_CHANGED));
+    }
+
+    #[test]
+    fn a_working_tree_form_on_a_directory_is_refused() {
+        let dir = action_fixture();
+        let p = dir.path();
+        std::fs::write(p.join("tools"), "x\n").unwrap();
+        git(p, &["add", "tools"]);
+        git(p, &["commit", "-q", "-m", "tools"]);
+        git(p, &["rm", "-q", "tools"]);
+        std::fs::create_dir(p.join("tools")).unwrap();
+        std::fs::write(p.join("tools/run"), "r\n").unwrap();
+        git(p, &["add", "tools/run"]);
+        let (_rt, h) = start_quiet(p);
+        let s = select(&h, "tools", true, false);
+        assert_eq!(
+            ready(&s)
+                .unwrap()
+                .pre_image
+                .as_ref()
+                .map(|i| i.worktree.clone()),
+            Some(WorktreeKind::Directory)
+        );
+        let a = act(&h, &s, ActionKind::DiscardFile, None);
+        assert_eq!(a.action_error.as_deref(), Some(actions::NOTICE_NOT_A_FILE));
+        assert!(!a.action_applied && p.join("tools/run").exists());
+        // The index-only form needs no file, but git refuses an index holding both `tools2` and a
+        // descendant, so the restore is shown on a fixture whose descendant is untracked.
+        std::fs::write(p.join("tools2"), "y\n").unwrap();
+        git(p, &["add", "tools2"]);
+        git(p, &["commit", "-q", "-m", "tools2"]);
+        git(p, &["rm", "-q", "tools2"]);
+        std::fs::create_dir(p.join("tools2")).unwrap();
+        std::fs::write(p.join("tools2/run"), "r\n").unwrap();
+        let s = select(&h, "tools2", true, false);
+        assert_eq!(act(&h, &s, ActionKind::Stage, Some(0)).action_error, None);
+        assert!(git_out(p, &["ls-files", "--", "tools2"]).trim() == "tools2");
+    }
+
+    #[test]
+    fn an_edit_during_the_diff_read_leaves_no_pre_image_and_refuses_the_key() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let gate = Arc::new(Semaphore::new(0));
+        let (_rt, h) = start_gated(p, gate.clone());
+        gate.add_permits(1);
+        wait_for(&h, "first", |s| ready(s).is_some());
+        gate.add_permits(2);
+        let s = select(&h, "u.txt", false, true);
+        assert!(ready(&s).unwrap().pre_image.is_some());
+        // The reload takes its first pre-image reading, then waits at the gate before the diff:
+        // the edit lands between the two readings, provably.
+        let readings = h.pre_images.load(Ordering::SeqCst);
+        h.commands.send(Command::Refresh).unwrap();
+        wait_until(|| (h.pre_images.load(Ordering::SeqCst) > readings).then_some(()));
+        std::fs::write(p.join("u.txt"), "u\nmore\n").unwrap();
+        gate.add_permits(1);
+        let s = wait_for(&h, "the reload", |n| {
+            !n.refreshing && ready(n).is_some_and(|d| d.raw_diff.contains("+more"))
+        });
+        assert!(
+            ready(&s).unwrap().pre_image.is_none(),
+            "the two readings disagreed"
+        );
+        let a = act(&h, &s, ActionKind::Stage, None);
+        assert_eq!(
+            (a.action_error.as_deref(), a.action_applied),
+            (Some(actions::NOTICE_CHANGED), false)
+        );
+        // The next reload, with nothing moving, carries a pre-image again. Three permits: the
+        // refused action's carrying refresh reloads the row too, before `select`'s two.
+        gate.add_permits(3);
+        let s = select(&h, "u.txt", false, true);
+        assert!(ready(&s).unwrap().pre_image.is_some());
+        gate.add_permits(1); // the carrying refresh's reload
+        assert_eq!(act(&h, &s, ActionKind::Stage, None).action_error, None);
+    }
+
+    #[test]
+    fn an_index_lock_is_retried_and_given_up_after_two_seconds() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let (_rt, h) = start_quiet(p);
+        let s = select(&h, "u.txt", false, true);
+        // Held for half a second: the retry absorbs it.
+        std::fs::write(p.join(".git/index.lock"), "").unwrap();
+        let lock = p.join(".git/index.lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            std::fs::remove_file(lock).unwrap();
+        });
+        let started = Instant::now();
+        let a = act(&h, &s, ActionKind::Stage, None);
+        release.join().unwrap();
+        assert_eq!(a.action_error, None);
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "the first attempt must have hit the lock"
+        );
+        assert!(git_out(p, &["ls-files", "--", "u.txt"]).contains("u.txt"));
+        // Held past the bound: git's own message, after two seconds.
+        std::fs::write(p.join("v.txt"), "v\n").unwrap();
+        let s = select(&h, "v.txt", false, true);
+        std::fs::write(p.join(".git/index.lock"), "").unwrap();
+        let started = Instant::now();
+        let a = act(&h, &s, ActionKind::Stage, None);
+        std::fs::remove_file(p.join(".git/index.lock")).unwrap();
+        assert!(
+            a.action_error
+                .as_deref()
+                .is_some_and(|e| e.contains("index.lock")),
+            "{:?}",
+            a.action_error
+        );
+        assert!(a.action_applied);
+        assert!(started.elapsed() >= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_diff_read_before_the_action_is_never_published_after_it() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = spawn(
+            rt.handle(),
+            SessionConfig {
+                scope: Scope::Worktree,
+                base_ref: None,
+                state_dir: None,
+                path: p.to_path_buf(),
+                poll_interval: Duration::from_secs(3600),
+                watcher: Arc::new(FlakyWatcher {
+                    allow: Arc::new(AtomicBool::new(true)),
+                }),
+                git_check: ok_git(),
+                diff_delay: Some(Duration::from_millis(400)),
+                diff_gate: None,
+                status_delay: None,
+            },
+        );
+        let s = select(&h, "u.txt", false, true);
+        let diff = arc_of(&s);
+        let discarded_before = h.diffs_discarded.load(Ordering::SeqCst);
+        // A slow reload of the row is in flight when the action is queued.
+        h.commands.send(Command::Refresh).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        h.commands
+            .send(Command::Act(Action {
+                kind: ActionKind::Stage,
+                diff,
+                hunk: None,
+            }))
+            .unwrap();
+        let answered = wait_for(&h, "answered", |n| n.action_seq == 1);
+        assert_eq!(answered.action_error, None);
+        let after = wait_for(&h, "the post-action diff", |n| {
+            !n.refreshing && ready(n).is_some_and(|d| d.key.path == "u.txt" && d.key.staged)
+        });
+        assert!(
+            h.diffs_discarded.load(Ordering::SeqCst) > discarded_before,
+            "the pre-action read was published"
+        );
+        assert!(ready(&after).unwrap().raw_diff.contains("+u"));
+    }
+
+    #[test]
+    fn an_act_outside_a_repository_is_answered_not_a_git_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, h) = start_quiet(dir.path());
+        let s = wait_for(&h, "not a repo", |s| {
+            matches!(s.repo, RepoState::NotARepo { .. })
+        });
+        let diff = Arc::new(LoadedDiff::build(
+            FileKey {
+                path: "x".into(),
+                staged: false,
+                untracked: true,
+            },
+            Comparison::Worktree,
+            None,
+            crate::git::GetGitDiffResponse {
+                file_diff: crate::git::FileDiff {
+                    file_path: "x".into(),
+                    old_path: None,
+                    new_path: None,
+                    hunks: Vec::new(),
+                },
+                old_text: String::new(),
+                new_text: String::new(),
+                raw_diff: String::new(),
+                repo_root: String::new(),
+            },
+            Vec::new(),
+            None,
+        ));
+        h.commands
+            .send(Command::Act(Action {
+                kind: ActionKind::Stage,
+                diff,
+                hunk: None,
+            }))
+            .unwrap();
+        let a = wait_for(&h, "answer", |n| n.action_seq == 1);
+        assert_eq!(
+            a.action_error.as_deref(),
+            Some("the diff changed; look again"),
+            "no diff is published, so identity fails first; {}",
+            s.revision
+        );
+    }
+
+    #[test]
+    fn a_mark_and_an_action_queued_together_answer_in_order() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let (_rt, h) = start_quiet(p);
+        let s = select(&h, "u.txt", false, true);
+        let head = git_out(p, &["rev-parse", "HEAD"]).trim().to_string();
+        let diff = arc_of(&s);
+        h.commands.send(Command::MarkReviewed(head)).unwrap();
+        h.commands
+            .send(Command::Act(Action {
+                kind: ActionKind::Stage,
+                diff,
+                hunk: None,
+            }))
+            .unwrap();
+        let s = wait_for(&h, "both", |n| n.mark_seq == 1 && n.action_seq == 1);
+        assert_eq!(s.action_error, None);
+        assert_eq!(
+            s.mark_error.as_deref(),
+            Some("mark not remembered: no state directory")
+        );
+    }
+
+    #[test]
+    fn the_watchers_trigger_for_the_actions_writes_coalesces() {
+        let dir = action_fixture();
+        let p = dir.path();
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = spawn(
+            rt.handle(),
+            SessionConfig {
+                scope: Scope::Worktree,
+                base_ref: None,
+                state_dir: None,
+                path: p.to_path_buf(),
+                poll_interval: Duration::from_secs(3600),
+                watcher: Arc::new(EmittingWatcher { sink: slot.clone() }),
+                git_check: ok_git(),
+                diff_delay: None,
+                diff_gate: None,
+                // Every refresh, the carrying one included, stays in flight 400 ms after its forms.
+                status_delay: Some(Duration::from_millis(400)),
+            },
+        );
+        let s = select(&h, "u.txt", false, true);
+        let sink = wait_until(|| slot.lock().unwrap().clone());
+        let before = h.refreshes.load(Ordering::SeqCst);
+        let diff = arc_of(&s);
+        h.commands
+            .send(Command::Act(Action {
+                kind: ActionKind::Stage,
+                diff,
+                hunk: None,
+            }))
+            .unwrap();
+        // The carrying refresh has started and is held: the events land while it is in flight.
+        wait_until(|| (h.refreshes.load(Ordering::SeqCst) > before).then_some(()));
+        for _ in 0..5 {
+            sink.emit_json("git-status-changed", serde_json::json!({ "cwds": [] }))
+                .unwrap();
+        }
+        let answered = wait_for(&h, "answered", |n| n.action_seq == 1);
+        assert_eq!(answered.action_error, None);
+        let settled = wait_for(&h, "settled", |n| !n.refreshing && n.action_seq == 1);
+        std::thread::sleep(Duration::from_millis(600)); // long enough for any extra refresh to start
+        let runs = h.refreshes.load(Ordering::SeqCst) - before;
+        assert_eq!(
+            runs, 2,
+            "the carrying refresh and exactly one follow-up for five events"
+        );
+        assert_eq!(settled.action_seq, 1, "answered once");
     }
 }

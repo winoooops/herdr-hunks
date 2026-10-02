@@ -237,6 +237,32 @@ impl LoadedDiff {
     }
 }
 
+/// What the key means; the row gives the direction (spec 9.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    Stage,
+    Discard,
+    DiscardFile,
+}
+
+/// A confirmed action against the very diff the box was opened on.
+#[derive(Debug, Clone)]
+pub struct Action {
+    pub kind: ActionKind,
+    /// The diff the box was opened on.
+    pub diff: Arc<LoadedDiff>,
+    /// The hunk under the cursor; `None` for `DiscardFile` and for every untracked row.
+    pub hunk: Option<usize>,
+}
+
+impl PartialEq for Action {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.hunk == other.hunk && Arc::ptr_eq(&self.diff, &other.diff)
+    }
+}
+
+impl Eq for Action {}
+
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub revision: u64,
@@ -275,6 +301,11 @@ pub struct Snapshot {
     /// Bumped once per answered `MarkReviewed`; `mark_error` is that answer.
     pub mark_seq: u64,
     pub mark_error: Option<String>,
+    /// Bumped once per answered `Act`; `action_error` and `action_applied` are that answer.
+    pub action_seq: u64,
+    pub action_error: Option<String>,
+    /// Whether any `apply` form ran for the answered `Act`.
+    pub action_applied: bool,
 }
 
 impl Snapshot {
@@ -307,6 +338,9 @@ impl Snapshot {
             pick_error: None,
             mark_seq: 0,
             mark_error: None,
+            action_seq: 0,
+            action_error: None,
+            action_applied: false,
         }
     }
 }
@@ -325,6 +359,8 @@ pub enum Command {
     MarkReviewed(String),
     /// Answer with `refs` and this opening's token on the snapshot.
     LoadRefs(u64),
+    /// Run the apply forms of spec 9.2 for this confirmed action; answered on `action_seq`.
+    Act(Action),
     Shutdown,
 }
 

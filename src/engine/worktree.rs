@@ -96,18 +96,19 @@ pub(crate) async fn diff(
 /// The index entry and the working-tree kind at `path`, both read now.
 pub(crate) async fn pre_image(toplevel: &str, path: &str) -> Result<PreImage, String> {
     validate_file_path(path)?;
-    let listed = base::git(toplevel, &["ls-files", "-s", "--", path]).await?;
+    let listed = base::git(toplevel, &["ls-files", "-s", "-z", "--", path]).await?;
     if !listed.status.success() {
         return Err(format!(
             "git ls-files failed: {}",
             String::from_utf8_lossy(&listed.stderr).trim()
         ));
     }
+    // A pathspec matches its descendants too: only the record for this very path counts.
     let index = String::from_utf8_lossy(&listed.stdout)
-        .lines()
-        .next()
-        .and_then(|line| line.split('\t').next())
-        .map(str::to_string);
+        .split('\0')
+        .filter_map(|record| record.split_once('\t'))
+        .find(|(_, name)| *name == path)
+        .map(|(entry, _)| entry.to_string());
     let full = std::path::Path::new(toplevel).join(path);
     let worktree = match std::fs::symlink_metadata(&full) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => WorktreeKind::Absent,
@@ -161,6 +162,12 @@ pub(crate) async fn untracked_diff(
         untracked: true,
     };
     diff(toplevel, &key, None).await
+}
+
+/// The parser other modules' tests build a `LoadedDiff` with.
+#[cfg(test)]
+pub(crate) fn parse_for_tests(patch: &[u8], path: &str) -> FileDiff {
+    parse_sections(patch, path)
 }
 
 #[cfg(test)]
@@ -406,6 +413,10 @@ mod tests {
         assert_eq!(response.file_diff.hunks.len(), 1);
         assert_eq!(response.file_diff.hunks[0].lines.len(), 1, "only `-x`");
         assert!(!response.raw_diff.contains("tools/run"));
+        // The index holds tools/run, not tools: the pre-image must not borrow the descendant's entry.
+        let pre = rt().block_on(pre_image(&toplevel, "tools")).unwrap();
+        assert_eq!(pre.index, None);
+        assert_eq!(pre.worktree, WorktreeKind::Directory);
     }
 
     #[test]
