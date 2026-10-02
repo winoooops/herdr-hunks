@@ -3974,3 +3974,44 @@ carrying refresh so the watcher test can require exactly one follow-up. The roun
 here, as the brief says they do once the findings are no longer structural.
 
 <!-- codex-reviewed: 2026-10-02T05:07:07Z -->
+
+## Execution notes
+
+Appended by the orchestrator as the tasks were executed (2026-10-01 to 2026-10-02), one
+coder agent per task in a herdr pane, every gate run outside its sandbox, every commit made
+by the orchestrator, every fix falsified by hand before it counted.
+
+- **Task 1** (`d1fd7a8`). As planned, with the K6 count made deterministic by a 1.8 s settle
+  before reading `head_samples`: with the lane's check in place two tasks sample, without it
+  five. `request_diff` and `run` carry `#[allow(clippy::too_many_arguments)]` rather than a
+  parameter struct. `status_delay` reaches `Job` through `State`.
+- **Task 2** (`48ecbe2`). Patch 0004 omits the `diff --git`/`index` lines like 0001-0003. The
+  K1-K7 bullets keep their descriptions and gain a closing sentence each.
+- **Task 3** (`91b35d4`). `classify` scans header lines only: a section without hunks is all
+  header. The real-file apply test proves each slice applies alone; the string test pins the
+  recount.
+- **Task 4** (`fc1fe63`). The `select` helper refreshes first and then takes the engine's last
+  settled snapshot, because the refresh's own reload can publish the key before the `Select`
+  does. `pre_image` lists with `-z` and keeps only the record whose path equals the requested
+  path, so a directory in a file's place records no index entry (an orchestrator fix, asserted
+  on the K7 fixture). The acted-Arc falsification hangs rather than mis-answers when the
+  `diff_gate` seam holds the lane; a seam artefact.
+- **Task 5** (`e9a1a19`). As planned; the chip-count test counts ten chips at 160 columns and the
+  unbound-key probe moved from `s` to `x`.
+- **Task 6** (`105f18b`). The recording fixture gives the gitlink an empty directory so git
+  prints `A  sub`, and its "index untouched" assertions compare `ls-files -s` entries rather
+  than the index bytes: after the viewer's own `apply --cached`, git's next `diff --numstat`
+  refreshes the stat data of the entries it wrote and rewrites the index, which
+  `GIT_OPTIONAL_LOCKS=0` does not guard. Recorded in `PORT-SURFACE.md` under D3. Tier B passed
+  against isolated servers of both hosts (herdr 0.8.0, vimeflow 0.8.0).
+- **Acceptance** (`b3ef4ba`). Row 9 recorded from a scripted session in a herdr pane on a
+  scratch repository; the evidence is in the acceptance file. Two of the orchestrator's key
+  presses landed on neighbouring rows and acted on them correctly, which is why the session
+  navigates by the files panel's selected line rather than by counted key presses.
+- **Codex round 1** (`efbf034`). Three defects, all real: a `Select` after the pop could spawn
+  a diff that read pre-mutation content and was published after the answer as a fresh Arc
+  (fixed: no diff task starts while an action is queued or carried); a forward slice of a
+  rename rewrote its header and so could not stage one hunk of an intent-to-add rename
+  (fixed: the rewrite is for reverse forms only); the sibling rule overrode a selection made
+  during the carrying refresh (fixed: it follows the acted row only when it was still
+  selected). Spec 9.2 and 9.4 amended in the same commit.
