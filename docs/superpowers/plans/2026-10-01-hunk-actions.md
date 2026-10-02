@@ -126,7 +126,10 @@ pub(crate) async fn pre_image(toplevel: &str, path: &str) -> Result<PreImage, St
 pub(crate) async fn rename_sources(toplevel: &str) -> BTreeMap<(String, bool), String>;
 pub fn hash_bytes(bytes: &[u8]) -> u64;
 
-// src/engine/session.rs: EngineHandle is unchanged; SessionConfig is unchanged (the lane is internal).
+// src/engine/session.rs: EngineHandle gains one test hook beside head_samples:
+pub pre_images: Arc<AtomicUsize>,   // pre-image readings taken by diff tasks (two per worktree-scope diff)
+// SessionConfig gains one test seam beside diff_delay (None in production, Task 4 uses it):
+pub status_delay: Option<Duration>, // run_job sleeps this long after the forms and before its status read
 ```
 
 The diff task looks a rename up by the row's side, as spec 9.2 says: for an `RM` path the staged row's patch names `a/old b/new` and needs `-M old new`, while the unstaged row's names `a/new b/new` and must not be given `old`, or the cutter drops it. The panel's display map (`Snapshot.rename_sources`, path to source, which `view.rs:361` reads) is the side map flattened.
@@ -646,7 +649,7 @@ In `session.rs`, add to `State` two fields, created in `run`'s `State { .. }` li
     latest_generation: Arc<std::sync::atomic::AtomicU64>,
 ```
 
-initialised as `Arc::new(Semaphore::new(1))` and `Arc::new(AtomicU64::new(0))`. In `request_diff`, after `self.diff_generation += 1;` add `self.latest_generation.store(self.diff_generation, Ordering::SeqCst);`, clone `lane = self.diff_lane.clone()`, `latest = self.latest_generation.clone()` and `diffs_discarded` (add it as a parameter: `discarded: &Arc<AtomicUsize>`; the three call sites pass `&diffs_discarded`), and replace the spawned block with:
+initialised as `Arc::new(Semaphore::new(1))` and `Arc::new(AtomicU64::new(0))`. In `request_diff`, after `self.diff_generation += 1;` add `self.latest_generation.store(self.diff_generation, Ordering::SeqCst);`, clone `lane = self.diff_lane.clone()`, `latest = self.latest_generation.clone()` and `diffs_discarded` (add it as a parameter: `discarded: &Arc<AtomicUsize>`; the three call sites pass `&diffs_discarded`), add the `pre_images` counter the same way `head_samples` is threaded (a field of `EngineHandle`, created in `spawn`, passed to `run` and to `request_diff`), add `status_delay: Option<Duration>` to `SessionConfig` (`None` in `production` and in every test literal) and to `Job`, applied in `run_job` after the forms and before `git_status_inner` (`if let Some(d) = job.status_delay { tokio::time::sleep(d).await; }`), and replace the spawned block with:
 
 ```rust
         tokio::spawn(async move {
@@ -665,6 +668,7 @@ initialised as `Arc::new(Semaphore::new(1))` and `Arc::new(AtomicU64::new(0))`. 
                 Comparison::Worktree => worktree::pre_image(&toplevel, &key.path).await.ok(),
                 Comparison::Branch { .. } => None,
             };
+            pre_images.fetch_add(1, Ordering::SeqCst);
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
@@ -682,6 +686,7 @@ initialised as `Arc::new(Semaphore::new(1))` and `Arc::new(AtomicU64::new(0))`. 
                 Comparison::Worktree => worktree::pre_image(&toplevel, &key.path).await.ok(),
                 Comparison::Branch { .. } => None,
             };
+            pre_images.fetch_add(1, Ordering::SeqCst);
             // Kept only when both readings agree; a disagreement means an edit landed mid-read.
             let pre_image = match (pre, post) {
                 (Some(a), Some(b)) if a == b => Some(a),
@@ -757,6 +762,7 @@ Add to `session.rs` tests, after `rapid_selection_does_not_wait_for_superseded_d
                 git_check: ok_git(),
                 diff_delay: Some(Duration::from_millis(300)),
                 diff_gate: None,
+                status_delay: None,
             },
         );
         wait_for(&h, "first", |s| ready(s).is_some());
@@ -1995,7 +2001,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
             scope: Scope::Worktree, base_ref: None, state_dir: None, path: dir.to_path_buf(),
             poll_interval: Duration::from_secs(3600),
             watcher: Arc::new(FlakyWatcher { allow: Arc::new(AtomicBool::new(true)) }),
-            git_check: ok_git(), diff_delay: None, diff_gate: None,
+            git_check: ok_git(), diff_delay: None, diff_gate: None, status_delay: None,
         });
         (rt, handle)
     }
@@ -2233,7 +2239,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
             scope: Scope::Worktree, base_ref: None, state_dir: None, path: p.to_path_buf(),
             poll_interval: Duration::from_secs(3600),
             watcher: Arc::new(FlakyWatcher { allow: Arc::new(AtomicBool::new(true)) }),
-            git_check: ok_git(), diff_delay: None, diff_gate: Some(gate.clone()),
+            git_check: ok_git(), diff_delay: None, diff_gate: Some(gate.clone()), status_delay: None,
         });
         gate.add_permits(1);
         wait_for(&h, "first", |s| ready(s).is_some());
@@ -2265,7 +2271,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
             scope: Scope::Worktree, base_ref: None, state_dir: None, path: p.to_path_buf(),
             poll_interval: Duration::from_secs(3600),
             watcher: Arc::new(FlakyWatcher { allow: Arc::new(AtomicBool::new(true)) }),
-            git_check: ok_git(), diff_delay: None, diff_gate: Some(gate.clone()),
+            git_check: ok_git(), diff_delay: None, diff_gate: Some(gate.clone()), status_delay: None,
         });
         gate.add_permits(1);
         wait_for(&h, "first", |s| ready(s).is_some());
@@ -2339,30 +2345,35 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
     fn an_edit_during_the_diff_read_leaves_no_pre_image_and_refuses_the_key() {
         let dir = action_fixture();
         let p = dir.path();
+        let gate = Arc::new(Semaphore::new(0));
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         let h = spawn(rt.handle(), SessionConfig {
             scope: Scope::Worktree, base_ref: None, state_dir: None, path: p.to_path_buf(),
             poll_interval: Duration::from_secs(3600),
             watcher: Arc::new(FlakyWatcher { allow: Arc::new(AtomicBool::new(true)) }),
-            git_check: ok_git(), diff_delay: Some(Duration::from_millis(400)), diff_gate: None,
+            git_check: ok_git(), diff_delay: None, diff_gate: Some(gate.clone()), status_delay: None,
         });
+        gate.add_permits(1);
+        wait_for(&h, "first", |s| ready(s).is_some());
+        gate.add_permits(2);
         let s = select(&h, "u.txt", false, true);
         assert!(ready(&s).unwrap().pre_image.is_some());
-        // The reload sleeps 400 ms between its first pre-image reading and the diff. The opening head
-        // sample precedes that reading by microseconds, so once `head_samples` has advanced the task
-        // is inside its delay, and the edit lands between the two readings.
-        let samples = h.head_samples.load(Ordering::SeqCst);
+        // The reload takes its first pre-image reading, then waits at the gate before the diff:
+        // the edit lands between the two readings, provably.
+        let readings = h.pre_images.load(Ordering::SeqCst);
         h.commands.send(Command::Refresh).unwrap();
-        wait_until(|| (h.head_samples.load(Ordering::SeqCst) > samples).then_some(()));
-        std::thread::sleep(Duration::from_millis(50));
+        wait_until(|| (h.pre_images.load(Ordering::SeqCst) > readings).then_some(()));
         std::fs::write(p.join("u.txt"), "u\nmore\n").unwrap();
+        gate.add_permits(1);
         let s = wait_for(&h, "the reload", |n| !n.refreshing && ready(n).is_some_and(|d| d.raw_diff.contains("+more")));
         assert!(ready(&s).unwrap().pre_image.is_none(), "the two readings disagreed");
         let a = act(&h, &s, ActionKind::Stage, None);
         assert_eq!((a.action_error.as_deref(), a.action_applied), (Some(actions::NOTICE_CHANGED), false));
         // The next reload, with nothing moving, carries a pre-image again.
-        h.commands.send(Command::Refresh).unwrap();
-        let s = wait_for(&h, "settled reload", |n| !n.refreshing && ready(n).is_some_and(|d| d.pre_image.is_some()));
+        gate.add_permits(2);
+        let s = select(&h, "u.txt", false, true);
+        assert!(ready(&s).unwrap().pre_image.is_some());
+        gate.add_permits(1); // the carrying refresh's reload
         assert_eq!(act(&h, &s, ActionKind::Stage, None).action_error, None);
     }
 
@@ -2406,7 +2417,7 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
             scope: Scope::Worktree, base_ref: None, state_dir: None, path: p.to_path_buf(),
             poll_interval: Duration::from_secs(3600),
             watcher: Arc::new(FlakyWatcher { allow: Arc::new(AtomicBool::new(true)) }),
-            git_check: ok_git(), diff_delay: Some(Duration::from_millis(400)), diff_gate: None,
+            git_check: ok_git(), diff_delay: Some(Duration::from_millis(400)), diff_gate: None, status_delay: None,
         });
         let s = select(&h, "u.txt", false, true);
         let diff = match &s.diff { DiffState::Ready(d) => d.clone(), _ => unreachable!() };
@@ -2466,23 +2477,26 @@ In `session.rs`'s test module, add a fixture with every row kind and a helper th
             poll_interval: Duration::from_secs(3600),
             watcher: Arc::new(EmittingWatcher { sink: slot.clone() }),
             git_check: ok_git(), diff_delay: None, diff_gate: None,
+            // Every refresh, the carrying one included, stays in flight 400 ms after its forms.
+            status_delay: Some(Duration::from_millis(400)),
         });
         let s = select(&h, "u.txt", false, true);
         let sink = wait_until(|| slot.lock().unwrap().clone());
         let before = h.refreshes.load(Ordering::SeqCst);
         let diff = match &s.diff { DiffState::Ready(d) => d.clone(), _ => unreachable!() };
         h.commands.send(Command::Act(Action { kind: ActionKind::Stage, diff, hunk: None })).unwrap();
-        // The events arrive while the carrying refresh is in flight.
+        // The carrying refresh has started and is held: the events land while it is in flight.
         wait_until(|| (h.refreshes.load(Ordering::SeqCst) > before).then_some(()));
         for _ in 0..5 {
             sink.emit_json("git-status-changed", serde_json::json!({ "cwds": [] })).unwrap();
         }
         let answered = wait_for(&h, "answered", |n| n.action_seq == 1);
         assert_eq!(answered.action_error, None);
-        std::thread::sleep(Duration::from_millis(800));
+        let settled = wait_for(&h, "settled", |n| !n.refreshing && n.action_seq == 1);
+        std::thread::sleep(Duration::from_millis(600)); // long enough for any extra refresh to start
         let runs = h.refreshes.load(Ordering::SeqCst) - before;
-        assert!((1..=2).contains(&runs), "the carrying refresh and at most one follow-up, got {runs}");
-        assert_eq!(wait_for(&h, "settled", |n| !n.refreshing).action_seq, 1, "answered once");
+        assert_eq!(runs, 2, "the carrying refresh and exactly one follow-up for five events");
+        assert_eq!(settled.action_seq, 1, "answered once");
     }
 ```
 
@@ -2922,7 +2936,9 @@ mod tests {
         let lines = dialog::render(&panel, 40, 8);
         assert_eq!(lines.len(), 8);
         let text: Vec<String> = lines.iter().map(|l| l.iter().map(|s| s.text.as_str()).collect()).collect();
-        assert!(text.iter().any(|l| l.contains("cannot be recovered")), "{text:?}");
+        // The warning wraps at 40 columns; the whole sentence must be there, across rows.
+        let joined: String = text.iter().map(|l| l.trim_matches(|c| c == '│' || c == ' ')).collect::<Vec<_>>().join(" ");
+        assert!(joined.contains("It is not in git and cannot be") && joined.contains("recovered."), "{text:?}");
         // The last line is the bottom border; the footer sits above it.
         assert!(text[text.len() - 2].contains(FOOTER), "{text:?}");
     }
@@ -3475,44 +3491,47 @@ fn subcommand(argv: &str) -> &str {
     args.get(i).copied().unwrap_or("")
 }
 
-/// The fixture of spec 9.8 item 4, plus the nested untracked file of the review focus.
+/// The fixture of spec 9.8 item 4 and the refusal cases of 9.6, plus the nested untracked file of the
+/// review focus. Every commit precedes every staged change, so nothing staged is committed away.
 fn fixture(real: &Path, p: &Path) {
     git(real, p, &["init", "-q", "-b", "main"]);
     git(real, p, &["config", "user.email", "t@example.com"]);
     git(real, p, &["config", "user.name", "t"]);
     let ctx = "c1\nc2\nc3\nc4\nc5\nc6\nc7\n";
+    // Baseline.
     std::fs::write(p.join("mm.txt"), format!("alpha\n{ctx}beta\n{ctx}gamma\n{ctx}delta\n")).unwrap();
     std::fs::write(p.join("md.txt"), "m\n").unwrap();
     std::fs::write(p.join("bin.dat"), [0u8, 1, 2]).unwrap();
+    std::fs::write(p.join("tools"), "x\n").unwrap();
+    std::fs::write(p.join("cc.txt"), format!("one\n{ctx}two\n")).unwrap();
     git(real, p, &["add", "-A"]);
     git(real, p, &["commit", "-q", "-m", "init"]);
+    let head = git(real, p, &["rev-parse", "HEAD"]).trim().to_string();
+    // Staged changes.
     std::fs::write(p.join("mm.txt"), format!("ALPHA\n{ctx}BETA\n{ctx}gamma\n{ctx}delta\n")).unwrap();
     git(real, p, &["add", "mm.txt"]);
-    std::fs::write(p.join("mm.txt"), format!("ALPHA\n{ctx}BETA\n{ctx}GAMMA\n{ctx}DELTA\n")).unwrap();
     std::fs::write(p.join("md.txt"), "M\n").unwrap();
     git(real, p, &["add", "md.txt"]);
-    std::fs::remove_file(p.join("md.txt")).unwrap();
-    std::fs::write(p.join("bin.dat"), [0u8, 1, 3]).unwrap();
-    std::fs::create_dir_all(p.join("newdir/deep")).unwrap();
-    std::fs::write(p.join("newdir/deep/u.txt"), "u\n").unwrap();
-    std::fs::write(p.join("u2.txt"), "two\n").unwrap();
-    // The refusal cases of spec 9.6: a diff past the cap, a gitlink, a directory in a file's place,
-    // and a file with two unstaged hunks for the concurrent pair.
-    let big: String = (0..200_001).map(|i| format!("{i}\n")).collect();
-    std::fs::write(p.join("big.txt"), big).unwrap();
-    let head = git(real, p, &["rev-parse", "HEAD"]).trim().to_string();
     git(real, p, &["update-index", "--add", "--cacheinfo", &format!("160000,{head},sub")]);
-    std::fs::write(p.join("tools"), "x\n").unwrap();
-    git(real, p, &["add", "tools"]);
-    let ctx = "c1\nc2\nc3\nc4\nc5\nc6\nc7\n";
-    std::fs::write(p.join("cc.txt"), format!("one\n{ctx}two\n")).unwrap();
-    git(real, p, &["add", "cc.txt"]);
-    git(real, p, &["commit", "-q", "-m", "more"]);
     git(real, p, &["rm", "-q", "tools"]);
     std::fs::create_dir(p.join("tools")).unwrap();
     std::fs::write(p.join("tools/run"), "r\n").unwrap();
     git(real, p, &["add", "tools/run"]);
+    // Working-tree changes.
+    std::fs::write(p.join("mm.txt"), format!("ALPHA\n{ctx}BETA\n{ctx}GAMMA\n{ctx}DELTA\n")).unwrap();
+    std::fs::remove_file(p.join("md.txt")).unwrap();
+    std::fs::write(p.join("bin.dat"), [0u8, 1, 3]).unwrap();
     std::fs::write(p.join("cc.txt"), format!("ONE\n{ctx}TWO\n")).unwrap();
+    std::fs::create_dir_all(p.join("newdir/deep")).unwrap();
+    std::fs::write(p.join("newdir/deep/u.txt"), "u\n").unwrap();
+    std::fs::write(p.join("u2.txt"), "two\n").unwrap();
+    let big: String = (0..200_001).map(|i| format!("{i}\n")).collect();
+    std::fs::write(p.join("big.txt"), big).unwrap();
+    // The starting state every case below counts on.
+    let status = git(real, p, &["status", "--porcelain=v1", "--untracked-files=all"]);
+    for line in ["MM mm.txt", "MD md.txt", " M bin.dat", "A  sub", "D  tools", "A  tools/run", " M cc.txt", "?? newdir/deep/u.txt", "?? u2.txt", "?? big.txt"] {
+        assert!(status.lines().any(|l| l == line), "fixture lacks `{line}`:\n{status}");
+    }
 }
 
 #[test]
@@ -3715,7 +3734,7 @@ In `tests/e2e_real_herdr.rs`, after the marker-clears block and before the focus
         // Phase 2: stage the one unstaged hunk of a.txt from the keyboard.
         std::fs::write(repo.join("a.txt"), "a\nSTAGE-ME\n").unwrap();
         iso.herdr(&["pane", "send-text", viewer_id, "b"]); // back to worktree scope
-        iso.herdr(&["pane", "wait-output", viewer_id, "--match", "+STAGE-ME", "--source", "visible", "--timeout", "15000"]); // the diff is loaded, not only the row
+        iso.herdr(&["pane", "wait-output", viewer_id, "--match", "STAGE-ME", "--source", "visible", "--timeout", "15000"]); // the diff line is drawn (`+ STAGE-ME`), not only the row
         iso.herdr(&["pane", "send-text", viewer_id, "s"]);
         iso.herdr(&["pane", "wait-output", viewer_id, "--match", "Stage hunk?", "--source", "visible", "--timeout", "15000"]);
         iso.herdr(&["pane", "send-text", viewer_id, "y"]);
@@ -3945,3 +3964,11 @@ accounts for the permits its helper needs, the directory test splits into the K7
 and a restore on a fixture git allows, the toolbar presence is asserted at 140 columns,
 three race tests synchronize on counters or visible text instead of sleeping, and the
 recording test covers the six remaining pre-git refusals with no `apply` recorded.
+
+**Round 4 (codex, plan-complete, 2026-10-01).** Five findings, none structural, all
+applied: the recording fixture makes every commit before any staged change and asserts its
+starting statuses; the minimum-width box test reads the wrapped warning across rows; Tier B
+matches the rendered `STAGE-ME`; a `pre_images` test counter and the diff gate make the
+mid-read edit land provably between the two readings; a `status_delay` seam holds the
+carrying refresh so the watcher test can require exactly one follow-up. The rounds stop
+here, as the brief says they do once the findings are no longer structural.
