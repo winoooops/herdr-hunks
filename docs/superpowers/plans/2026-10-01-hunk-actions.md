@@ -3972,3 +3972,5 @@ matches the rendered `STAGE-ME`; a `pre_images` test counter and the diff gate m
 mid-read edit land provably between the two readings; a `status_delay` seam holds the
 carrying refresh so the watcher test can require exactly one follow-up. The rounds stop
 here, as the brief says they do once the findings are no longer structural.
+
+<!-- codex-reviewed: 2026-10-02T05:07:07Z -->
