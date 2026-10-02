@@ -1,4 +1,5 @@
 pub mod config;
+pub mod confirm;
 pub mod dialog;
 pub mod format;
 pub mod guard;

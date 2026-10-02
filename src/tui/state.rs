@@ -19,6 +19,14 @@ enum NoticeKind {
     BaseError,
 }
 
+/// A confirmed action between `y` and the moment its keys are free again (spec 9.3).
+pub struct PendingAction {
+    pub diff: std::sync::Arc<LoadedDiff>,
+    pub done: String,
+    pub verb: &'static str,
+    pub answered: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub text: String,
@@ -40,6 +48,10 @@ pub struct ViewState {
     pub popup: bool,
     pub help_open: bool,
     pub picker: Option<crate::tui::picker::Picker>,
+    /// The y/n box of spec 9.3, open from the main view only.
+    pub confirm: Option<crate::tui::confirm::Confirm>,
+    /// The action `y` sent, until its answer and, when a form ran, its Arc have both passed.
+    pub pending_action: Option<PendingAction>,
     pub refs_token: u64,
     /// Last submitted pick's reply sequence, retained when the picker closes.
     pub submitted_pick_seq: u64,
@@ -53,6 +65,7 @@ pub struct ViewState {
     /// What the notice on screen is, so displacing one can put it back.
     notice_kind: NoticeKind,
     seen_mark_seq: u64,
+    seen_action_seq: u64,
     seen_rewrite: Option<(String, String, crate::engine::MarkState)>,
     width: u16,
     /// The diff the rows were built from. Holding the Arc makes `Arc::ptr_eq` a safe,
@@ -76,6 +89,8 @@ impl ViewState {
             popup: false,
             help_open: false,
             picker: None,
+            confirm: None,
+            pending_action: None,
             refs_token: 0,
             submitted_pick_seq: 0,
             notice: None,
@@ -86,6 +101,7 @@ impl ViewState {
             pending_base_error: None,
             notice_kind: NoticeKind::Other,
             seen_mark_seq: 0,
+            seen_action_seq: 0,
             seen_rewrite: None,
             width: 0,
             built_from: None,
@@ -106,6 +122,17 @@ impl ViewState {
             urgent: true,
         });
         self.notice_kind = NoticeKind::Other;
+    }
+
+    /// Spec 9.3's guard: unanswered, or answered as applied while its Arc is still on screen.
+    pub fn action_running(&self, snapshot: &Snapshot) -> bool {
+        match &self.pending_action {
+            None => false,
+            Some(pending) if !pending.answered => true,
+            Some(pending) => {
+                matches!(&snapshot.diff, DiffState::Ready(d) if std::sync::Arc::ptr_eq(d, &pending.diff))
+            }
+        }
     }
 
     /// Record only a drawn body's id; any snapshot without an id clears the last one.
@@ -217,6 +244,49 @@ impl ViewState {
                 (None, None) => {}
             }
         }
+        let mut answered_action = false;
+        if snapshot.action_seq != self.seen_action_seq {
+            self.seen_action_seq = snapshot.action_seq;
+            answered_action = true;
+            if let Some(pending) = self.pending_action.take() {
+                // The answer to the key the user just pressed is shown at once (8.5's rule for M).
+                if let Some(displaced) = self.notice.as_ref().filter(|n| n.urgent) {
+                    match self.notice_kind {
+                        NoticeKind::Rewrite => self.seen_rewrite = None,
+                        NoticeKind::BaseError => {
+                            self.pending_base_error = Some(displaced.text.clone())
+                        }
+                        NoticeKind::Other => {}
+                    }
+                }
+                match &snapshot.action_error {
+                    Some(error) => {
+                        let mut text = format!(
+                            "{} failed: {}",
+                            pending.verb,
+                            crate::tui::sanitize::sanitize(error)
+                        );
+                        if error.contains("does not match index") {
+                            text.push_str("; unstage it first (s)");
+                        }
+                        self.warn(text);
+                    }
+                    None => self.notify(pending.done.clone()),
+                }
+                if snapshot.action_applied {
+                    self.pending_action = Some(PendingAction {
+                        answered: true,
+                        ..pending
+                    });
+                }
+            }
+        }
+        // An applied action holds the keys until its Arc has left the screen.
+        if self.pending_action.as_ref().is_some_and(|p| p.answered)
+            && !self.action_running(snapshot)
+        {
+            self.pending_action = None;
+        }
         // Warn only for the pair the engine conclusively classified.
         let rewritten = snapshot.mark.as_ref().and_then(|mark| {
             let at = mark.classified_at.clone()?;
@@ -225,7 +295,7 @@ impl ViewState {
         });
         // Leave the warning pending until an urgent answer has been acknowledged.
         let urgent_stands = self.notice.as_ref().is_some_and(|n| n.urgent);
-        if rewritten != self.seen_rewrite && !answered_mark && !urgent_stands {
+        if rewritten != self.seen_rewrite && !answered_mark && !answered_action && !urgent_stands {
             self.seen_rewrite = rewritten.clone();
             match rewritten.map(|(_, _, state)| state) {
                 Some(MarkState::Rewritten) => {
@@ -256,7 +326,8 @@ impl ViewState {
         // warning -- including the one the branch above just set, whose pair is already
         // recorded and would never speak again.
         if let Some(error) = self.pending_base_error.clone() {
-            if !answered_mark && !self.notice.as_ref().is_some_and(|n| n.urgent) {
+            if !answered_mark && !answered_action && !self.notice.as_ref().is_some_and(|n| n.urgent)
+            {
                 self.pending_base_error = None;
                 self.warn(error);
                 self.notice_kind = NoticeKind::BaseError;
@@ -340,6 +411,7 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     pub(crate) fn snapshot(path: &str, raw: &str, hunks: &[(u32, &str)]) -> Snapshot {
+        let hunks_spec = hunks;
         let hunks = hunks
             .iter()
             .map(|(start, kinds)| DiffHunk {
@@ -369,6 +441,23 @@ pub(crate) mod tests {
             staged: false,
             untracked: false,
         };
+        // The patch mirrors the parsed hunks, so the slicer and the box have real bytes to work on.
+        let mut patch = format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n");
+        for (start, kinds) in hunks_spec {
+            let old = kinds.chars().filter(|c| *c != '+').count();
+            let new = kinds.chars().filter(|c| *c != '-').count();
+            patch.push_str(&format!("@@ -{start},{old} +{start},{new} @@\n"));
+            for k in kinds.chars() {
+                patch.push_str(&format!(
+                    "{}line {k}\n",
+                    if k == '+' || k == '-' { k } else { ' ' }
+                ));
+            }
+        }
+        let pre_image = Some(crate::engine::PreImage {
+            index: Some("100644 0000000000000000000000000000000000000000 0".into()),
+            worktree: crate::engine::WorktreeKind::File(0),
+        });
         let loaded = LoadedDiff::build(
             key.clone(),
             Comparison::Worktree,
@@ -385,8 +474,8 @@ pub(crate) mod tests {
                 raw_diff: raw.into(),
                 repo_root: "/r".into(),
             },
-            Vec::new(),
-            None,
+            patch.into_bytes(),
+            pre_image,
         );
         let mut s = Snapshot::empty("/r");
         s.revision = 1;
