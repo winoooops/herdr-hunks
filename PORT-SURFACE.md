@@ -112,7 +112,13 @@ the watcher's synchronous calls. The frozen tree is not edited.
   and `git diff` calls (`vimeflow:crates/backend/src/git/mod.rs:1146`,
   `watcher.rs:488`) may take `index.lock` and rewrite the index to refresh its
   stat cache. For a viewer that polls while an agent runs git in the same
-  worktree, that risks `index.lock` collisions and breaks G7.
+  worktree, that risks `index.lock` collisions and breaks G7. One refresh is
+  not guarded by the variable: after an `apply --cached` of spec 9 wrote an
+  entry without stat data, the next `git diff --numstat` or `--name-status`
+  refreshes that entry's stat fields and rewrites the index (git's
+  `refresh_index_quietly`). It follows the viewer's own mutation, changes no
+  entry's content, mode or stage, and `tests/hunk_actions.rs` compares the
+  entries rather than the bytes for that reason.
 - `GIT_LITERAL_PATHSPECS=1`. The frozen diff call passes the selected path after
   `--` with no literal-pathspec mode (`mod.rs:1513-1518`), so a file named
   `a*.txt` would also match `ab.txt`, and the single-file parser would merge both

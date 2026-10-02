@@ -2,9 +2,9 @@
 
 [English](README.md) · **简体中文** · [日本語](README.ja.md)
 
-适用于 [Herdr](https://herdr.dev) 的只读 git 差异块查看器，提供变更文件列表、
-统一/并排差异视图、可点击的导航工具栏和实时刷新。
-第一阶段不支持暂存、取消暂存、丢弃修改、添加评论或向代理派发任务。
+适用于 [Herdr](https://herdr.dev) 的 git 差异块查看器，提供变更文件列表、
+统一/并排差异视图、可点击的导航工具栏和实时刷新，并支持在确认框后暂存差异块。
+不支持添加评论或向代理派发任务。
 
 ## 安装
 
@@ -35,7 +35,7 @@ herdr plugin action invoke update --plugin winoooops.hunks
 | `update` | 对 GitHub 安装，当最新发行标签比当前运行版本更新时安装它，否则提示已是最新；拒绝本地链接或未知来源。 |
 
 独立运行：`herdr-hunks [PATH]` 或 `herdr-hunks tui [PATH]`；PATH 默认为当前目录。
-标准输入和标准输出都必须连接到终端。`--version` 输出 `herdr-hunks 0.0.3`。
+标准输入和标准输出都必须连接到终端。`--version` 输出 `herdr-hunks 0.0.4`。
 可通过 `herdr plugin log list --plugin winoooops.hunks --limit 1` 查看操作诊断信息。
 
 ## 快捷键绑定
@@ -65,6 +65,9 @@ description = "Open the hunk viewer"
 | `t` | 切换统一 / 并排视图；并排视图至少需要 100 列 |
 | `e` / `E` | 切换 / 固定文件面板 |
 | `r` | 刷新 |
+| `s` | 暂存光标所在的差异块；在已暂存行上则取消暂存；未跟踪文件整体暂存（仅 worktree 范围） |
+| `d` | 丢弃光标所在的差异块；对未跟踪文件则删除该文件（仅 worktree 范围） |
+| `D` | 丢弃该行显示的全部改动（仅 worktree 范围） |
 | `b` | 切换范围：worktree <-> branch |
 | `B` | 选择比较基准 |
 | `M` | 将当前提交标记为已审阅 |
@@ -77,7 +80,7 @@ description = "Open the hunk viewer"
 | Ctrl+C | 立即退出，包括在按键帮助或基准选择器中 |
 
 方向键、PageDown、PageUp、Home 和 End 的别名仅在不带修饰键时生效。
-第一阶段保留 `s d D i I u U x v y Y @ c /`，不绑定任何操作。
+第二阶段保留 `i I u U x X v y Y @ c /`，不绑定任何操作。
 
 ## 鼠标
 
@@ -151,7 +154,7 @@ height = "80%"
 因此存在同名标签时应写成 `refs/heads/x`。选择的基准按工作树保存；
 状态目录不可用时，仅在当前会话内有效。
 
-分支范围与查看器的其他部分一样为只读，只在运行的 git 命令中增加 `merge-base` 和 `for-each-ref`。
+分支范围只运行只读命令，只在运行的 git 命令中增加 `merge-base` 和 `for-each-ref`。
 每次刷新都会重新检查基准，因此基准移动后（例如合并到 `main` 或执行 fetch），
 会在一个轮询间隔内反映出来。
 
@@ -174,6 +177,28 @@ height = "80%"
 同一选择器还会在可解析时提供 `upstream`、`last commit` 和 `last 3 commits`，
 常用基准无需再手动输入。
 
+## 差异块操作
+
+在 worktree 范围内，`s` 暂存光标所在的差异块（在已暂存行上则取消暂存），`d`
+丢弃它，`D` 丢弃该行显示的全部改动。每个按键都会弹出确认框：`y` 确认，`n`
+取消，其他按键无效。确认框会写明差异块和文件，并在操作不可撤销时说明：丢弃的
+差异块无法找回，在未跟踪行上按 `D` 会删除一个 git 从未记录的文件。
+
+每个操作都是一次 `git apply`，补丁从屏幕上的 diff 中切出：你读到的就是交给
+git 的。已暂存行的丢弃使用 `--index`，索引和工作区要么一起改变、要么都不变；
+文件还有未暂存改动时 git 会拒绝，提示先取消暂存。应用前查看器会重新读取文件和
+索引条目，若自读取 diff 以来有变化，则以 `the diff changed; look again` 拒绝。
+被大小上限截断的行、二进制文件和子模块指针不会被操作。
+
+查看器生成的每个 diff 都带三行上下文、`a/` 与 `b/` 前缀且不经过 textconv，
+因此 `diff.context`、`diff.noprefix`、`diff.mnemonicPrefix` 和 textconv 驱动
+对它不起作用；`apply.ignoreWhitespace` 固定关闭，`apply.whitespace` 固定为
+`nowarn`。在 branch 范围内这三个按键显示 `switch to worktree scope (b) to
+stage or discard`。
+
+查看器运行十一个 git 子命令：分支范围的十个只读命令，以及仅在确认后运行的
+`apply`。
+
 ## 运行要求
 
 - macOS 或 Linux，标准输入和标准输出连接到终端。
@@ -183,12 +208,7 @@ height = "80%"
 
 ## 已知限制
 
-本阶段为只读，尚未实现暂存和评论。
-[PORT-SURFACE.md 列出了 K1–K7](PORT-SURFACE.md#known-defects)：K1–K4 是冻结代码中修改路径的缺陷，
-第一阶段不会触发；K5 可能隐藏先暂存修改或新增、再删除文件时的暂存部分；
-K6 会使已被新请求取代的慢速差异请求累积 git 进程。
-在 worktree 范围中，若已暂存行的路径由文件变成目录，会把目录的补丁解析为该行自己的补丁
-（PORT-SURFACE.md 中的 K7）；branch 范围不受影响。
+PORT-SURFACE.md 中的 K1–K7 已在 0.0.4 修复。评论尚未实现。
 不是合法 UTF-8 的路径会以 `\u{fffd}` 代替无法解码的字节显示；传给 git 的是替换后的名字，所以其差异为空
 （或者是恰好叫这个名字的文件的差异）；仅在这些字节上不同的路径在 branch 范围合并为一行，
 在 worktree 范围则只有同类行（staged、unstaged 或未跟踪）才会合并。
@@ -198,7 +218,7 @@ K6 会使已被新请求取代的慢速差异请求累积 git 进程。
 
 ## 路线图
 
-P1：只读查看。P2：暂存、取消暂存、丢弃操作及缺陷修复。
+P1：只读查看。P2：暂存、取消暂存、丢弃操作及缺陷修复（0.0.4）。
 P3：评论和代理任务派发。P4：回复与讨论串。P5：委托审查。
 参见[设计规范](docs/superpowers/specs/2026-09-18-hunks-roadmap-p1-viewer-design.md)。
 

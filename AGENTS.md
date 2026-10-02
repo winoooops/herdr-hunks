@@ -1,12 +1,12 @@
 # Working on herdr-hunks
 
-- Phase 1 is a read-only viewer. Keep git mutations, comments, and agent dispatch out of this phase.
+- Phases 1-2 ship a viewer whose only mutations are the confirmed hunk actions of spec 9. Keep comments and agent dispatch out.
 - `src/git/` is frozen at vimeflow `91e45b1c8f381385093813d0b4eb1d9daeb2d563` plus registered patches. Never edit it by hand: change the pin or add a numbered patch in `port/patches/`, registered in `PORT-SURFACE.md`.
-- Verify the frozen tree with `scripts/port-check.sh /path/to/vimeflow` and `sh scripts/port-check-selftest.sh /path/to/vimeflow`. Treat the reference checkout as read-only. The engine reaches five additional frozen functions through the D6 visibility patch; its git allow-list has ten subcommands.
+- Verify the frozen tree with `scripts/port-check.sh /path/to/vimeflow` and `sh scripts/port-check-selftest.sh /path/to/vimeflow`. Treat the reference checkout as read-only. The engine reaches five additional frozen functions through the D6 visibility patch; its read allow-list has ten subcommands, and `apply` is the eleventh.
 - Before committing, run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and `cargo check --no-default-features`, plus both port checks. Test HOME must be writable and outside a git repository; preserve CARGO_HOME and RUSTUP_HOME when overriding it.
 - Keep inherited clippy allowances on the `git` module declaration; do not alter frozen sources to satisfy lints.
-- Reserved keys remain unbound: `s d D i I u U x v y Y @ c /`. `b` and `B` are the scope keys; the Phase 2 write actions bind in `worktree` scope only and, in `branch` scope, show `switch to worktree scope (b) to stage or discard`.
-- `M` marks a commit as reviewed and writes only `marks.json`; the git allow-list remains unchanged at ten subcommands.
+- Reserved keys remain unbound: `i I u U x X v y Y @ c /`. `b` and `B` are the scope keys; `s`, `d` and `D` are the Phase 2 write actions, bound in `worktree` scope only and, in `branch` scope, showing `switch to worktree scope (b) to stage or discard`.
+- `M` marks a commit as reviewed and writes only `marks.json`; the ten read subcommands are unchanged; `apply` is the eleventh and runs only from a confirmed `s`, `d` or `D` (`tests/hunk_actions.rs`).
 - Read the plugin ID from `HERDR_PLUGIN_ID`. Reach the host through `HERDR_BIN_PATH` or `HERDR_SOCKET_PATH`; never hardcode its executable name in Rust.
 - Use the shared absolute config/state directory helpers. Never write state relative to the current directory. Sanitize git text before drawing; use named ANSI colours only.
 - Keep Cargo.toml, Cargo.lock, and herdr-plugin.toml versions together, and mirror README changes in English, Simplified Chinese, and Japanese.
@@ -136,8 +136,9 @@ of files a session writes, so a new state file changes that test.
 Each took several review rounds to get right. Read the comments at the places named
 here before changing them.
 
-1. **Read-only (G7).** The viewer runs only the git subcommands allow-listed in
-   `tests/readonly_guarantee.rs`. A revision is always one argv element: typed text
+1. **Read-only except on confirmation (G7, spec 9.6).** The viewer runs only the git
+   subcommands allow-listed in `tests/readonly_guarantee.rs`, plus `apply` from a confirmed
+   action, which `tests/hunk_actions.rs` records form by form. A revision is always one argv element: typed text
    passes `base::check_text` and `base::verify`, and anything read back from a state
    file is checked by shape (`base::is_object_id`) before it can become an argument.
    The test records every git invocation of a scripted session, so a new git call is
