@@ -36,9 +36,34 @@ pub fn truncate(s: &str, max_cells: usize) -> String {
     out
 }
 
+/// `…` plus the tail of `text` that fits `max` cells; the whole text when it already fits.
+pub fn truncate_left(text: &str, max: usize) -> String {
+    if width(text) <= max {
+        return text.to_string();
+    }
+    let mut tail = String::new();
+    let mut used = 1;
+    for ch in text.chars().rev() {
+        let w = width(&ch.to_string());
+        if used + w > max {
+            break;
+        }
+        used += w;
+        tail.insert(0, ch);
+    }
+    format!("…{tail}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_left_keeps_the_tail_behind_an_ellipsis() {
+        assert_eq!(truncate_left("src/values.ts", 8), "…lues.ts");
+        assert_eq!(truncate_left("ab", 8), "ab");
+        assert_eq!(width(&truncate_left("猫猫猫猫", 5)), 5);
+    }
 
     #[test]
     fn truncate_measures_display_cells_and_ends_in_ellipsis() {

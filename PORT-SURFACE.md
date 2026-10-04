@@ -11,9 +11,9 @@ then changed only by the registered patches below:
 - `src/git/test_helpers.rs`
 
 `scripts/port-check.sh <vimeflow-checkout>` verifies the pinned sources plus
-`port/patches/*.patch` in order against `src/git/`. Three patches are registered:
-`0001-no-ext-diff.patch` (D4), `0002-drain-sync-output.patch` (D5) and
-`0003-engine-visibility.patch` (D6).
+`port/patches/*.patch` in order against `src/git/`. Four patches are registered:
+`0001-no-ext-diff.patch` (D4), `0002-drain-sync-output.patch` (D5),
+`0003-engine-visibility.patch` (D6) and `0004-status-two-halves.patch` (K5).
 `sh scripts/port-check-selftest.sh <vimeflow-checkout>` verifies the baseline and rejection of symlinks, extra files, hand edits, and unregistered patches in a temporary copy.
 
 ## Port surface
@@ -26,12 +26,12 @@ crate::runtime::{serialize_event, EventSink}
 ```
 
 Tests additionally import `crate::runtime::FakeEventSink`.
-The mutating git functions are copied but are not called in Phase 1.
+The mutating git functions are copied and are not called; every mutation runs
+through `engine::actions` (spec 9.2).
 
 The engine calls these frozen functions:
 
 - `git_status_inner`
-- `get_git_diff_inner`
 - `git_branch_inner`
 - `git_worktree_name_inner`
 - `start_git_watcher_backend`
@@ -41,6 +41,10 @@ The engine calls these frozen functions:
 - `parse_numstat` (D6, pub(crate))
 - `parse_git_diff` (D6, pub(crate))
 - `decode_git_patch_path` (D6, pub(crate))
+
+`get_git_diff_inner` is no longer called from the engine (D7);
+`git_diff_response_tests` keeps testing it and the engine's diff tests use it as
+their oracle.
 
 ## Shims
 
@@ -108,7 +112,13 @@ the watcher's synchronous calls. The frozen tree is not edited.
   and `git diff` calls (`vimeflow:crates/backend/src/git/mod.rs:1146`,
   `watcher.rs:488`) may take `index.lock` and rewrite the index to refresh its
   stat cache. For a viewer that polls while an agent runs git in the same
-  worktree, that risks `index.lock` collisions and breaks G7.
+  worktree, that risks `index.lock` collisions and breaks G7. One refresh is
+  not guarded by the variable: after an `apply --cached` of spec 9 wrote an
+  entry without stat data, the next `git diff --numstat` or `--name-status`
+  refreshes that entry's stat fields and rewrites the index (git's
+  `refresh_index_quietly`). It follows the viewer's own mutation, changes no
+  entry's content, mode or stage, and `tests/hunk_actions.rs` compares the
+  entries rather than the bytes for that reason.
 - `GIT_LITERAL_PATHSPECS=1`. The frozen diff call passes the selected path after
   `--` with no literal-pathspec mode (`mod.rs:1513-1518`), so a file named
   `a*.txt` would also match `ab.txt`, and the single-file parser would merge both
@@ -150,43 +160,72 @@ instead of the frozen `get_git_diff_inner`, which hard-codes its two bases.
 30 s timeout, the D3-compatible spawn and both parsers behave exactly as
 before, and every frozen test is unaffected.
 
+**D7 (hunk actions): engine-built diffs.** Every diff the viewer shows is built
+by the engine (`src/engine/worktree.rs`, `src/engine/branch.rs`) with
+`--no-color --no-ext-diff --no-textconv -U3 --src-prefix=a/ --dst-prefix=b/`,
+in both scopes, and the output bytes are kept beside the parsed hunks
+(`LoadedDiff.patch`) so an action applies back exactly what was read: a
+converted text (textconv) cannot be applied, a hunk cut from a diff without
+context lands at the wrong line, and a prefix the user configured away cannot
+be parsed by `git apply` (spec 9.2). The frozen `get_git_diff_inner` is no
+longer called; it stays in the tree as the oracle of the engine's diff tests.
+**D4 is amended by D7:** textconv filters are no longer left on. A binary file
+with a textconv driver shows as binary and is refused by the actions; a text
+file with one shows its raw text. D4's patch is unchanged because the frozen
+calls it touches still exist.
+
 ## Known defects
 
-**K1-K7: known defects.** K1-K5 and K7 are in the frozen tree. K1-K4 sit in the
-mutating paths and are unreachable in Phase 1. K5 and K7 are in read paths and
-are visible in Phase 1. K1-K5 and K7 are fixed in Phase 2, through the patch
-mechanism of 2.2 or by sibling reimplementation where a patch would be large.
+**K1-K7: known defects, closed in 0.0.4.** K1-K5 and K7 are in the frozen tree.
+K1-K4 sit in the mutating paths and were unreachable in Phase 1. K5 and K7 are
+in read paths and were visible in Phase 1. 0.0.4 closes each one: K5 through
+patch `0004-status-two-halves.patch`, the others by the engine's own forms and
+diffs (spec 9.5), which leave the defective frozen code uncalled.
 
 - **K1.** Stage, unstage and discard run with `current_dir(<pane cwd>)`
   (`mod.rs:369,393,437-462`), while status and diff return toplevel-relative paths
   and run with `-C <toplevel>`. From a subdirectory the path no longer matches.
+  Not reached in 0.0.4: every form of spec 9.2 runs with `-C <toplevel>` on
+  toplevel-relative paths.
 - **K2.** Whole-file operations discard git's exit status:
   `run_git_with_timeout` returns `Ok` for any exit code (`mod.rs:41`) and the
-  callers end in `.map(|_| ())?` (`mod.rs:370,395,438-463`).
+  callers end in `.map(|_| ())?` (`mod.rs:370,395,438-463`). Not reached in
+  0.0.4: the runner of spec 9.4 reads the status and answers with stderr.
 - **K3.** Per-hunk discard ignores its scope (`mod.rs:426-428,466-469`). From the
   staged view it reverse-applies the HEAD-to-index patch to the worktree only, so
-  the index keeps the change.
+  the index keeps the change. Not reached in 0.0.4: a staged row's discard is the
+  `--index -R` form of spec 9.2, index and working tree together.
 - **K4.** Unstaging one hunk of a staged rename also reverses the rename, because
   the reused patch header carries `rename from` / `rename to`. This was observed
-  with a plain-git probe during the scan and must be re-verified in the Phase 2
-  spec.
+  with a plain-git probe during the scan. Closed in 0.0.4: the slicer of spec 9.2
+  rewrites a rename section's header to name the new path alone; re-verified
+  against git 2.55.
 - **K5.** `parse_git_status` splits `MM`, `AM` and rename-plus-edit into two rows,
   but `MD` and `AD` fall to its default arm (`mod.rs:883-892`) and produce one
   unstaged `Modified` row. After staging a change and then deleting the working
   file, the staged half is hidden and the deletion is labelled modified. vimeflow
   accepted this limit (its VIM-327 spec puts extending the parser out of scope).
-  Phase 1 inherits it because the parser is frozen.
+  Closed in 0.0.4 by `port/patches/0004-status-two-halves.patch`: the default arm
+  splits `XY` into up to two rows, a staged one for `X` and an unstaged one for
+  `Y`, with `M` and `T` as `Modified`, `A` as `Added` and `D` as `Deleted`; a
+  letter outside those keeps the old single unstaged `Modified` row, and the
+  conflict arms before it are untouched. `MD`, `AD`, `T `, ` T`, `TM` and `MT`
+  are the codes this reaches. Its test lives in `mod.rs`'s test module, as D5's
+  does in `watcher.rs`.
 - **K6.** Superseded engine diff requests are not cancelled: the frozen
   `run_git_with_timeout` waits in `spawn_blocking`, so aborting the Tokio task
   would not kill its git child. Holding n/p with slow diffs can therefore pile
-  up git processes. Phase 1 accepts this limitation. Phase 2 adds a concurrency
-  cap or a cancellable runner.
+  up git processes. Closed in 0.0.4 by the diff lane of spec 9.4: diff tasks run
+  git one at a time, and a task that acquires the lane after its generation was
+  superseded returns without spawning.
 - **K7.** A staged row whose path was a file and is now a directory (`D tools`
   next to `A tools/run` in the index) gets both patches from
   `git diff --cached -- tools`, because a pathspec matches its descendants, and
   `parse_git_diff` reads the second file's headers as content of the first.
-  Rare, worktree scope only. Branch scope is unaffected: the engine cuts the
+  Rare, worktree scope only. Branch scope was unaffected: the engine cuts the
   output into `diff --git` sections and keeps only the row's own (spec 7.2).
+  Not reached in 0.0.4: the engine cuts sections before parsing in both scopes
+  (spec 9.2, D7); the frozen function keeps the defect and is no longer called.
 
 ## Adapted tests
 

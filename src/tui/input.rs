@@ -67,6 +67,9 @@ pub fn handle_key(
             _ => Outcome::Inert,
         };
     }
+    if state.confirm.is_some() {
+        return confirm_key(state, key);
+    }
     if state.picker.is_some() {
         return picker_key(state, snapshot, key);
     }
@@ -77,6 +80,77 @@ pub fn handle_key(
         Some(action) => apply_action(state, snapshot, action, width),
         None => Outcome::Inert,
     }
+}
+
+/// The box of spec 9.3: `y` confirms once the box was drawn, `n` cancels, everything else is inert.
+fn confirm_key(state: &mut ViewState, key: KeyEvent) -> Outcome {
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('n'), KeyModifiers::NONE) => {
+            state.confirm = None;
+            Outcome::Redraw
+        }
+        (KeyCode::Char('y'), KeyModifiers::NONE) => {
+            let Some(confirm) = state.confirm.take_if(|c| c.drawn) else {
+                return Outcome::Inert;
+            };
+            state.pending_action = Some(crate::tui::state::PendingAction {
+                diff: confirm.action.diff.clone(),
+                done: confirm.done,
+                verb: confirm.verb,
+                answered: false,
+            });
+            Outcome::Engine(Command::Act(confirm.action))
+        }
+        _ => Outcome::Inert,
+    }
+}
+
+/// Spec 9.2's refusals in the TUI's order, then the box; the engine re-decides all of them (9.4).
+fn open_box(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction) -> Outcome {
+    use crate::engine::actions::{self, NOTICE_NO_HUNK, NOTICE_RUNNING, NOTICE_SCOPE};
+    use crate::engine::{ActionKind, Scope};
+    if snapshot.scope == Scope::Branch {
+        state.notify(NOTICE_SCOPE);
+        return Outcome::Redraw;
+    }
+    if state.action_running(snapshot) {
+        state.notify(NOTICE_RUNNING);
+        return Outcome::Redraw;
+    }
+    let DiffState::Ready(diff) = &snapshot.diff else {
+        state.notify(NOTICE_NO_HUNK);
+        return Outcome::Redraw;
+    };
+    let kind = match action {
+        KeyAction::StageHunk => ActionKind::Stage,
+        KeyAction::DiscardHunk => ActionKind::Discard,
+        _ => ActionKind::DiscardFile,
+    };
+    let hunk = if kind == ActionKind::DiscardFile || diff.key.untracked {
+        None
+    } else {
+        state
+            .cursor
+            .and_then(|c| diff.targets.get(c))
+            .map(|t| t.hunk_index)
+    };
+    let candidate = crate::engine::Action {
+        kind,
+        diff: diff.clone(),
+        hunk,
+    };
+    if let Err(notice) = actions::plan(&candidate) {
+        state.notify(notice);
+        return Outcome::Redraw;
+    }
+    let total = diff.file_diff.hunks.len();
+    state.confirm = Some(crate::tui::confirm::Confirm::open(
+        kind,
+        diff.clone(),
+        hunk,
+        total,
+    ));
+    Outcome::Redraw
 }
 
 fn picker_key(state: &mut ViewState, snapshot: &Snapshot, key: KeyEvent) -> Outcome {
@@ -236,6 +310,7 @@ fn act(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction, width: u16
             state.help_open = true;
             state.help_offset = 0;
         }
+        StageHunk | DiscardHunk | DiscardFile => return open_box(state, snapshot, action),
         _ => return move_cursor(state, snapshot, action),
     }
     Outcome::Redraw
@@ -333,6 +408,10 @@ pub fn handle_mouse(
     ev: MouseEvent,
 ) -> Outcome {
     if !state.mouse_requested || !ev.modifiers.is_empty() {
+        return Outcome::Inert;
+    }
+    // The box has to be answered: no click or wheel reaches anything under it.
+    if state.confirm.is_some() {
         return Outcome::Inert;
     }
     if ev.kind == MouseEventKind::Moved {
@@ -924,7 +1003,7 @@ mod tests {
         st.reconcile(&snap);
         handle_key(&mut st, &snap, key("t"), 99);
         assert!(st.notice.is_some());
-        assert_eq!(handle_key(&mut st, &snap, key("s"), 99), Outcome::Inert);
+        assert_eq!(handle_key(&mut st, &snap, key("x"), 99), Outcome::Inert);
         assert!(st.notice.is_some());
         assert_eq!(handle_key(&mut st, &snap, key("k"), 99), Outcome::Redraw);
         assert!(st.notice.is_none());
@@ -1795,5 +1874,255 @@ mod tests {
         let notice = st.notice.as_ref().unwrap();
         assert_eq!(notice.text, "marked ddddddd as reviewed");
         assert!(!notice.urgent);
+    }
+
+    use crate::engine::actions::{
+        NOTICE_CHANGED, NOTICE_CUT, NOTICE_NO_HUNK, NOTICE_RUNNING, NOTICE_SCOPE,
+    };
+    use crate::engine::{ActionKind, Scope};
+
+    fn press_y(st: &mut ViewState, snap: &crate::engine::Snapshot) -> Outcome {
+        if let Some(c) = st.confirm.as_mut() {
+            c.drawn = true;
+        }
+        handle_key(st, snap, key("y"), 120)
+    }
+
+    fn arc_of(snap: &crate::engine::Snapshot) -> std::sync::Arc<crate::engine::LoadedDiff> {
+        match &snap.diff {
+            DiffState::Ready(d) => d.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn s_d_and_capital_d_open_their_boxes_and_y_sends_the_act() {
+        for (k, kind, hunk, title) in [
+            ("s", ActionKind::Stage, Some(0), "Stage hunk?"),
+            ("d", ActionKind::Discard, Some(0), "Discard hunk?"),
+            ("D", ActionKind::DiscardFile, None, "Discard file?"),
+        ] {
+            let (snap, mut st) = setup(&[(10, " --+ "), (40, "+")]);
+            assert_eq!(handle_key(&mut st, &snap, key(k), 120), Outcome::Redraw);
+            let confirm = st.confirm.as_ref().expect("a box");
+            assert_eq!(confirm.title, title);
+            assert_eq!((confirm.action.kind, confirm.action.hunk), (kind, hunk));
+            let diff = arc_of(&snap);
+            let outcome = press_y(&mut st, &snap);
+            assert_eq!(
+                outcome,
+                Outcome::Engine(Command::Act(crate::engine::Action { kind, diff, hunk }))
+            );
+            assert!(st.confirm.is_none());
+            assert!(st.action_running(&snap));
+        }
+        // On the staged row `s` is an unstage and the hunk follows the cursor.
+        let (mut snap, mut st) = setup(&[(10, " --+ "), (40, "+")]);
+        if let DiffState::Ready(d) = &mut snap.diff {
+            std::sync::Arc::make_mut(d).key.staged = true;
+        }
+        st.reconcile(&snap);
+        handle_key(&mut st, &snap, key("]"), 120);
+        handle_key(&mut st, &snap, key("s"), 120);
+        let confirm = st.confirm.as_ref().unwrap();
+        assert_eq!(
+            (confirm.title, confirm.action.hunk),
+            ("Unstage hunk?", Some(1))
+        );
+    }
+
+    #[test]
+    fn n_closes_the_box_and_every_other_key_and_mouse_is_inert_in_it() {
+        let (snap, mut st) = setup(&[(1, "+")]);
+        handle_key(&mut st, &snap, key("d"), 120);
+        for k in ["j", "k", "q", "s", "d", "D", "M", "b", "?", "Y", "N"] {
+            assert_eq!(
+                handle_key(&mut st, &snap, key(k), 120),
+                Outcome::Inert,
+                "{k}"
+            );
+            assert!(st.confirm.is_some(), "{k} closed the box");
+        }
+        assert_eq!(
+            handle_key(
+                &mut st,
+                &snap,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                120
+            ),
+            Outcome::Inert
+        );
+        let rendered = view::render(&snap, &st, 120, 24);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            handle_mouse(&mut st, &snap, &rendered, click),
+            Outcome::Inert
+        );
+        assert_eq!(
+            handle_key(&mut st, &snap, key("ctrl+c"), 120),
+            Outcome::Quit
+        );
+        assert_eq!(handle_key(&mut st, &snap, key("n"), 120), Outcome::Redraw);
+        assert!(st.confirm.is_none() && st.pending_action.is_none());
+    }
+
+    #[test]
+    fn y_is_inert_until_the_box_was_drawn() {
+        let (snap, mut st) = setup(&[(1, "+")]);
+        handle_key(&mut st, &snap, key("s"), 120);
+        assert_eq!(handle_key(&mut st, &snap, key("y"), 120), Outcome::Inert);
+        assert!(st.confirm.is_some());
+        assert!(matches!(
+            press_y(&mut st, &snap),
+            Outcome::Engine(Command::Act(_))
+        ));
+    }
+
+    #[test]
+    fn branch_scope_and_the_refusals_show_a_notice_and_no_box() {
+        let (mut snap, mut st) = setup(&[(1, "+")]);
+        snap.scope = Scope::Branch;
+        for k in ["s", "d", "D"] {
+            assert_eq!(handle_key(&mut st, &snap, key(k), 120), Outcome::Redraw);
+            assert_eq!(
+                st.notice.as_ref().map(|n| n.text.as_str()),
+                Some(NOTICE_SCOPE)
+            );
+            assert!(st.confirm.is_none());
+        }
+        snap.scope = Scope::Worktree;
+        snap.diff = DiffState::Loading;
+        st.reconcile(&snap);
+        handle_key(&mut st, &snap, key("s"), 120);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some(NOTICE_NO_HUNK)
+        );
+        assert!(st.confirm.is_none());
+    }
+
+    #[test]
+    fn a_second_key_while_an_action_is_running_opens_nothing() {
+        let (mut snap, mut st) = setup(&[(1, "+")]);
+        handle_key(&mut st, &snap, key("s"), 120);
+        assert!(matches!(press_y(&mut st, &snap), Outcome::Engine(_)));
+        handle_key(&mut st, &snap, key("s"), 120);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some(NOTICE_RUNNING)
+        );
+        assert!(st.confirm.is_none());
+        // Answered and applied, with the same Arc on screen: still running.
+        snap.action_seq = 1;
+        snap.action_applied = true;
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("staged hunk 1/1 of a.rs")
+        );
+        assert!(st.action_running(&snap));
+        handle_key(&mut st, &snap, key("d"), 120);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some(NOTICE_RUNNING)
+        );
+        // A fresh Arc frees the keys.
+        let fresh = snapshot("a.rs", "r2", &[(1, "+")]);
+        snap.diff = fresh.diff.clone();
+        st.observe(&snap);
+        assert!(!st.action_running(&snap));
+        st.reconcile(&snap);
+        handle_key(&mut st, &snap, key("d"), 120);
+        assert!(st.confirm.is_some());
+    }
+
+    #[test]
+    fn a_refused_answer_frees_the_keys_at_once_and_carries_the_unstage_hint() {
+        let (mut snap, mut st) = setup(&[(1, "+")]);
+        handle_key(&mut st, &snap, key("d"), 120);
+        press_y(&mut st, &snap);
+        snap.action_seq = 1;
+        snap.action_error = Some("f.txt: does not match index".into());
+        snap.action_applied = true;
+        st.observe(&snap);
+        let notice = st.notice.as_ref().unwrap();
+        assert!(notice.urgent);
+        assert_eq!(
+            notice.text,
+            "discard failed: f.txt: does not match index; unstage it first (s)"
+        );
+        assert!(
+            st.action_running(&snap),
+            "applied on the same Arc still holds"
+        );
+        snap.action_seq = 2;
+        snap.action_error = Some(NOTICE_CHANGED.into());
+        snap.action_applied = false;
+        st.pending_action = Some(crate::tui::state::PendingAction {
+            diff: arc_of(&snap),
+            done: "x".into(),
+            verb: "stage",
+            answered: false,
+        });
+        st.observe(&snap);
+        assert!(
+            !st.action_running(&snap),
+            "a pre-git refusal frees the keys"
+        );
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("stage failed: the diff changed; look again")
+        );
+    }
+
+    #[test]
+    fn a_cut_diff_refuses_every_key() {
+        let (mut snap, mut st) = setup(&[(1, "+++++")]);
+        if let DiffState::Ready(d) = &mut snap.diff {
+            let d = std::sync::Arc::make_mut(d);
+            d.truncated_lines = 2;
+        }
+        st.reconcile(&snap);
+        for k in ["s", "d", "D"] {
+            handle_key(&mut st, &snap, key(k), 120);
+            assert_eq!(
+                st.notice.as_ref().map(|n| n.text.as_str()),
+                Some(NOTICE_CUT),
+                "{k}"
+            );
+            assert!(st.confirm.is_none());
+        }
+    }
+
+    #[test]
+    fn an_action_answer_over_an_unread_warning_puts_it_back() {
+        use crate::engine::{Mark, MarkState};
+        let (mut snap, mut st) = setup(&[(1, "+")]);
+        handle_key(&mut st, &snap, key("s"), 120);
+        press_y(&mut st, &snap);
+        // One snapshot carries both the answer and a rewritten classification: the answer speaks
+        // first (8.5's rule), and the warning waits for the body key that acknowledges it.
+        snap.head_seen = Some("h1".repeat(20));
+        snap.mark = Some(Mark {
+            commit: "m".repeat(40),
+            at: 1,
+            state: MarkState::Rewritten,
+            classified_at: snap.head_seen.clone(),
+        });
+        snap.action_seq = 1;
+        snap.action_applied = true;
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("staged hunk 1/1 of a.rs")
+        );
+        handle_key(&mut st, &snap, key("t"), 120);
+        let notice = st.notice.as_ref().expect("the warning follows the answer");
+        assert!(notice.urgent && notice.text.contains("no longer on this branch"));
     }
 }

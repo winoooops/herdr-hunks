@@ -547,6 +547,14 @@ async fn status_rows_cover_the_criterion_one_fixture() {
     }
     git(p, &["add", "-A"]);
     git(p, &["commit", "-q", "-m", "init"]);
+    std::fs::write(p.join("md.txt"), "m\n").unwrap();
+    std::fs::write(p.join("ad.txt"), "x\n").unwrap();
+    git(p, &["add", "md.txt"]);
+    git(p, &["commit", "-q", "-m", "md"]);
+    std::fs::write(p.join("md.txt"), "M\n").unwrap();
+    git(p, &["add", "md.txt", "ad.txt"]);
+    std::fs::remove_file(p.join("md.txt")).unwrap(); // MD
+    std::fs::remove_file(p.join("ad.txt")).unwrap(); // AD
     std::fs::write(p.join("mm.txt"), "ONE\n2\n3\n4\n5\n6\n7\n8\n").unwrap();
     git(p, &["add", "mm.txt"]);
     std::fs::write(p.join("mm.txt"), "ONE\n2\n3\n4\n5\n6\n7\nEIGHT\n").unwrap(); // MM
@@ -571,6 +579,10 @@ async fn status_rows_cover_the_criterion_one_fixture() {
         ("mm.txt", false),
         ("am.txt", true),
         ("am.txt", false),
+        ("md.txt", true),
+        ("md.txt", false),
+        ("ad.txt", true),
+        ("ad.txt", false),
         ("del.txt", true),
         ("renamed.txt", true),
         ("newdir/deep/u.txt", false),

@@ -22,10 +22,11 @@ result is PENDING.
 | 6. Branch scope parity | On a branch with committed and uncommitted changes (the fixture of `branch_scope_lists_every_change_the_branch_carries_once`, or a real worktree), press `b`. Compare the row list with `git diff $(git merge-base HEAD main) --name-status -M --` plus the `??` rows of `git status --porcelain --untracked-files=all`; compare one tracked row's hunks with `git diff <M> -- <path>`, the rename with `git diff <M> -M -- <old> <new>`, and an untracked row with `git diff --no-index -- /dev/null <path>`. | Every changed path is listed once (twice only for a path deleted on the branch and recreated untracked) and each diff matches hunk for hunk. | pass | 2026-09-22 | herdr 0.8.0 + vimeflow 0.8.0 (tier B on both at `b090e5a`); by-hand check on a build of `b090e5a` | Linux 7.1.3 x86_64 (Nobara 44) |
 | 7. Default base and remembered pick | On a repository with `main` and no configuration, press `b`: the chip reads `vs main`. Press `B`, pick another ref, close the viewer, reopen it on the same worktree and press `b`. | The base is `main` without configuration; the reopened viewer compares against the picked ref. | pass | 2026-09-22 | n/a (viewer built from `b090e5a`, run directly; git 2.55.0) | Linux 7.1.3 x86_64 (Nobara 44) |
 | 8. Review marks | On a branch where an agent has committed, press `b`, read the rows and press `M`: every `●` clears. Have the agent commit again and compare the marked rows with `git diff <marked commit> HEAD --name-only --no-renames`. Edit a file without committing, press `M` again. Close and reopen the viewer. | The dots clear on `M`; after the new commit exactly that command's paths carry one; an uncommitted edit carries none and `M` still clears everything; the mark survives reopening. | pass | 2026-09-23 | n/a (viewer 0.0.3 built from `1d0dd11`, run directly; git 2.55.0) | Linux 7.1.3 x86_64 (Nobara 44) |
+| 9. Hunk actions | On an `MM` file with two hunks on each side, press `s` on an unstaged hunk, `s` on the staged row, `d` on an unstaged hunk, `d` on a staged hunk while the file has unstaged changes and again once it has none, comparing with `git diff` and `git diff --cached` after each step; `D` then `n` on an untracked row, `D` then `y`; the keys in branch scope; an edit by the agent between the frame and `y`; from a pane in a subdirectory (K1) a staged rename with edits (K4), an `MD` path (K5) and `tools` replaced by `tools/run` in the index (K7). | Each step changes exactly the hunk or row the box named and nothing else; the staged discard is refused with the unstage hint while unstaged edits remain and discards exactly that hunk once they are gone; `n` changes nothing and `y` deletes the file; branch scope shows the notice; the edited hunk is refused with `the diff changed; look again`; the four defect fixtures behave as spec 9 says. | pass | 2026-10-02 | n/a (viewer 0.0.4 built from `14cd488`, run in a herdr pane on a scratch repository; git 2.55.0; Tier B green on herdr 0.8.0 and vimeflow 0.8.0) | Linux 7.1.3 x86_64 (Nobara 44) |
 
 Only the orchestrator/user may replace result cells with `pass`, fill in the date,
 version, and host evidence, and change the first line to `Status: PASS` after all
-eight rows pass. Rows 1–7 belong to the earlier releases; row 8 covers 0.0.3.
+nine rows pass. Rows 1–8 belong to the earlier releases; row 9 covers 0.0.4.
 The release workflow's guard refuses to build or publish without that PASS line.
 Record both upstream and fork observations for criteria 2–4;
 the inotify exhaustion check specifically requires a Linux test host.
@@ -87,6 +88,30 @@ all 15 passed.
   `git reset --hard` past the marked commit produced
   `the marked commit is no longer on this branch; press M again` with every row flagged, and
   the rows, the diff and the base kept working.
+
+- **Row 9.** 2026-10-02 on `105f18b` and again on 2026-10-04 on the release commit `14cd488`,
+  viewer 0.0.4 run in a herdr pane on a scratch repository holding every fixture the row names. On the `MM` file (two hunks staged, two unstaged) `s` on the
+  unstaged GAMMA hunk opened `Stage hunk 1/2 of mm.txt?`, and `y` answered `staged hunk 1/2 of
+  mm.txt` with `git diff --cached` showing ALPHA, BETA and GAMMA and `git diff` DELTA only; `s` on
+  the staged row's third hunk (`Move hunk 3/3 of mm.txt out of the index?`) put GAMMA back on the
+  working-tree side; `d` on the unstaged GAMMA hunk (`This cannot be undone.`) left ALPHA and BETA
+  staged and DELTA unstaged; `d` on a staged hunk while DELTA remained answered `discard failed:
+  error: mm.txt: does not match index; unstage it first (s)` and changed nothing; once the file was
+  clean, `d` on the staged BETA hunk answered `discarded hunk 2/2 of mm.txt`, leaving ALPHA staged
+  and `beta` restored in the file. On the untracked row `D` opened `Delete untracked file?` / `It
+  is not in git and cannot be recovered.`; `n` left the file in place and `D` then `y` answered
+  `deleted u.txt` with the file gone. In branch scope (`vs main`) `s`, `d` and `D` each showed
+  `switch to worktree scope (b) to stage or discard` and changed nothing. With the box open on
+  `sub/deep.txt`, an external edit landed before `y`: the answer was `stage failed: the diff
+  changed; look again` and the index stayed empty. The defect fixtures: from a pane whose cwd was
+  the subdirectory `sub/` (K1), `s` then `y` staged `sub/deep.txt` (`M  sub/deep.txt`); on the
+  staged rename with two hunks (K4), unstaging hunk 1 gave `RM ren.txt -> renamed.txt` with the
+  rename standing in `git diff --cached -M` beside `+TWO`, and `+ONE` on the working-tree side; the
+  `MD` path (K5) listed a staged `M` row and an unstaged `D` row, and `D` on the staged row was
+  refused with the unstage hint while the file stayed absent; the `D tools` row beside `A tools/run`
+  (K7) showed only its own `-x` hunk, and `D` on it answered `discard failed: not a regular file:
+  not applied here` with both index entries intact. The recording test (`cargo test --test
+  hunk_actions`) and the Tier B test on both hosts passed on both commits.
 
 ## Automated Tier B check
 

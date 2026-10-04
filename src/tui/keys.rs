@@ -22,6 +22,9 @@ pub enum KeyAction {
     ToggleScope,
     PickBase,
     MarkReviewed,
+    StageHunk,
+    DiscardHunk,
+    DiscardFile,
     First,
     Last,
     ScrollLeft,
@@ -38,9 +41,7 @@ pub struct Binding {
     pub vimeflow: Option<&'static str>,
 }
 
-pub const RESERVED: &[&str] = &[
-    "s", "d", "D", "i", "I", "u", "U", "x", "v", "y", "Y", "@", "c", "/",
-];
+pub const RESERVED: &[&str] = &["i", "I", "u", "U", "x", "X", "v", "y", "Y", "@", "c", "/"];
 
 pub const KEYS: &[Binding] = &[
     Binding {
@@ -126,6 +127,24 @@ pub const KEYS: &[Binding] = &[
         label: "refresh",
         action: KeyAction::Refresh,
         vimeflow: Some("diff-refresh"),
+    },
+    Binding {
+        key: "s",
+        label: "stage / unstage hunk",
+        action: KeyAction::StageHunk,
+        vimeflow: Some("diff-hunk-stage"),
+    },
+    Binding {
+        key: "d",
+        label: "discard hunk",
+        action: KeyAction::DiscardHunk,
+        vimeflow: Some("diff-hunk-discard"),
+    },
+    Binding {
+        key: "D",
+        label: "discard file",
+        action: KeyAction::DiscardFile,
+        vimeflow: Some("diff-file-discard"),
     },
     Binding {
         key: "b",
@@ -276,8 +295,8 @@ mod tests {
                 assert_eq!(lookup(&KeyEvent::new(code, modifiers)), None);
             }
         }
-        assert_eq!(KEYS.len(), 24);
-        assert_eq!(help_panel(false).rows.len(), 24);
+        assert_eq!(KEYS.len(), 27);
+        assert_eq!(help_panel(false).rows.len(), 27);
     }
 
     #[test]
@@ -308,7 +327,11 @@ mod tests {
         );
         assert_eq!(
             lookup(&KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
-            None
+            Some(KeyAction::DiscardHunk)
+        );
+        assert_eq!(
+            lookup(&KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT)),
+            Some(KeyAction::DiscardFile)
         );
         for modifiers in [
             KeyModifiers::ALT,
