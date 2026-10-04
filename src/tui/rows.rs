@@ -288,6 +288,8 @@ mod tests {
                 raw_diff: String::new(),
                 repo_root: String::new(),
             },
+            Vec::new(),
+            None,
         )
     }
 

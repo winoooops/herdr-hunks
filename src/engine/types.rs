@@ -29,6 +29,29 @@ impl FileKey {
     }
 }
 
+/// What the working tree holds at the row's path, from lstat (spec 9.2 "Stale content").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeKind {
+    Absent,
+    /// A regular file: a hash of its bytes.
+    File(u64),
+    /// A symlink: a hash of its target's bytes.
+    Symlink(u64),
+    Directory,
+    Other,
+}
+
+/// The pre-image a diff was read against; `None` on `LoadedDiff` when its two readings disagreed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreImage {
+    /// `<mode> <object id> <stage>` of `ls-files -s`; `None` when the index has no entry.
+    pub index: Option<String>,
+    /// The same for the row's rename source, whose entry a forward form applies to; `None` when
+    /// the row has no source or the source has no entry.
+    pub source: Option<String>,
+    pub worktree: WorktreeKind,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     Worktree,
@@ -144,6 +167,10 @@ pub struct LoadedDiff {
     pub read_at: Option<String>,
     pub file_diff: FileDiff,
     pub raw_diff: String,
+    /// The kept sections, byte for byte: what an action applies back.
+    pub patch: Vec<u8>,
+    /// `None` when the two readings around the diff disagreed.
+    pub pre_image: Option<PreImage>,
     pub targets: Vec<Target>,
     pub unified_order: Vec<usize>,
     pub truncated_lines: usize,
@@ -155,8 +182,18 @@ impl LoadedDiff {
         comparison: Comparison,
         read_at: Option<String>,
         response: GetGitDiffResponse,
+        patch: Vec<u8>,
+        pre_image: Option<PreImage>,
     ) -> Self {
-        Self::build_with_cap(key, comparison, read_at, response, MAX_DIFF_LINES)
+        Self::build_with_cap(
+            key,
+            comparison,
+            read_at,
+            response,
+            patch,
+            pre_image,
+            MAX_DIFF_LINES,
+        )
     }
 
     pub fn build_with_cap(
@@ -164,6 +201,8 @@ impl LoadedDiff {
         comparison: Comparison,
         read_at: Option<String>,
         response: GetGitDiffResponse,
+        patch: Vec<u8>,
+        pre_image: Option<PreImage>,
         cap: usize,
     ) -> Self {
         let total: usize = response.file_diff.hunks.iter().map(|h| h.lines.len()).sum();
@@ -192,12 +231,40 @@ impl LoadedDiff {
             read_at,
             file_diff,
             raw_diff: response.raw_diff,
+            patch,
+            pre_image,
             targets,
             unified_order,
             truncated_lines: total - kept,
         }
     }
 }
+
+/// What the key means; the row gives the direction (spec 9.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    Stage,
+    Discard,
+    DiscardFile,
+}
+
+/// A confirmed action against the very diff the box was opened on.
+#[derive(Debug, Clone)]
+pub struct Action {
+    pub kind: ActionKind,
+    /// The diff the box was opened on.
+    pub diff: Arc<LoadedDiff>,
+    /// The hunk under the cursor; `None` for `DiscardFile` and for every untracked row.
+    pub hunk: Option<usize>,
+}
+
+impl PartialEq for Action {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.hunk == other.hunk && Arc::ptr_eq(&self.diff, &other.diff)
+    }
+}
+
+impl Eq for Action {}
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -216,7 +283,7 @@ pub struct Snapshot {
     /// What steps 2-5 of the resolution order name, for the picker's reset row.
     pub default_base: Option<String>,
     pub files: Vec<ChangedFile>,
-    /// Branch scope only: a renamed row's path -> its old path.
+    /// A renamed row's path -> its old path, in both scopes; the diff task asks by side.
     pub rename_sources: Arc<BTreeMap<String, String>>,
     /// Branch scope paths changed since the mark; non-Current states flag every row instead.
     pub unread: Arc<BTreeSet<String>>,
@@ -237,6 +304,11 @@ pub struct Snapshot {
     /// Bumped once per answered `MarkReviewed`; `mark_error` is that answer.
     pub mark_seq: u64,
     pub mark_error: Option<String>,
+    /// Bumped once per answered `Act`; `action_error` and `action_applied` are that answer.
+    pub action_seq: u64,
+    pub action_error: Option<String>,
+    /// Whether any `apply` form ran for the answered `Act`.
+    pub action_applied: bool,
 }
 
 impl Snapshot {
@@ -269,6 +341,9 @@ impl Snapshot {
             pick_error: None,
             mark_seq: 0,
             mark_error: None,
+            action_seq: 0,
+            action_error: None,
+            action_applied: false,
         }
     }
 }
@@ -287,6 +362,8 @@ pub enum Command {
     MarkReviewed(String),
     /// Answer with `refs` and this opening's token on the snapshot.
     LoadRefs(u64),
+    /// Run the apply forms of spec 9.2 for this confirmed action; answered on `action_seq`.
+    Act(Action),
     Shutdown,
 }
 
@@ -344,6 +421,8 @@ mod tests {
             Comparison::Worktree,
             None,
             response(vec![hunk(1, 3), hunk(50, 2)]),
+            Vec::new(),
+            None,
             10,
         );
         assert_eq!(loaded.file_diff.hunks.len(), 2);
@@ -360,6 +439,8 @@ mod tests {
             Comparison::Worktree,
             None,
             response(vec![hunk(1, 6), hunk(50, 6), hunk(90, 1)]),
+            Vec::new(),
+            None,
             10,
         );
         assert_eq!(loaded.file_diff.hunks.len(), 1);
@@ -374,6 +455,8 @@ mod tests {
             Comparison::Worktree,
             None,
             response(vec![hunk(1, 25)]),
+            Vec::new(),
+            None,
             10,
         );
         assert_eq!(loaded.file_diff.hunks.len(), 1);
@@ -422,7 +505,14 @@ mod tests {
         let branch = Comparison::Branch {
             merge_base: "1".repeat(40),
         };
-        let loaded = LoadedDiff::build(key(), branch.clone(), None, response(vec![hunk(1, 1)]));
+        let loaded = LoadedDiff::build(
+            key(),
+            branch.clone(),
+            None,
+            response(vec![hunk(1, 1)]),
+            Vec::new(),
+            None,
+        );
         assert_eq!(loaded.comparison, branch);
         assert_ne!(loaded.comparison, Comparison::Worktree);
         let empty = Snapshot::empty("/r");

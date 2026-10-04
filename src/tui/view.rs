@@ -22,6 +22,9 @@ pub enum Action {
     ToggleView,
     ToggleFiles,
     Refresh,
+    StageHunk,
+    DiscardHunk,
+    DiscardFile,
     SelectFile(usize),
     CursorToRow(usize),
     PickRow(usize),
@@ -39,6 +42,9 @@ impl Action {
             Self::ToggleView => KeyAction::ToggleView,
             Self::ToggleFiles => KeyAction::ToggleFiles,
             Self::Refresh => KeyAction::Refresh,
+            Self::StageHunk => KeyAction::StageHunk,
+            Self::DiscardHunk => KeyAction::DiscardHunk,
+            Self::DiscardFile => KeyAction::DiscardFile,
             Self::SelectFile(_) | Self::CursorToRow(_) | Self::PickRow(_) => return None,
         })
     }
@@ -56,6 +62,7 @@ impl Hit {
         state.mouse_requested
             && !state.help_open
             && state.picker.is_none()
+            && state.confirm.is_none()
             && state
                 .hover
                 .is_some_and(|(x, y)| self.y == y && x >= self.x0 && x < self.x1)
@@ -219,6 +226,23 @@ fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Ve
         ),
     ];
     if snapshot.scope == Scope::Worktree {
+        // The group of spec 9.3 sits between the steppers and is the first item dropped.
+        let ready = matches!(snapshot.diff, DiffState::Ready(_));
+        let stage = if staged { "unstage" } else { "stage" };
+        let chip = |text: &str, action: Action| (text.to_string(), ready.then_some(action));
+        items.insert(
+            1,
+            (
+                vec![
+                    chip(stage, Action::StageHunk),
+                    (" ".into(), None),
+                    chip("discard", Action::DiscardHunk),
+                    (" ".into(), None),
+                    chip("discard file", Action::DiscardFile),
+                ],
+                8,
+            ),
+        );
         items.push((
             vec![(if staged { "STAGED" } else { "UNSTAGED" }.into(), None)],
             4,
@@ -593,6 +617,7 @@ pub fn body_is_drawn(state: &ViewState, snapshot: &Snapshot, columns: u16, heigh
         && height >= 10
         && !state.help_open
         && state.picker.is_none()
+        && state.confirm.is_none()
         && (matches!(&snapshot.diff, DiffState::Ready(_)) || snapshot.files.is_empty())
 }
 
@@ -662,9 +687,11 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
         "t view",
         "e files",
         "r refresh",
-        "? help",
-        "q quit",
     ];
+    if snapshot.scope == Scope::Worktree {
+        hints.extend(["s stage", "d discard", "D file"]);
+    }
+    hints.extend(["? help", "q quit"]);
     while width(&hints.join("  ")) > usize::from(columns) {
         // Keep help and quit until the other hints have gone.
         hints.remove(hints.len().saturating_sub(3));
@@ -751,6 +778,25 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
                 action: Action::PickRow(first + i),
             });
         }
+    }
+    if let Some(confirm) = &state.confirm {
+        let panel_width = columns.min(60);
+        let panel = confirm.panel(panel_width);
+        let panel_height =
+            (dialog::line_count(&panel, panel_width) + 4).min(usize::from(height) - 2) as u16;
+        let x = usize::from((columns - panel_width) / 2);
+        for (y, overlay) in dialog::render(&panel, panel_width, panel_height)
+            .into_iter()
+            .enumerate()
+        {
+            let background = &lines[y + 1];
+            let mut line = clip_line(background, 0, x);
+            line.extend(overlay);
+            let right = x + usize::from(panel_width);
+            line.extend(clip_line(background, right, usize::from(columns) - right));
+            lines[y + 1] = line;
+        }
+        hits.clear();
     }
     Rendered { lines, hits }
 }
@@ -923,6 +969,9 @@ mod tests {
             "t view",
             "e files",
             "r refresh",
+            "s stage",
+            "d discard",
+            "D file",
             "? help",
             "q quit",
         ] {
@@ -1172,7 +1221,8 @@ mod tests {
                 }
                 x = end;
             }
-            assert_eq!(chips, 7);
+            // The seven Phase 1 chips and the three action chips of spec 9.3.
+            assert_eq!(chips, 10);
             assert!(r.lines[0]
                 .iter()
                 .any(|s| s.text == if busy { " … " } else { " ⟳ " }));
@@ -1773,5 +1823,105 @@ mod tests {
         snap.mark.as_mut().unwrap().commit = commit;
         snap.base.as_mut().unwrap().requested = "refs/heads/main".into();
         assert!(render(&snap, &st, 120, 24).plain()[0].contains("vs main"));
+    }
+
+    #[test]
+    fn the_toolbar_group_sits_between_the_steppers_and_drops_first() {
+        // The fixture's toolbar needs about 132 columns with the group; it shows at 140 and is the
+        // first thing dropped below that.
+        let (r, _) = rendered(140, 20, FilesPanel::Hidden);
+        let bar = &r.plain()[0];
+        let stepper = bar.find("‹  a.rs").unwrap();
+        let group = bar.find(" stage ").unwrap();
+        let hunks = bar.find("{} 1/2").unwrap();
+        assert!(stepper < group && group < hunks, "{bar}");
+        assert!(
+            bar.contains(" discard ") && bar.contains(" discard file "),
+            "{bar}"
+        );
+        for action in [Action::StageHunk, Action::DiscardHunk, Action::DiscardFile] {
+            assert!(
+                r.hits.iter().any(|h| h.y == 0 && h.action == action),
+                "{action:?}"
+            );
+        }
+        for columns in [120, 80] {
+            let (r, _) = rendered(columns, 20, FilesPanel::Hidden);
+            let bar = &r.plain()[0];
+            assert!(
+                !bar.contains("discard") && bar.contains("{} 1/2"),
+                "{columns}: {bar}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_group_reads_unstage_on_a_staged_row_and_is_absent_in_branch_scope_and_dim_while_loading()
+    {
+        let mut snap = files(snapshot("a.rs", "r1", &[(1, "+")]));
+        if let DiffState::Ready(d) = &mut snap.diff {
+            std::sync::Arc::make_mut(d).key.staged = true;
+        }
+        snap.selected.as_mut().unwrap().staged = true;
+        let st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        let bar = render(&snap, &st, 140, 20).plain()[0].clone();
+        assert!(
+            bar.contains(" unstage ") && !bar.contains(" stage "),
+            "{bar}"
+        );
+        snap.scope = Scope::Branch;
+        snap.base = Some(crate::engine::Base {
+            requested: "refs/heads/main".into(),
+            commit: "c".repeat(40),
+            merge_base: Some("m".repeat(40)),
+            source: crate::engine::BaseSource::Default,
+        });
+        let r = render(&snap, &st, 140, 20);
+        assert!(!r.plain()[0].contains("discard"));
+        assert!(!r.plain().last().unwrap().contains("s stage"));
+        snap.scope = Scope::Worktree;
+        snap.diff = DiffState::Loading;
+        let r = render(&snap, &st, 140, 20);
+        assert!(r.plain()[0].contains("discard"));
+        assert!(!r.hits.iter().any(|h| matches!(
+            h.action,
+            Action::StageHunk | Action::DiscardHunk | Action::DiscardFile
+        )));
+    }
+
+    #[test]
+    fn the_box_covers_the_body_and_fits_the_minimum_terminal() {
+        let snap = files(snapshot(
+            "a/very/long/directory/name/that/goes/on/and/on/values.ts",
+            "r1",
+            &[(1, "+")],
+        ));
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.resize(40, body_height(&st, &snap, 10));
+        st.reconcile(&snap);
+        crate::tui::input::handle_key(
+            &mut st,
+            &snap,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('D'),
+                crossterm::event::KeyModifiers::SHIFT,
+            ),
+            40,
+        );
+        assert!(st.confirm.is_some());
+        let r = render(&snap, &st, 40, 10);
+        let text = r.plain();
+        assert!(text.iter().any(|l| l.contains("Discard file?")), "{text:?}");
+        assert!(
+            text.iter().any(|l| l.contains("cannot be undone")),
+            "{text:?}"
+        );
+        assert!(text.iter().any(|l| l.contains("y yes · n no")), "{text:?}");
+        assert!(r.hits.is_empty());
+        assert!(!body_is_drawn(&st, &snap, 40, 10));
+        assert_eq!(
+            render(&snap, &st, 39, 10).plain(),
+            vec!["terminal too small"]
+        );
     }
 }

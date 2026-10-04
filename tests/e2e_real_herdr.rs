@@ -236,6 +236,17 @@ fn open_split_creates_one_viewer_and_reuses_it() {
                 .unwrap()
                 .success());
         };
+        let git_out = |args: &[&str]| -> String {
+            let out = iso
+                .command("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
         git(&["init", "-q", "-b", "main"]);
         git(&["config", "user.email", "t@example.com"]);
         git(&["config", "user.name", "t"]);
@@ -366,6 +377,49 @@ fn open_split_creates_one_viewer_and_reuses_it() {
             let screen = iso.herdr_text(&["pane", "read", viewer_id, "--source", "visible"]);
             !screen.contains('●')
         });
+
+        // Phase 2: stage the one unstaged hunk of a.txt from the keyboard.
+        std::fs::write(repo.join("a.txt"), "a\nSTAGE-ME\n").unwrap();
+        iso.herdr(&["pane", "send-text", viewer_id, "b"]); // back to worktree scope
+                                                           // The diff line is drawn (`+ STAGE-ME`), not only the row.
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "STAGE-ME",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        iso.herdr(&["pane", "send-text", viewer_id, "s"]);
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "Stage hunk?",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        iso.herdr(&["pane", "send-text", viewer_id, "y"]);
+        wait_for("the row moves to the staged side", || {
+            git_out(&["status", "--porcelain=v1", "--", "a.txt"]).trim() == "M  a.txt"
+        });
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "staged hunk 1/1 of a.txt",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
         assert_eq!(
             viewer["cwd"].as_str().map(PathBuf::from),
             Some(std::fs::canonicalize(&repo).unwrap())

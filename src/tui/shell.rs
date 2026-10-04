@@ -151,6 +151,7 @@ fn run_terminal(
         }
         if dirty {
             let mut drew_body = false;
+            let mut box_fits = false;
             terminal.draw(|frame| {
                 let area = frame.area();
                 width = area.width;
@@ -158,6 +159,10 @@ fn run_terminal(
                 state.reconcile(&snapshot);
                 rendered = view::render(&snapshot, &state, width, area.height);
                 drew_body = view::body_is_drawn(&state, &snapshot, width, area.height);
+                box_fits = state
+                    .confirm
+                    .as_ref()
+                    .is_some_and(|c| c.fits(width, area.height));
                 let lines: Vec<_> = rendered
                     .lines
                     .iter()
@@ -177,6 +182,10 @@ fn run_terminal(
                 frame.render_widget(Paragraph::new(lines), area);
             })?;
             state.record_drawn(&snapshot, drew_body);
+            // A box the frame clipped is drawn but not confirmable (spec 9.3).
+            if let Some(confirm) = state.confirm.as_mut() {
+                confirm.drawn = box_fits;
+            }
             dirty = false;
         }
         match guard::poll_terminal(Duration::ZERO).and_then(|pending| {

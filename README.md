@@ -2,9 +2,9 @@
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md)
 
-A read-only git hunk viewer for [Herdr](https://herdr.dev), with changed files,
-unified/split diffs, a clickable navigation toolbar, and live refresh.
-Phase 1 does not stage, unstage, discard, add comments, or dispatch to agents.
+A git hunk viewer for [Herdr](https://herdr.dev), with changed files,
+unified/split diffs, a clickable navigation toolbar, live refresh, and hunk
+staging behind a y/n box. It does not add comments or dispatch to agents.
 
 ## Install
 
@@ -38,7 +38,7 @@ herdr plugin action invoke update --plugin winoooops.hunks
 
 Standalone: `herdr-hunks [PATH]` or `herdr-hunks tui [PATH]`; PATH defaults to the
 current directory. Both stdin and stdout must be terminals. `--version` prints
-`herdr-hunks 0.0.3`. Action diagnostics are available through
+`herdr-hunks 0.0.4`. Action diagnostics are available through
 `herdr plugin log list --plugin winoooops.hunks --limit 1`.
 
 ## Keybinding
@@ -68,6 +68,9 @@ To bind the split action instead, change `command` to
 | `t` | Toggle unified / split; split needs at least 100 columns |
 | `e` / `E` | Toggle / pin the files panel |
 | `r` | Refresh |
+| `s` | Stage the hunk under the cursor, or unstage it on a staged row; whole file on an untracked row (worktree scope) |
+| `d` | Discard the hunk under the cursor; deletes an untracked file (worktree scope) |
+| `D` | Discard every change the row shows (worktree scope) |
 | `b` | Switch scope: worktree <-> branch |
 | `B` | Compare against: pick the base |
 | `M` | Mark the current commit as reviewed |
@@ -79,8 +82,8 @@ To bind the split action instead, change `command` to
 | Esc | Close the key sheet or base picker; otherwise close a popup viewer |
 | Ctrl+C | Quit immediately, including from the key sheet or base picker |
 
-Arrow, page, Home, and End aliases require no modifiers. Phase 1 leaves
-`s d D i I u U x v y Y @ c /` unbound.
+Arrow, page, Home, and End aliases require no modifiers. Phase 2 leaves
+`i I u U x X v y Y @ c /` unbound.
 
 ## Mouse
 
@@ -164,7 +167,7 @@ to git fully qualified; free text and `[base] ref` are passed as written, so
 write `refs/heads/x` when a tag shares the name. A pick is remembered per
 worktree; when the state directory is unusable it lasts for the session.
 
-Branch scope is read-only like the rest of the viewer: it adds `merge-base`
+Branch scope runs only reads: it adds `merge-base`
 and `for-each-ref` to the git commands the viewer runs. The base is
 re-checked on every refresh, so a base that moved (a merge into `main`, a
 fetch) is reflected within the poll interval.
@@ -188,6 +191,34 @@ choosing it narrows the list to what the working tree differs from the mark by.
 The same picker now lists `upstream`, `last commit` and `last 3 commits` when
 they resolve, so the common bases need no typing.
 
+## Hunk actions
+
+In worktree scope, `s` stages the hunk under the cursor (or unstages it on a
+staged row), `d` discards it and `D` discards every change the row shows. Each
+opens a box: `y` confirms, `n` cancels, every other key is inert. The box names
+the hunk and the file, and says so when the action cannot be undone: a
+discarded hunk is gone, and `D` on an untracked row deletes a file git never
+had.
+
+Every action is one `git apply` on a patch cut from the diff on screen: what
+you read is what git is given. A staged row's discard uses `--index`, so the
+index and the working tree change together or not at all; while the file has
+unstaged changes git refuses it, and the notice says to unstage first. The
+viewer re-reads the file and the index entry before applying and refuses with
+`the diff changed; look again` when they moved since the diff was read. Rows
+cut by the size cap, binary files, submodule pointers and unmerged paths are not
+acted on.
+
+The viewer builds every diff it shows with three lines of context, `a/` and
+`b/` prefixes and no textconv, so `diff.context`, `diff.noprefix`,
+`diff.mnemonicPrefix` and textconv drivers do not apply to it;
+`apply.ignoreWhitespace` is pinned off and `apply.whitespace` to `nowarn`. In
+branch scope the three keys show `switch to worktree scope (b) to stage or
+discard`.
+
+The viewer runs eleven git subcommands: the ten reads of branch scope and
+`apply`, which runs only from a confirmed key.
+
 ## Requirements
 
 - macOS or Linux, with terminal stdin and stdout.
@@ -197,13 +228,8 @@ they resolve, so the common bases need no typing.
 
 ## Known limitations
 
-This phase is read-only; staging and comments are not implemented.
-[PORT-SURFACE.md lists K1–K7](PORT-SURFACE.md#known-defects): K1–K4 are frozen
-mutation-path defects unreachable in Phase 1; K5 can hide the staged half of a
-modified/added-then-deleted file; K6 allows superseded slow diffs to accumulate
-git processes. In worktree scope, a staged row whose path turned from a file into
-a directory parses the directory's patch as its own (K7 in PORT-SURFACE.md); branch
-scope is unaffected. Paths that are not valid UTF-8 are shown with `\u{fffd}` in
+K1–K7 of PORT-SURFACE.md are closed in 0.0.4. Comments are not implemented.
+Paths that are not valid UTF-8 are shown with `\u{fffd}` in
 place of the offending bytes; git is given the replaced name, so their diff is empty
 (or that of a file literally so named); paths that differ only in those bytes share
 one row in branch scope, and in worktree scope when they are also the same kind of row
@@ -214,7 +240,7 @@ when reading a partial clone. No syntax highlighting or context expansion yet.
 
 ## Roadmap
 
-P1: read-only viewing. P2: stage/unstage/discard actions and defect fixes.
+P1: read-only viewing. P2: stage/unstage/discard actions and defect fixes (0.0.4).
 P3: comments and agent dispatch. P4: replies and threads. P5: delegated review.
 See the [design spec](docs/superpowers/specs/2026-09-18-hunks-roadmap-p1-viewer-design.md).
 

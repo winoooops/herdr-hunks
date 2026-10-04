@@ -881,14 +881,45 @@ fn parse_git_status(output: &str) -> Vec<ChangedFile> {
                 });
             }
             _ => {
-                // Default to modified unstaged for unknown codes
-                files.push(ChangedFile {
-                    path,
-                    status: ChangedFileStatus::Modified,
-                    staged: false,
-                    insertions: None,
-                    deletions: None,
-                });
+                // Each known side is its own row: X staged, Y unstaged. Unknown codes
+                // keep the old single unstaged Modified row.
+                let side = |code: u8| match code {
+                    b'M' | b'T' => Some(ChangedFileStatus::Modified),
+                    b'A' => Some(ChangedFileStatus::Added),
+                    b'D' => Some(ChangedFileStatus::Deleted),
+                    _ => None,
+                };
+                let bytes = xy.as_bytes();
+                let staged_half = side(bytes[0]);
+                let unstaged_half = side(bytes[1]);
+                if staged_half.is_none() && unstaged_half.is_none() {
+                    files.push(ChangedFile {
+                        path,
+                        status: ChangedFileStatus::Modified,
+                        staged: false,
+                        insertions: None,
+                        deletions: None,
+                    });
+                } else {
+                    if let Some(status) = staged_half {
+                        files.push(ChangedFile {
+                            path: path.clone(),
+                            status,
+                            staged: true,
+                            insertions: None,
+                            deletions: None,
+                        });
+                    }
+                    if let Some(status) = unstaged_half {
+                        files.push(ChangedFile {
+                            path,
+                            status,
+                            staged: false,
+                            insertions: None,
+                            deletions: None,
+                        });
+                    }
+                }
             }
         }
 
@@ -2303,6 +2334,46 @@ diff --git a/path.txt b/path.txt
         assert_eq!(files[1].path, "renamed.txt");
         assert!(matches!(files[1].status, ChangedFileStatus::Deleted));
         assert!(!files[1].staged, "Second RD entry should be unstaged");
+    }
+
+    #[test]
+    fn test_parse_git_status_splits_every_two_sided_code() {
+        // X is the index side, Y the worktree side; each non-blank side is one row.
+        let output = "MD md.txt\0AD ad.txt\0T  t1.txt\0 T t2.txt\0TM tm.txt\0MT mt.txt\0";
+        let files = parse_git_status(output);
+        let rows: Vec<(&str, bool, &str)> = files
+            .iter()
+            .map(|f| {
+                let status = match f.status {
+                    ChangedFileStatus::Modified => "M",
+                    ChangedFileStatus::Added => "A",
+                    ChangedFileStatus::Deleted => "D",
+                    ChangedFileStatus::Renamed => "R",
+                    ChangedFileStatus::Untracked => "?",
+                };
+                (f.path.as_str(), f.staged, status)
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("md.txt", true, "M"),
+                ("md.txt", false, "D"),
+                ("ad.txt", true, "A"),
+                ("ad.txt", false, "D"),
+                ("t1.txt", true, "M"),
+                ("t2.txt", false, "M"),
+                ("tm.txt", true, "M"),
+                ("tm.txt", false, "M"),
+                ("mt.txt", true, "M"),
+                ("mt.txt", false, "M"),
+            ]
+        );
+        // A letter outside M A D T keeps the old single unstaged row.
+        let files = parse_git_status("ZZ odd.txt\0");
+        assert_eq!(files.len(), 1);
+        assert!(!files[0].staged);
+        assert!(matches!(files[0].status, ChangedFileStatus::Modified));
     }
 
     #[test]
