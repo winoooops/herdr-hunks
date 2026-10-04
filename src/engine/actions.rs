@@ -13,6 +13,7 @@ pub const NOTICE_NO_HUNK: &str = "no hunk under the cursor";
 pub const NOTICE_CUT: &str = "diff cut by the size cap; use a shell";
 pub const NOTICE_BINARY: &str = "binary file: not applied here";
 pub const NOTICE_SUBMODULE: &str = "submodule: not applied here";
+pub const NOTICE_UNMERGED: &str = "unmerged path: not applied here";
 pub const NOTICE_NOT_A_FILE: &str = "not a regular file: not applied here";
 pub const NOTICE_CHANGED: &str = "the diff changed; look again";
 pub const NOTICE_RUNNING: &str = "an action is still running";
@@ -71,6 +72,8 @@ pub enum Kind {
     Text,
     Binary,
     Submodule,
+    /// A conflict's combined diff (`diff --cc`): no two-sided patch git could apply.
+    Unmerged,
 }
 
 /// The lines of `section`, each with its newline; a last line without one is still returned.
@@ -93,6 +96,9 @@ fn lines(section: &[u8]) -> Vec<&[u8]> {
 /// named in the section's `index` or mode lines, never in its content) is not a file.
 pub fn classify(patch: &[u8]) -> Kind {
     for section in sections(patch) {
+        if section.starts_with(b"diff --cc ") || section.starts_with(b"diff --combined ") {
+            return Kind::Unmerged;
+        }
         let (header, _) = split_section(section);
         for line in &header {
             let text = String::from_utf8_lossy(line);
@@ -347,6 +353,9 @@ pub fn plan(action: &Action) -> Result<(Form, Vec<u8>), String> {
     if kind == Kind::Submodule {
         return Err(NOTICE_SUBMODULE.into());
     }
+    if kind == Kind::Unmerged {
+        return Err(NOTICE_UNMERGED.into());
+    }
     let whole = action.kind == ActionKind::DiscardFile || diff.key.untracked;
     if whole {
         if kind == Kind::Binary {
@@ -598,6 +607,24 @@ mod tests {
         );
         assert!(text.ends_with("+target\n\\ No newline at end of file\n"));
         assert!(!text.contains("deleted file mode"));
+    }
+
+    #[test]
+    fn an_unmerged_rows_combined_diff_is_refused_before_git() {
+        let combined: &[u8] = b"diff --cc c.txt\nindex 1,2..3\n--- a/c.txt\n+++ b/c.txt\n@@@ -1,1 -1,1 +1,5 @@@\n++<<<<<<< HEAD\n +ours\n++=======\n+ theirs\n++>>>>>>> other\n";
+        assert_eq!(classify(combined), Kind::Unmerged);
+        let row = loaded("c.txt", false, false, Comparison::Worktree, combined, 1_000);
+        for (kind, hunk) in [
+            (ActionKind::Stage, Some(0)),
+            (ActionKind::Discard, Some(0)),
+            (ActionKind::DiscardFile, None),
+        ] {
+            assert_eq!(
+                plan(&act(kind, &row, hunk)).unwrap_err(),
+                NOTICE_UNMERGED,
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]

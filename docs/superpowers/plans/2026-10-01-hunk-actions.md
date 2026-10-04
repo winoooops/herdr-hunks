@@ -4015,3 +4015,13 @@ by the orchestrator, every fix falsified by hand before it counted.
   (fixed: the rewrite is for reverse forms only); the sibling rule overrode a selection made
   during the carrying refresh (fixed: it follows the acted row only when it was still
   selected). Spec 9.2 and 9.4 amended in the same commit.
+- **Codex round 2** (`87d4e82`). Two defects, both real: the pre-image checked only the
+  destination's index entry while a forward rename patch applies to the source's, so
+  `PreImage.source` is bracketed with the diff and re-checked for index-reading forms; the
+  working-tree hash read whole files, so it streams through a 64 KiB buffer. Spec 9.2 amended.
+- **Codex round 3.** No findings; the rounds stopped there.
+- **Kimi milestone.** Verdict: ship. Two LOW findings, both taken: `Cargo.toml`'s description
+  still said read-only; an unmerged (`UU`) row's combined `diff --cc` patch reached `git
+  apply`, which refused it with its raw text and changed nothing, and is now refused before
+  git with `unmerged path: not applied here` (spec 9.2 and 9.7, the READMEs, a planner test).
+  Kimi's own gates all passed; it did not re-run Tier B or mutate code to re-falsify tests.

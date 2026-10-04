@@ -166,7 +166,10 @@ with `binary file: not applied here`, because the displayed diff carries no
 payload git could apply. A row whose section is a submodule
 pointer (`Subproject commit`) is refused with `submodule: not applied here`,
 because `git apply` would ignore the pointer in the working tree and only
-unstage it in the index. In branch scope every key shows `switch to worktree
+unstage it in the index. An unmerged path, whose patch is a combined
+`diff --cc` section (7.2, 9.2), is refused with `unmerged path: not applied
+here`: a conflict has no two-sided patch git could apply, and resolving it is
+not a hunk action. In branch scope every key shows `switch to worktree
 scope (b) to stage or discard`.
 
 **Stale content.** Three guards, each stricter than the last. The command
@@ -500,7 +503,7 @@ leaves the index, the working tree and the rows untouched, and runs no
 | --- | --- |
 | `s`, `d` or `D` in branch scope | `switch to worktree scope (b) to stage or discard`; nothing is sent |
 | `s` or `d` on a tracked row with no hunk under the cursor | `no hunk under the cursor`; no box |
-| the row's diff is cut by the size cap, binary, or a submodule pointer | the notice of 9.2; no box |
+| the row's diff is cut by the size cap, binary, a submodule pointer, or an unmerged path | the notice of 9.2; no box |
 | a key while an `Act` is unanswered, or answered as applied while the diff it acted on is still on screen | `an action is still running`; no box |
 | the diff was replaced between the frame and `y`, or between `y` and the refresh that carries it; a form already ran on it; or the pre-image read before the form differs from the one read with the diff | `the diff changed; look again`; no form runs; the newer diff is on screen or arrives with the next refresh |
 | an `Act` fails 9.2's eligibility in the engine (a branch-scope `Arc`, a hunk index out of range) | the notice the TUI would have shown; no form runs |

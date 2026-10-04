@@ -206,7 +206,8 @@ index and the working tree change together or not at all; while the file has
 unstaged changes git refuses it, and the notice says to unstage first. The
 viewer re-reads the file and the index entry before applying and refuses with
 `the diff changed; look again` when they moved since the diff was read. Rows
-cut by the size cap, binary files and submodule pointers are not acted on.
+cut by the size cap, binary files, submodule pointers and unmerged paths are not
+acted on.
 
 The viewer builds every diff it shows with three lines of context, `a/` and
 `b/` prefixes and no textconv, so `diff.context`, `diff.noprefix`,

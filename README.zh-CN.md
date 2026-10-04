@@ -188,7 +188,7 @@ height = "80%"
 git 的。已暂存行的丢弃使用 `--index`，索引和工作区要么一起改变、要么都不变；
 文件还有未暂存改动时 git 会拒绝，提示先取消暂存。应用前查看器会重新读取文件和
 索引条目，若自读取 diff 以来有变化，则以 `the diff changed; look again` 拒绝。
-被大小上限截断的行、二进制文件和子模块指针不会被操作。
+被大小上限截断的行、二进制文件、子模块指针和未合并的路径不会被操作。
 
 查看器生成的每个 diff 都带三行上下文、`a/` 与 `b/` 前缀且不经过 textconv，
 因此 `diff.context`、`diff.noprefix`、`diff.mnemonicPrefix` 和 textconv 驱动
