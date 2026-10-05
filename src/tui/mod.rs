@@ -1,3 +1,4 @@
+pub mod cards;
 pub mod config;
 pub mod confirm;
 pub mod dialog;
@@ -8,6 +9,7 @@ pub mod keys;
 pub mod layout;
 pub mod panes;
 pub mod picker;
+pub mod review;
 pub mod rows;
 pub mod sanitize;
 pub mod shell;

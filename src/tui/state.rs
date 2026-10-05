@@ -1,10 +1,13 @@
 //! Everything the TUI owns that is not in the snapshot, and the 4.8 reconciliation rules.
 use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use crate::engine::nav::{self, Side, ViewMode};
 use crate::engine::{DiffState, LoadedDiff, Snapshot};
 use crate::tui::layout::{clamp_scroll, ensure_visible, reanchor, LineSpan};
-use crate::tui::rows::{self, Rows};
+use crate::tui::rows::{self, EditorAnchor, EditorPlace, Row, Rows};
+use crate::tui::{cards, review};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilesPanel {
@@ -36,6 +39,15 @@ pub struct Notice {
     pub urgent: bool,
 }
 
+type BuiltFrom = (
+    Option<Arc<LoadedDiff>>,
+    ViewMode,
+    Arc<Vec<crate::engine::comments::Comment>>,
+    u64,
+    u16,
+    Option<EditorPlace>,
+);
+
 pub struct ViewState {
     pub drawn_head: Option<String>,
     pub requested_mode: ViewMode,
@@ -56,6 +68,11 @@ pub struct ViewState {
     pub pending_action: Option<PendingAction>,
     pub panes: Option<crate::tui::panes::PanePicker>,
     pub panes_token: u64,
+    pub editor: Option<crate::tui::review::Editor>,
+    pub visual: Option<crate::tui::review::Visual>,
+    pub orphan: Option<usize>,
+    pub comment_token: u64,
+
     pub pick_token: u64,
     pub socket_path: Option<String>,
     pub refs_token: u64,
@@ -71,6 +88,7 @@ pub struct ViewState {
     /// What the notice on screen is, so displacing one can put it back.
     notice_kind: NoticeKind,
     seen_target_seq: u64,
+    seen_comment_seq: u64,
     deferred: VecDeque<String>,
     seen_mark_seq: u64,
     seen_action_seq: u64,
@@ -78,7 +96,8 @@ pub struct ViewState {
     width: u16,
     /// The diff the rows were built from. Holding the Arc makes `Arc::ptr_eq` a safe,
     /// allocation-free "did anything change" test; the engine swaps the Arc only on change.
-    built_from: Option<(std::sync::Arc<LoadedDiff>, ViewMode)>,
+    built_from: Option<BuiltFrom>,
+    last_diff: Option<Arc<LoadedDiff>>,
 }
 
 impl ViewState {
@@ -101,6 +120,10 @@ impl ViewState {
             pending_action: None,
             panes: None,
             panes_token: 0,
+            editor: None,
+            visual: None,
+            orphan: None,
+            comment_token: 0,
             pick_token: 0,
             socket_path: None,
             refs_token: 0,
@@ -113,12 +136,14 @@ impl ViewState {
             pending_base_error: None,
             notice_kind: NoticeKind::Other,
             seen_target_seq: 0,
+            seen_comment_seq: 0,
             deferred: VecDeque::new(),
             seen_mark_seq: 0,
             seen_action_seq: 0,
             seen_rewrite: None,
             width: 0,
             built_from: None,
+            last_diff: None,
         }
     }
 
@@ -205,19 +230,76 @@ impl ViewState {
         }
     }
 
-    fn keep_cursor_visible(&mut self) {
-        if let (Some(rows), Some(cursor)) = (&self.rows, self.cursor) {
-            if let Some(&row) = rows.row_of_target.get(cursor) {
-                self.offset = ensure_visible(
-                    self.offset,
+    pub fn body_width(&self) -> u16 {
+        self.width
+            .saturating_sub(if self.files_panel == FilesPanel::Hidden {
+                0
+            } else {
+                crate::tui::view::FILES_WIDTH + 1
+            })
+    }
+
+    pub fn editor_place(&self) -> Option<EditorPlace> {
+        let editor = self.editor.as_ref()?;
+        let after = editor
+            .editing
+            .as_ref()
+            .filter(|c| {
+                self.rows
+                    .as_ref()
+                    .is_some_and(|rows| rows.orphan_tops.iter().any(|(_, id)| id == &c.id))
+            })
+            .map_or_else(
+                || EditorAnchor::Anchor(editor.anchor.clone()),
+                |c| EditorAnchor::Orphan(c.id.clone()),
+            );
+        Some(EditorPlace {
+            after,
+            lines: editor
+                .lines(cards::card_width(usize::from(self.body_width()), self.mode))
+                .len(),
+        })
+    }
+
+    pub fn keep_cursor_visible(&mut self) {
+        let Some(rows) = &self.rows else { return };
+        let span = if self.editor.is_some() {
+            let first = rows
+                .rows
+                .iter()
+                .position(|r| matches!(r, Row::Editor { .. }));
+            let last = rows
+                .rows
+                .iter()
+                .rposition(|r| matches!(r, Row::Editor { .. }));
+            first.zip(last).map(|(first, last)| {
+                if last - first + 1 > usize::from(self.body_height) {
                     LineSpan {
-                        start: row,
+                        start: last.saturating_sub(1),
                         height: 1,
-                    },
-                    self.body_height,
-                    rows.rows.len(),
-                );
-            }
+                    }
+                } else {
+                    LineSpan {
+                        start: first,
+                        height: last - first + 1,
+                    }
+                }
+            })
+        } else if let Some(index) = self.orphan {
+            rows.orphan_tops.get(index).map(|(row, _)| LineSpan {
+                start: *row,
+                height: 1,
+            })
+        } else {
+            self.cursor
+                .and_then(|c| rows.row_of_target.get(c))
+                .map(|row| LineSpan {
+                    start: *row,
+                    height: 1,
+                })
+        };
+        if let Some(span) = span {
+            self.offset = ensure_visible(self.offset, span, self.body_height, rows.rows.len());
         }
     }
 
@@ -235,6 +317,11 @@ impl ViewState {
         if let Some(picker) = &mut self.panes {
             picker.observe(snapshot);
             if picker.done {
+                if let crate::tui::panes::ReturnTo::Editor(anchor) = &picker.return_to {
+                    if snapshot.target.is_some() {
+                        self.editor = Some(review::Editor::new(anchor.clone()));
+                    }
+                }
                 self.panes = None;
             }
         }
@@ -244,6 +331,27 @@ impl ViewState {
             if let Some(error) = &snapshot.target_error {
                 self.displace_urgent();
                 self.warn(crate::tui::sanitize::sanitize(error));
+            }
+        }
+        let answered_comment = snapshot.comment_seq != self.seen_comment_seq;
+        if answered_comment {
+            self.seen_comment_seq = snapshot.comment_seq;
+            if let Some(error) = &snapshot.comment_error {
+                self.displace_urgent();
+                self.warn(crate::tui::sanitize::sanitize(error));
+            }
+            if self
+                .editor
+                .as_ref()
+                .is_some_and(|e| e.pending.is_some() && e.pending == snapshot.comment_token)
+            {
+                if snapshot.comment_refused {
+                    if let Some(editor) = self.editor.as_mut() {
+                        editor.pending = None;
+                    }
+                } else {
+                    self.editor = None;
+                }
             }
         }
         let mut answered_mark = false;
@@ -359,33 +467,111 @@ impl ViewState {
     }
 
     pub fn reconcile(&mut self, snapshot: &Snapshot) {
-        let DiffState::Ready(diff) = &snapshot.diff else {
-            // Keep the identity and previous diff for the next Ready.
-            self.rows = None;
-            self.cursor = None;
-            self.offset = 0;
-            self.hscroll = 0;
-            return;
+        let diff = match &snapshot.diff {
+            DiffState::Ready(d) => Some(d),
+            _ => None,
         };
-        // Runs before every frame, so the unchanged case must cost nothing: no clone, no compare of text.
-        if let Some((built, mode)) = &self.built_from {
-            if std::sync::Arc::ptr_eq(built, diff) && *mode == self.mode && self.rows.is_some() {
+        if self
+            .visual
+            .as_ref()
+            .is_some_and(|v| diff.is_none_or(|d| !Arc::ptr_eq(d, &v.diff)))
+        {
+            self.visual = None;
+        }
+        let body_width = self.body_width();
+        let mut files = std::collections::hash_map::DefaultHasher::new();
+        (snapshot.scope == crate::engine::Scope::Branch).hash(&mut files);
+        snapshot.files.len().hash(&mut files);
+        for file in &snapshot.files {
+            crate::engine::FileKey::of(file).hash(&mut files);
+        }
+        let files = files.finish();
+        let mut editor = self.editor_place();
+        if diff.is_none() {
+            if let Some(editor) = &mut editor {
+                if matches!(editor.after, EditorAnchor::Anchor(_)) {
+                    editor.after = EditorAnchor::End;
+                }
+            }
+        }
+        if let Some((built, mode, comments, built_files, width, built_editor)) = &self.built_from {
+            let same_diff = match (built, diff) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            if same_diff
+                && *mode == self.mode
+                && Arc::ptr_eq(comments, &snapshot.comments)
+                && *built_files == files
+                && *width == body_width
+                && *built_editor == editor
+            {
                 return;
             }
         }
-        let same_file = self
-            .built_from
-            .as_ref()
-            .map(|(built, _)| {
-                built.key == diff.key
-                    || (built.comparison != diff.comparison && built.key.path == diff.key.path)
+        let keep_scrolled = editor.is_none()
+            && self.orphan.is_none()
+            && self.built_from.as_ref().is_some_and(|(built, mode, ..)| {
+                *mode == self.mode
+                    && built
+                        .as_ref()
+                        .zip(diff)
+                        .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
             })
-            .unwrap_or(false);
+            && self
+                .cursor
+                .and_then(|c| self.rows.as_ref()?.row_of_target.get(c))
+                .is_some_and(|row| {
+                    *row < self.offset || *row >= self.offset + usize::from(self.body_height)
+                });
+        self.built_from = Some((
+            diff.cloned(),
+            self.mode,
+            snapshot.comments.clone(),
+            files,
+            body_width,
+            editor.clone(),
+        ));
+        let orphans = rows::orphans(&snapshot.comments, snapshot);
+        if self.orphan.is_some_and(|i| i >= orphans.len()) {
+            self.orphan = None;
+        }
+        let card_width = cards::card_width(usize::from(body_width), self.mode);
+        let Some(diff) = diff else {
+            self.rows = if !orphans.is_empty() || editor.is_some() {
+                Some(rows::orphans_only(&orphans, card_width, editor.as_ref()))
+            } else {
+                None
+            };
+            self.cursor = None;
+            self.offset = self.rows.as_ref().map_or(0, |rows| {
+                clamp_scroll(self.offset, rows.rows.len(), self.body_height)
+            });
+            self.hscroll = 0;
+            self.keep_cursor_visible();
+            return;
+        };
+        let same_file = self.last_diff.as_ref().is_some_and(|built| {
+            built.key == diff.key
+                || (built.comparison != diff.comparison && built.key.path == diff.key.path)
+        });
         let old_row = match (&self.rows, self.cursor) {
             (Some(rows), Some(c)) => rows.row_of_target.get(c).copied(),
             _ => None,
         };
-        let rows = rows::build(diff, self.mode);
+        let rows = rows::build(
+            diff,
+            self.mode,
+            &rows::in_place(
+                &snapshot.comments,
+                diff,
+                snapshot.scope == crate::engine::Scope::Branch,
+            ),
+            &orphans,
+            card_width,
+            editor.as_ref(),
+        );
 
         if !same_file {
             self.offset = 0;
@@ -413,7 +599,7 @@ impl ViewState {
             self.offset = 0;
             self.hscroll = 0;
         } else if let (true, Some(old), Some(new)) = (
-            same_file,
+            same_file && !keep_scrolled,
             old_row,
             self.cursor.and_then(|c| rows.row_of_target.get(c).copied()),
         ) {
@@ -421,8 +607,16 @@ impl ViewState {
         }
         self.rows = Some(rows);
         self.hscroll = self.hscroll.min(self.max_hscroll());
-        self.keep_cursor_visible();
-        self.built_from = Some((diff.clone(), self.mode));
+        if keep_scrolled {
+            self.offset = clamp_scroll(
+                self.offset,
+                self.rows.as_ref().unwrap().rows.len(),
+                self.body_height,
+            );
+        } else {
+            self.keep_cursor_visible();
+        }
+        self.last_diff = Some(diff.clone());
     }
 }
 
@@ -619,7 +813,10 @@ pub(crate) mod tests {
         let DiffState::Ready(diff) = &snap.diff else {
             panic!()
         };
-        assert!(Arc::ptr_eq(&st.built_from.as_ref().unwrap().0, diff));
+        assert!(Arc::ptr_eq(
+            st.built_from.as_ref().unwrap().0.as_ref().unwrap(),
+            diff
+        ));
     }
 
     #[test]
@@ -1039,5 +1236,131 @@ pub(crate) mod tests {
             .unwrap()
             .text
             .contains("no longer on this branch"));
+    }
+
+    use crate::tui::input::handle_key;
+    use crate::tui::input::tests::{anchor_on, comment_at, key, review_setup};
+    use crate::tui::review::Editor;
+    use crate::tui::rows::Row;
+
+    #[test]
+    fn reconcile_rebuilds_on_a_new_comments_arc_and_on_width_and_not_otherwise() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        let before = st.rows.as_ref().unwrap().rows.as_ptr();
+        st.reconcile(&snap);
+        assert_eq!(st.rows.as_ref().unwrap().rows.as_ptr(), before);
+        snap.comments = Arc::new(vec![comment_at(
+            &anchor_on(&snap, 11),
+            &"字".repeat(200),
+            1,
+        )]);
+        st.reconcile(&snap);
+        assert!(st
+            .rows
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .any(|r| matches!(r, Row::Card { .. })));
+        let rows = st.rows.as_ref().unwrap().rows.as_ptr();
+        st.reconcile(&snap);
+        assert_eq!(st.rows.as_ref().unwrap().rows.as_ptr(), rows);
+        let len = st.rows.as_ref().unwrap().rows.len();
+        st.resize(100, 22);
+        st.reconcile(&snap);
+        assert!(st.rows.as_ref().unwrap().rows.len() > len);
+        st.editor = Some(Editor::new(anchor_on(&snap, 11)));
+        st.reconcile(&snap);
+        let rows = st.rows.as_ref().unwrap().rows.as_ptr();
+        st.editor.as_mut().unwrap().insert('a');
+        st.reconcile(&snap);
+        assert_eq!(
+            st.rows.as_ref().unwrap().rows.as_ptr(),
+            rows,
+            "typing within one row reuses rows"
+        );
+        st.editor = None;
+        snap.files.clear();
+        st.reconcile(&snap);
+        assert_eq!(
+            st.rows.as_ref().unwrap().orphan_tops.len(),
+            1,
+            "file membership also rebuilds"
+        );
+    }
+
+    #[test]
+    fn an_editor_opened_on_the_bottom_row_scrolls_into_view() {
+        let (snap, mut st) = review_setup(&[(1, &"+".repeat(40))]);
+        st.resize(120, 10);
+        handle_key(&mut st, &snap, key("G"), 120);
+        handle_key(&mut st, &snap, key("i"), 120);
+        st.reconcile(&snap);
+        let rows = &st.rows.as_ref().unwrap().rows;
+        let first = rows
+            .iter()
+            .position(|r| matches!(r, Row::Editor { .. }))
+            .expect("editor rows");
+        let last = rows
+            .iter()
+            .rposition(|r| matches!(r, Row::Editor { .. }))
+            .unwrap();
+        assert!(first >= st.offset && last < st.offset + 10);
+    }
+
+    #[test]
+    fn an_editor_taller_than_the_body_keeps_its_caret_visible() {
+        let (snap, mut st) = review_setup(&[(1, "+")]);
+        st.resize(120, 8);
+        handle_key(&mut st, &snap, key("i"), 120);
+        for _ in 0..120 {
+            handle_key(&mut st, &snap, key("ctrl+j"), 120);
+            st.reconcile(&snap);
+        }
+        let editor = st.editor.as_ref().expect("editor");
+        assert_eq!(editor.text.split('\n').count(), 100);
+        let plain = crate::tui::view::render(&snap, &st, 120, 10).plain();
+        assert!(
+            plain[8].contains('_'),
+            "the caret is on the body's bottom row: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn a_partially_visible_editor_whose_anchor_scrolled_away_still_draws() {
+        let (snap, mut st) = review_setup(&[(1, &"+".repeat(40))]);
+        st.resize(120, 8);
+        handle_key(&mut st, &snap, key("i"), 120);
+        for _ in 0..5 {
+            handle_key(&mut st, &snap, key("ctrl+j"), 120);
+        }
+        handle_key(&mut st, &snap, key("z"), 120);
+        st.reconcile(&snap);
+        handle_key(&mut st, &snap, key("ctrl+d"), 120);
+        st.reconcile(&snap);
+        assert!(
+            matches!(st.rows.as_ref().unwrap().rows[st.offset], Row::Editor { line } if line > 0)
+        );
+        let plain = crate::tui::view::render(&snap, &st, 120, 10).plain();
+        assert!(plain[1].trim_start().starts_with('│'), "{plain:?}");
+        assert!(plain.iter().any(|l| l.contains("z_")));
+    }
+
+    #[test]
+    fn an_accepted_comment_save_does_not_hide_a_base_error() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        let mut editor = Editor::new(anchor_on(&snap, 11));
+        editor.text = "saved".into();
+        editor.submit(1);
+        st.editor = Some(editor);
+        snap.comment_seq = 1;
+        snap.comment_token = Some(1);
+        snap.base_error = Some("base failed".into());
+        st.observe(&snap);
+        assert!(st.editor.is_none());
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("base failed")
+        );
     }
 }

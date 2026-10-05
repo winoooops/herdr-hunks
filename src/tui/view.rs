@@ -7,7 +7,7 @@ use crate::tui::rows::Row;
 use crate::tui::sanitize::sanitize;
 use crate::tui::state::{FilesPanel, ViewState};
 use crate::tui::style::{Line, Role, Semantic, Span, Style};
-use crate::tui::{dialog, keys, layout, picker};
+use crate::tui::{cards, dialog, keys, layout, picker, review};
 
 pub const FILES_WIDTH: u16 = 18;
 pub const MIN_SPLIT_WIDTH: u16 = 100;
@@ -30,6 +30,7 @@ pub enum Action {
     PickRow(usize),
     PickPane,
     PickPaneRow(usize),
+    EditorCategory(crate::engine::comments::Category),
 }
 
 impl Action {
@@ -51,7 +52,8 @@ impl Action {
             Self::SelectFile(_)
             | Self::CursorToRow(_)
             | Self::PickRow(_)
-            | Self::PickPaneRow(_) => return None,
+            | Self::PickPaneRow(_)
+            | Self::EditorCategory(_) => return None,
         })
     }
 }
@@ -70,6 +72,7 @@ impl Hit {
             && state.picker.is_none()
             && state.panes.is_none()
             && state.confirm.is_none()
+            && state.editor.is_none()
             && state
                 .hover
                 .is_some_and(|(x, y)| self.y == y && x >= self.x0 && x < self.x1)
@@ -432,10 +435,12 @@ fn files_lines(snapshot: &Snapshot, state: &ViewState, height: u16) -> (Vec<Line
     if height == 0 {
         return (lines, hits);
     }
-    lines.push(vec![Span::emphasis(pad(
-        &format!("CHANGED {}", snapshot.files.len()),
-        FILES_WIDTH.into(),
-    ))]);
+    let pending = snapshot.comments.iter().filter(|c| c.is_pending()).count();
+    let mut heading = format!("CHANGED {}", snapshot.files.len());
+    if pending > 0 {
+        heading.push_str(&format!(" · ✎ {pending}"));
+    }
+    lines.push(vec![Span::emphasis(pad(&heading, FILES_WIDTH.into()))]);
     let selected = snapshot.selected.as_ref().and_then(|key| {
         snapshot
             .files
@@ -467,7 +472,17 @@ fn files_lines(snapshot: &Snapshot, state: &ViewState, height: u16) -> (Vec<Line
         if duplicate {
             line.push(Span::label(format!(" {}/", sanitize(dir))));
         }
-        let mut line = fit_line(line, usize::from(FILES_WIDTH - 2));
+        let commented = snapshot.comments.iter().any(|c| {
+            c.anchor.key.path == file.path
+                && matches!(
+                    c.anchor.comparison,
+                    crate::engine::comments::AnchorComparison::Branch { .. }
+                ) == (snapshot.scope == Scope::Branch)
+        });
+        let mut line = fit_line(line, usize::from(FILES_WIDTH - 2 - u16::from(commented)));
+        if commented {
+            line.push(Span::body("✎"));
+        }
         line.push(if unread_marker(snapshot, file) {
             Span::new("● ", Style::semantic(Role::Emphasis, Semantic::Accent))
         } else {
@@ -580,7 +595,15 @@ fn scroll_text(text: &str, cells: usize) -> String {
     String::new()
 }
 
-fn body_line(row: &Row, columns: u16, hscroll: usize, _mode: ViewMode, cursor: bool) -> Line {
+fn body_line(
+    row: &Row,
+    columns: u16,
+    hscroll: usize,
+    mode: ViewMode,
+    cursor: bool,
+    selected: [bool; 2],
+    editor: Option<(&review::Editor, &[cards::CardLine])>,
+) -> Line {
     let cells = usize::from(columns);
     let number = |no: Option<u32>| no.map(|n| n.to_string()).unwrap_or_default();
     let line_style = |sign| match sign {
@@ -589,6 +612,67 @@ fn body_line(row: &Row, columns: u16, hscroll: usize, _mode: ViewMode, cursor: b
         _ => Style::role(Role::Body),
     };
     let line = match row {
+        Row::Orphans { count } => vec![Span::label(format!(
+            "✎ on changes no longer shown ({count})"
+        ))],
+        Row::Editor { line } => {
+            let card_width = cards::card_width(cells, mode);
+            let mut framed = vec![Span::body(" ".repeat(cells.saturating_sub(card_width)))];
+            if let Some((editor, lines)) = editor {
+                framed.extend(match lines.get(*line) {
+                    Some(cards::CardLine::Top { .. }) => {
+                        let mut title = editor.title();
+                        if !editor.at_limit {
+                            let used: usize = title.iter().map(|s| width(&s.text)).sum();
+                            if let Some(room) = card_width
+                                .saturating_sub(5)
+                                .checked_sub(used + width(" ctrl+h/l"))
+                            {
+                                title.push(Span::label(format!("{} ctrl+h/l", " ".repeat(room))));
+                            }
+                        }
+                        cards::frame_top(title, card_width)
+                    }
+                    Some(cards::CardLine::Text(text)) => cards::frame_text(text, card_width),
+                    Some(cards::CardLine::Bottom) => cards::frame_bottom(
+                        if editor.pending.is_some() {
+                            "saving…"
+                        } else {
+                            review::EDITOR_FOOTER
+                        },
+                        card_width,
+                    ),
+                    None => Vec::new(),
+                });
+            }
+            framed
+        }
+        Row::Card { line, .. } => {
+            let card_width = crate::tui::cards::card_width(cells, mode);
+            let mut framed = vec![Span::body(" ".repeat(cells.saturating_sub(card_width)))];
+            framed.extend(match line {
+                crate::tui::cards::CardLine::Top { title, tone, dim } => {
+                    crate::tui::cards::frame_top(
+                        vec![Span::new(
+                            title,
+                            Style {
+                                semantic: *tone,
+                                role: if *dim { Role::Label } else { Role::Emphasis },
+                                ..Style::role(Role::Body)
+                            },
+                        )],
+                        card_width,
+                    )
+                }
+                crate::tui::cards::CardLine::Text(text) => {
+                    crate::tui::cards::frame_text(text, card_width)
+                }
+                crate::tui::cards::CardLine::Bottom => {
+                    crate::tui::cards::frame_bottom("", card_width)
+                }
+            });
+            framed
+        }
         Row::FileHeader { path } => vec![Span::emphasis(scroll_text(path, hscroll))],
         Row::HunkHeader { text, .. } => vec![Span::new(
             scroll_text(text, hscroll),
@@ -612,19 +696,25 @@ fn body_line(row: &Row, columns: u16, hscroll: usize, _mode: ViewMode, cursor: b
             Span::label(format!("{:>5} {:>5} ", number(*old_no), number(*new_no))),
             Span::new(
                 format!("{sign} {}", scroll_text(text, hscroll)),
-                line_style(*sign),
+                Style {
+                    reverse: selected[0],
+                    ..line_style(*sign)
+                },
             ),
         ],
         Row::Split { left, right } => {
             let half = cells.saturating_sub(1) / 2;
-            let side = |cell: &Option<crate::tui::rows::Cell>| {
+            let side = |cell: &Option<crate::tui::rows::Cell>, selected: bool| {
                 fit_line(
                     match cell {
                         Some(cell) => vec![
                             Span::label(format!("{:>5} ", number(cell.no))),
                             Span::new(
                                 format!("{} {}", cell.sign, scroll_text(&cell.text, hscroll)),
-                                line_style(cell.sign),
+                                Style {
+                                    reverse: selected,
+                                    ..line_style(cell.sign)
+                                },
                             ),
                         ],
                         None => Vec::new(),
@@ -632,9 +722,9 @@ fn body_line(row: &Row, columns: u16, hscroll: usize, _mode: ViewMode, cursor: b
                     half,
                 )
             };
-            let mut line = side(left);
+            let mut line = side(left, selected[0]);
             line.push(Span::new("│", Style::role(Role::Rule)));
-            line.extend(side(right));
+            line.extend(side(right, selected[1]));
             line
         }
     };
@@ -655,7 +745,9 @@ pub fn body_is_drawn(state: &ViewState, snapshot: &Snapshot, columns: u16, heigh
         && state.picker.is_none()
         && state.panes.is_none()
         && state.confirm.is_none()
-        && (matches!(&snapshot.diff, DiffState::Ready(_)) || snapshot.files.is_empty())
+        && (matches!(&snapshot.diff, DiffState::Ready(_))
+            || snapshot.files.is_empty()
+            || state.editor.is_some())
 }
 
 pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16) -> Rendered {
@@ -681,7 +773,39 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
         (Vec::new(), Vec::new())
     };
     hits.extend(file_hits);
-    let message = state_message(snapshot);
+    let message = if state.rows.as_ref().is_some_and(|rows| {
+        rows.rows
+            .iter()
+            .any(|row| matches!(row, Row::Card { .. } | Row::Editor { .. }))
+    }) {
+        None
+    } else {
+        state_message(snapshot)
+    };
+    let selected: std::collections::HashSet<usize> =
+        match (&snapshot.diff, &state.visual, state.cursor) {
+            (DiffState::Ready(diff), Some(visual), Some(cursor))
+                if std::sync::Arc::ptr_eq(diff, &visual.diff) =>
+            {
+                review::selection(diff, visual, cursor)
+                    .map(|(side, start, end)| {
+                        diff.targets
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, t)| {
+                                t.side == side && t.line_number >= start && t.line_number <= end
+                            })
+                            .map(|(i, _)| i)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            _ => Default::default(),
+        };
+    let editor_lines = state
+        .editor
+        .as_ref()
+        .map(|e| e.lines(cards::card_width(usize::from(body_width), state.mode)));
     for y in 0..height_body {
         let mut line = panel.get(usize::from(y)).cloned().unwrap_or_default();
         if panel_width > 0 {
@@ -697,18 +821,61 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
         } else if let Some(rows) = &state.rows {
             let row_index = state.offset.saturating_add(usize::from(y));
             if let Some(row) = rows.rows.get(row_index) {
-                let cursor = state
-                    .cursor
-                    .and_then(|c| rows.row_of_target.get(c))
-                    .copied()
-                    == Some(row_index);
-                body = body_line(row, body_width, state.hscroll, state.mode, cursor);
-                hits.push(Hit {
-                    y: y + 1,
-                    x0: panel_width,
-                    x1: columns,
-                    action: Action::CursorToRow(row_index),
-                });
+                let cursor = if let Some(orphan) = state.orphan {
+                    matches!(row, Row::Card { id, .. } if rows.orphan_tops.get(orphan).is_some_and(|(_, c)| id == c))
+                } else {
+                    state.visual.is_none()
+                        && state
+                            .cursor
+                            .and_then(|c| rows.row_of_target.get(c))
+                            .copied()
+                            == Some(row_index)
+                };
+                let selection = match row {
+                    Row::Unified { target, .. } => [selected.contains(target), false],
+                    Row::Split { left, right } => [left, right].map(|cell| {
+                        cell.as_ref()
+                            .and_then(|c| c.target)
+                            .is_some_and(|t| selected.contains(&t))
+                    }),
+                    _ => [false; 2],
+                };
+                body = body_line(
+                    row,
+                    body_width,
+                    state.hscroll,
+                    state.mode,
+                    cursor,
+                    selection,
+                    state.editor.as_ref().zip(editor_lines.as_deref()),
+                );
+                if matches!(row, Row::Editor { line: 0 }) {
+                    let mut x = usize::from(panel_width);
+                    for span in &body {
+                        let end = x + width(&span.text);
+                        if let Some(category) = crate::engine::comments::Category::ALL
+                            .iter()
+                            .find(|c| c.short() == span.text)
+                        {
+                            if end <= usize::from(columns) {
+                                hits.push(Hit {
+                                    y: y + 1,
+                                    x0: x as u16,
+                                    x1: end as u16,
+                                    action: Action::EditorCategory(*category),
+                                });
+                            }
+                        }
+                        x = end;
+                    }
+                } else if !matches!(row, Row::Editor { .. }) {
+                    hits.push(Hit {
+                        y: y + 1,
+                        x0: panel_width,
+                        x1: columns,
+                        action: Action::CursorToRow(row_index),
+                    });
+                }
             }
         }
         line.extend(fit_line(body, body_width.into()));
@@ -908,7 +1075,7 @@ mod tests {
                     format!("… {count} more {noun} not shown"),
                 ),
             ] {
-                let line = body_line(&row, 80, 0, ViewMode::Unified, false);
+                let line = body_line(&row, 80, 0, ViewMode::Unified, false, [false; 2], None);
                 let text: String = line.iter().map(|span| span.text.as_str()).collect();
                 assert_eq!(text.trim_end(), expected);
             }
@@ -1057,7 +1224,8 @@ mod tests {
         let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Shown, true);
         st.help_open = true;
         st.help_offset = 18;
-        for (columns, height) in [(40, 10), (61, 12), (120, 40)] {
+        let full_height = keys::KEYS.len() as u16 + 7;
+        for (columns, height) in [(40, 10), (61, 12), (120, full_height)] {
             st.resize(columns, body_height(&st, &snap, height));
             st.reconcile(&snap);
             let r = render(&snap, &st, columns, height);
@@ -1071,7 +1239,7 @@ mod tests {
             let (left, _) = title.split_once("┌ Keys ").unwrap();
             assert_eq!(width(left), usize::from(columns.saturating_sub(60) / 2));
             assert!(r.hits.is_empty());
-            if height == 40 {
+            if height == full_height {
                 for binding in keys::KEYS {
                     assert!(plain.iter().any(|line| line.contains(binding.label)));
                 }
@@ -1204,7 +1372,7 @@ mod tests {
             }),
             right: None,
         };
-        let line = body_line(&row, 41, 1, ViewMode::Split, true);
+        let line = body_line(&row, 41, 1, ViewMode::Split, true, [false; 2], None);
         let text: String = line.iter().map(|s| s.text.as_str()).collect();
         let (left, right) = text.split_once('│').unwrap();
         assert_eq!(left.trim_end(), "   11 -  ab");
@@ -1435,7 +1603,9 @@ mod tests {
         st.help_open = true;
         for popup in [false, true] {
             st.popup = popup;
-            let text = render(&snap, &st, 120, 40).plain().join("\n");
+            let text = render(&snap, &st, 120, keys::KEYS.len() as u16 + 7)
+                .plain()
+                .join("\n");
             assert_eq!(
                 text.lines()
                     .any(|l| l.contains("esc") && l.contains("close") && !l.contains("closes")),
@@ -2094,5 +2264,216 @@ mod tests {
         let hit = &r.hits[0];
         assert_eq!((hit.y, &hit.action), (6, &Action::PickPaneRow(0)));
         assert!(r.plain()[6].contains("✂ clipboard"), "{:?}", r.plain());
+    }
+
+    use crate::engine::comments::{self, Category, CommentState};
+    use crate::tui::input::handle_key;
+    use crate::tui::input::tests::{anchor_on, comment_at, key, review_setup};
+    use crate::tui::review::{Editor, EDITOR_FOOTER};
+
+    #[test]
+    fn a_card_is_wrapped_and_framed_at_one_width() {
+        for columns in [80, 120] {
+            for mode in [ViewMode::Unified, ViewMode::Split] {
+                let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+                let text = "x".repeat(200);
+                snap.comments =
+                    std::sync::Arc::new(vec![comment_at(&anchor_on(&snap, 11), &text, 1)]);
+                st.requested_mode = mode;
+                st.resize(columns, 22);
+                st.mode = mode;
+                st.reconcile(&snap);
+                let output = render(&snap, &st, columns, 24).plain();
+                let shown: String = output
+                    .iter()
+                    .filter_map(|line| {
+                        line.trim_start()
+                            .strip_prefix("│ ")
+                            .and_then(|s| s.strip_suffix(" │"))
+                            .map(str::trim_end)
+                    })
+                    .collect();
+                assert_eq!(shown, text, "{columns} {mode:?}: {output:?}");
+                assert!(output.iter().all(|l| width(l) <= usize::from(columns)));
+            }
+        }
+    }
+
+    #[test]
+    fn cards_are_drawn_under_their_lines_with_their_titles() {
+        let (mut snap, mut st) = review_setup(&[(10, " ++ ")]);
+        st.requested_mode = ViewMode::Unified;
+        st.resize(120, 22);
+        let bug = comment_at(&anchor_on(&snap, 11), "fix this", 1);
+        let mut sent = comment_at(&anchor_on(&snap, 12), "why this?", 2);
+        sent.category = Category::Question;
+        sent.state = CommentState::Sent(comments::Stamp {
+            at: 1,
+            nonce: "abc123".into(),
+            item: 1,
+            to: crate::engine::target::Destination::clipboard(),
+        });
+        snap.comments = std::sync::Arc::new(vec![bug, sent]);
+        st.reconcile(&snap);
+        let rendered = render(&snap, &st, 120, 24);
+        let plain = rendered.plain();
+        for (title, text, number) in [
+            ("Bug · pending", "fix this", "11"),
+            ("Question · sent", "why this?", "12"),
+        ] {
+            let at = plain
+                .iter()
+                .position(|l| l.contains(&format!("╭─ {title}")))
+                .expect("card title");
+            assert!(plain[at - 1].contains(number) && plain[at - 1].contains("+ line +"));
+            assert!(plain[at + 1].contains(&format!("│ {text}")));
+        }
+        let sent = rendered
+            .lines
+            .iter()
+            .flatten()
+            .find(|s| s.text == "Question · sent")
+            .unwrap();
+        assert_eq!(sent.style.role, Role::Label);
+    }
+
+    #[test]
+    fn the_panel_marks_files_with_comments_and_counts_pending() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        snap = files(snap);
+        st.files_panel = FilesPanel::Shown;
+        let mut pending = comment_at(&anchor_on(&snap, 11), "pending", 1);
+        pending.anchor.key = FileKey::of(&snap.files[0]);
+        let mut sent = comment_at(&anchor_on(&snap, 11), "sent", 2);
+        sent.state = CommentState::Sent(comments::Stamp {
+            at: 1,
+            nonce: "abc123".into(),
+            item: 2,
+            to: crate::engine::target::Destination::clipboard(),
+        });
+        snap.comments = std::sync::Arc::new(vec![pending, sent]);
+        st.reconcile(&snap);
+        let (panel, _) = files_lines(&snap, &st, 22);
+        let plain: Vec<String> = panel
+            .iter()
+            .map(|l| l.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        assert!(plain[0].starts_with("CHANGED 2 · ✎ 1"));
+        assert_eq!(
+            plain[1].chars().nth(usize::from(FILES_WIDTH - 3)),
+            Some('✎')
+        );
+        assert!(plain[1].ends_with("✎S ") && plain[2].ends_with("✎  "));
+        let mut branch = snap.comments[0].clone();
+        branch.anchor.comparison = comments::AnchorComparison::Branch {
+            merge_base: "0".repeat(40),
+            label: "main".into(),
+        };
+        snap.comments = std::sync::Arc::new(vec![branch]);
+        let (panel, _) = files_lines(&snap, &st, 22);
+        assert!(
+            panel[0].iter().any(|s| s.text.contains("✎ 1")),
+            "the count spans scopes"
+        );
+        assert!(
+            !panel[1].iter().any(|s| s.text.contains('✎')),
+            "the mark follows the scope"
+        );
+    }
+
+    #[test]
+    fn the_editor_is_spliced_after_its_anchor_row() {
+        let (snap, mut st) = review_setup(&[(10, " +++ ")]);
+        st.requested_mode = ViewMode::Unified;
+        st.resize(120, 22);
+        st.editor = Some(Editor::new(anchor_on(&snap, 12)));
+        st.reconcile(&snap);
+        let output = render(&snap, &st, 120, 24);
+        let plain = output.plain();
+        let at = plain
+            .iter()
+            .position(|s| s.contains("comment on R12 ·"))
+            .expect("editor title");
+        assert!(plain[at - 1].contains("12 + line +"));
+        assert!(plain[at].contains("ctrl+h/l"));
+        assert!(plain[at + 1].contains('_'));
+        assert!(plain[at + 2].contains(EDITOR_FOOTER));
+        assert!(plain[at + 3].contains("13 + line +"));
+        assert!(body_is_drawn(&st, &snap, 120, 24));
+    }
+
+    #[test]
+    fn an_orphan_section_closes_the_body() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        let mut orphan = comment_at(&anchor_on(&snap, 16), "left behind", 1);
+        orphan.anchor.key.path = "gone.rs".into();
+        snap.comments = std::sync::Arc::new(vec![orphan]);
+        st.reconcile(&snap);
+        let plain = render(&snap, &st, 120, 24).plain();
+        let at = plain
+            .iter()
+            .position(|s| s.contains("✎ on changes no longer shown (1)"))
+            .expect("orphan section");
+        assert!(plain[at + 1].contains("gone.rs:16 · Bug · pending"));
+        assert!(plain[at + 2].contains("│ left behind"));
+    }
+
+    #[test]
+    fn a_visual_selection_is_drawn_in_reverse_over_its_lines() {
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let (snap, mut st) = review_setup(&[(10, " --++ ")]);
+            st.requested_mode = mode;
+            st.resize(120, 22);
+            st.reconcile(&snap);
+            handle_key(&mut st, &snap, key("v"), 120);
+            handle_key(&mut st, &snap, key("j"), 120);
+            let output = render(&snap, &st, 120, 24);
+            let text_spans: Vec<_> = output
+                .lines
+                .iter()
+                .flatten()
+                .filter(|s| s.text.contains("line "))
+                .collect();
+            let selected: Vec<_> = text_spans.iter().filter(|s| s.style.reverse).collect();
+            assert_eq!(selected.len(), 2, "{mode:?}");
+            assert!(selected.iter().all(|s| s.text.contains("- line -")));
+            assert!(
+                text_spans
+                    .iter()
+                    .filter(|s| !s.text.contains("- line -"))
+                    .all(|s| !s.style.reverse),
+                "the other side is not selected"
+            );
+        }
+    }
+
+    #[test]
+    fn cards_fit_beside_the_panel_at_the_minimum_terminal_width() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        st.files_panel = FilesPanel::Shown;
+        st.resize(40, 58);
+        let comment = comment_at(&anchor_on(&snap, 11), &"z".repeat(200), 1);
+        snap.comments = std::sync::Arc::new(vec![comment.clone()]);
+        for editing in [false, true] {
+            if editing {
+                snap.comments = std::sync::Arc::new(Vec::new());
+                st.editor = Some(Editor::edit(&comment));
+            }
+            st.reconcile(&snap);
+            let output = render(&snap, &st, 40, 60).plain();
+            assert_eq!(
+                output
+                    .iter()
+                    .flat_map(|s| s.chars())
+                    .filter(|c| *c == 'z')
+                    .count(),
+                200,
+                "{output:?}"
+            );
+            assert!(output.iter().all(|s| width(s) <= 40));
+            if editing {
+                assert!(output.iter().any(|s| s.contains('_')));
+            }
+        }
     }
 }

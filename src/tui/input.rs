@@ -3,13 +3,15 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
+use crate::engine::comments::{self, Anchor, AnchorComparison, Span as AnchorSpan};
 use crate::engine::nav::{self, Side, ViewMode};
-use crate::engine::{Command, DiffState, FileKey, Snapshot, NO_BASE_NOTICE};
+use crate::engine::{Command, Comparison, DiffState, FileKey, Snapshot, NO_BASE_NOTICE};
 use crate::tui::keys::{self, KeyAction};
 use crate::tui::layout::clamp_scroll;
 use crate::tui::state::{FilesPanel, ViewState};
 use crate::tui::view::{self, Action, Rendered};
 use crate::tui::{dialog, format};
+use crate::tui::{review, rows};
 
 #[derive(Debug, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)] // Commands carry the comment the editor saw.
@@ -71,11 +73,27 @@ pub fn handle_key(
     if state.confirm.is_some() {
         return confirm_key(state, key);
     }
+    if state.editor.is_some() {
+        let outcome = editor_key(state, snapshot, key);
+        if outcome != Outcome::Inert {
+            state.reconcile(snapshot);
+            if !(key.modifiers == KeyModifiers::CONTROL
+                && matches!(key.code, KeyCode::Char('d' | 'u')))
+            {
+                state.keep_cursor_visible();
+            }
+        }
+        return outcome;
+    }
     if state.panes.is_some() {
         return panes_key(state, snapshot, key);
     }
     if state.picker.is_some() {
         return picker_key(state, snapshot, key);
+    }
+    if state.visual.is_some() && key.code == KeyCode::Esc && key.modifiers.is_empty() {
+        state.visual = None;
+        return Outcome::Redraw;
     }
     if state.popup && key.code == KeyCode::Esc && key.modifiers.is_empty() {
         return Outcome::Quit;
@@ -113,6 +131,10 @@ fn confirm_key(state: &mut ViewState, key: KeyEvent) -> Outcome {
 fn open_box(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction) -> Outcome {
     use crate::engine::actions::{self, NOTICE_NO_HUNK, NOTICE_RUNNING, NOTICE_SCOPE};
     use crate::engine::{ActionKind, Scope};
+    if state.orphan.is_some() {
+        state.notify(NOTICE_NO_HUNK);
+        return Outcome::Redraw;
+    }
     if snapshot.scope == Scope::Branch {
         state.notify(NOTICE_SCOPE);
         return Outcome::Redraw;
@@ -155,6 +177,223 @@ fn open_box(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction) -> Ou
         total,
     ));
     Outcome::Redraw
+}
+
+fn editor_key(state: &mut ViewState, _snapshot: &Snapshot, key: KeyEvent) -> Outcome {
+    let Some(editor) = state.editor.as_mut() else {
+        return Outcome::Inert;
+    };
+
+    if editor.pending.is_some() && key.code != KeyCode::Esc {
+        return Outcome::Inert;
+    }
+    if key.modifiers == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char('d' | 'u')) {
+        let Some(rows) = &state.rows else {
+            return Outcome::Inert;
+        };
+        let delta = isize::try_from(state.body_height / 2).unwrap_or(0);
+        return scroll(
+            &mut state.offset,
+            if key.code == KeyCode::Char('d') {
+                delta
+            } else {
+                -delta
+            },
+            rows.rows.len(),
+            state.body_height,
+        );
+    }
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, KeyModifiers::NONE) => {
+            state.editor = None;
+            Outcome::Redraw
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => {
+            state.comment_token += 1;
+            match editor.submit(state.comment_token) {
+                Some(command) => Outcome::Engine(command),
+                None => Outcome::Inert,
+            }
+        }
+        (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+            editor.newline();
+            Outcome::Redraw
+        }
+        (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
+            editor.category = editor.category.previous();
+            Outcome::Redraw
+        }
+        (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+            editor.category = editor.category.next();
+            Outcome::Redraw
+        }
+        (KeyCode::Backspace, KeyModifiers::NONE) => {
+            editor.backspace();
+            Outcome::Redraw
+        }
+        (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            editor.insert(ch);
+            Outcome::Redraw
+        }
+        _ => Outcome::Inert,
+    }
+}
+
+fn comment_key(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction) -> Outcome {
+    use KeyAction::*;
+
+    if let Some(index) = state.orphan {
+        let id = state
+            .rows
+            .as_ref()
+            .and_then(|r| r.orphan_tops.get(index))
+            .map(|(_, id)| id.clone());
+        let comment = id.and_then(|id| {
+            snapshot
+                .comments
+                .iter()
+                .find(|c| c.id == id && c.is_editable())
+                .cloned()
+        });
+        return match (action, comment) {
+            (EditComment, Some(c)) => {
+                state.editor = Some(review::Editor::edit(&c));
+                Outcome::Redraw
+            }
+            (DeleteComment, Some(c)) => Outcome::Engine(Command::DeleteComment { seen: c }),
+            _ => Outcome::Inert,
+        };
+    }
+    let DiffState::Ready(diff) = &snapshot.diff else {
+        state.notify(review::NO_LINE);
+        return Outcome::Redraw;
+    };
+    let branch = snapshot.scope == crate::engine::Scope::Branch;
+    let comparison = match (&diff.comparison, &snapshot.base) {
+        (Comparison::Branch { merge_base }, Some(base)) => AnchorComparison::Branch {
+            merge_base: merge_base.clone(),
+            label: base.label().to_string(),
+        },
+        _ => AnchorComparison::Worktree,
+    };
+    let cursor_target = state
+        .cursor
+        .and_then(|c| diff.targets.get(c).map(|t| (c, t.side, t.line_number)));
+    let in_place = rows::in_place(&snapshot.comments, diff, branch);
+
+    let on_cursor_row = || -> Option<comments::Comment> {
+        let cursor = state.cursor?;
+        in_place
+            .iter()
+            .filter(|c| c.is_editable())
+            .filter(|c| rows::anchor_target(diff, &c.anchor) == Some(cursor))
+            .max_by_key(|c| (c.created_at, c.id.clone()))
+            .map(|c| (*c).clone())
+    };
+    let file_comment = || -> Option<comments::Comment> {
+        in_place
+            .iter()
+            .filter(|c| c.is_editable() && matches!(c.anchor.span, AnchorSpan::File))
+            .max_by_key(|c| (c.created_at, c.id.clone()))
+            .map(|c| (*c).clone())
+    };
+    let at_cap = snapshot.comments.iter().filter(|c| c.is_unsent()).count() >= comments::CAP;
+    match action {
+        Visual => {
+            let Some((cursor, ..)) = cursor_target else {
+                state.notify(review::NO_LINE);
+                return Outcome::Redraw;
+            };
+            state.visual = Some(review::Visual {
+                start: cursor,
+                diff: diff.clone(),
+            });
+            Outcome::Redraw
+        }
+        Comment | CommentFile => {
+            if at_cap {
+                state.notify(comments::NOTICE_CAP);
+                return Outcome::Redraw;
+            }
+            let anchor = if action == CommentFile {
+                state.visual = None;
+                Anchor {
+                    key: diff.key.clone(),
+                    side: Side::Additions,
+                    line: 0,
+                    span: AnchorSpan::File,
+                    comparison,
+                }
+            } else {
+                let Some((cursor, side, line)) = cursor_target else {
+                    state.notify(review::NO_LINE);
+                    return Outcome::Redraw;
+                };
+
+                match state
+                    .visual
+                    .take()
+                    .filter(|v| std::sync::Arc::ptr_eq(&v.diff, diff))
+                    .and_then(|v| review::selection(diff, &v, cursor))
+                {
+                    Some((side, start, end)) if start != end => Anchor {
+                        key: diff.key.clone(),
+                        side,
+                        line: start,
+                        span: AnchorSpan::Range { end },
+                        comparison,
+                    },
+                    _ => Anchor {
+                        key: diff.key.clone(),
+                        side,
+                        line,
+                        span: AnchorSpan::Line,
+                        comparison,
+                    },
+                }
+            };
+            if snapshot.target.is_none() {
+                state.notify(review::CHOOSE_PANE);
+                state.panes_token += 1;
+                state.panes = Some(crate::tui::panes::PanePicker::open(
+                    state.panes_token,
+                    crate::tui::panes::ReturnTo::Editor(anchor),
+                ));
+                return Outcome::Engine(Command::LoadPanes(state.panes_token));
+            }
+            state.editor = Some(review::Editor::new(anchor));
+            Outcome::Redraw
+        }
+        EditComment | DeleteComment => {
+            let Some(comment) = on_cursor_row() else {
+                state.notify(if cursor_target.is_none() {
+                    review::NO_LINE
+                } else {
+                    review::NO_COMMENT
+                });
+                return Outcome::Redraw;
+            };
+            if action == EditComment {
+                state.editor = Some(review::Editor::edit(&comment));
+                Outcome::Redraw
+            } else {
+                Outcome::Engine(Command::DeleteComment { seen: comment })
+            }
+        }
+        EditFileComment | DeleteFileComment => {
+            let Some(comment) = file_comment() else {
+                state.notify(review::NO_COMMENT);
+                return Outcome::Redraw;
+            };
+            if action == EditFileComment {
+                state.editor = Some(review::Editor::edit(&comment));
+                Outcome::Redraw
+            } else {
+                Outcome::Engine(Command::DeleteComment { seen: comment })
+            }
+        }
+        _ => Outcome::Inert,
+    }
 }
 
 fn panes_key(state: &mut ViewState, snapshot: &Snapshot, key: KeyEvent) -> Outcome {
@@ -337,6 +576,10 @@ fn act(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction, width: u16
                 Some(_) => Outcome::Engine(Command::SetScope(snapshot.scope.other())),
             };
         }
+        Comment | CommentFile | Visual | EditComment | EditFileComment | DeleteComment
+        | DeleteFileComment => {
+            return comment_key(state, snapshot, action);
+        }
         PickPane => {
             state.panes_token += 1;
             state.panes = Some(crate::tui::panes::PanePicker::open(
@@ -359,8 +602,14 @@ fn act(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction, width: u16
                 Some(commit) => Outcome::Engine(Command::MarkReviewed(commit)),
             };
         }
-        FileNext => return Outcome::Engine(Command::SelectNext),
-        FilePrev => return Outcome::Engine(Command::SelectPrev),
+        FileNext | FilePrev => {
+            state.orphan = None;
+            return Outcome::Engine(if action == FileNext {
+                Command::SelectNext
+            } else {
+                Command::SelectPrev
+            });
+        }
         ToggleView => {
             if state.requested_mode == ViewMode::Unified && width < view::MIN_SPLIT_WIDTH {
                 state.notify("split view needs 100 columns");
@@ -395,13 +644,57 @@ fn act(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction, width: u16
             state.help_offset = 0;
         }
         StageHunk | DiscardHunk | DiscardFile => return open_box(state, snapshot, action),
-        _ => return move_cursor(state, snapshot, action),
+        _ => {
+            let orphan = state.orphan;
+            let outcome = move_cursor(state, snapshot, action);
+            if orphan != state.orphan {
+                state.keep_cursor_visible();
+                if outcome == Outcome::Inert {
+                    return Outcome::Redraw;
+                }
+            }
+            return outcome;
+        }
     }
     Outcome::Redraw
 }
 
 fn move_cursor(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction) -> Outcome {
     use KeyAction::*;
+    let orphan_count = state.rows.as_ref().map_or(0, |r| r.orphan_tops.len());
+    if let Some(index) = state.orphan {
+        match action {
+            LineDown => {
+                if index + 1 >= orphan_count {
+                    return Outcome::Inert;
+                }
+                state.orphan = Some(index + 1);
+                state.keep_cursor_visible();
+                return Outcome::Redraw;
+            }
+            LineUp => {
+                state.orphan = index.checked_sub(1);
+                state.keep_cursor_visible();
+                return Outcome::Redraw;
+            }
+            _ => state.orphan = None,
+        }
+    } else if action == LineDown && orphan_count > 0 && state.visual.is_none() {
+        let at_end = match (&snapshot.diff, state.cursor) {
+            (DiffState::Ready(diff), Some(cursor)) => match state.mode {
+                ViewMode::Unified => diff.unified_order.last() == Some(&cursor),
+                ViewMode::Split => state.rows.as_ref().is_some_and(|rows| {
+                    rows.row_of_target.get(cursor) == rows.row_of_target.last()
+                }),
+            },
+            _ => true,
+        };
+        if at_end {
+            state.orphan = Some(0);
+            state.keep_cursor_visible();
+            return Outcome::Redraw;
+        }
+    }
     let (DiffState::Ready(diff), Some(cursor)) = (&snapshot.diff, state.cursor) else {
         return Outcome::Inert;
     };
@@ -409,23 +702,45 @@ fn move_cursor(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction) ->
         return Outcome::Inert;
     };
     let target = match action {
-        LineDown | LineUp => Some(nav::move_line(
-            &diff.targets,
-            &diff.unified_order,
-            cursor,
-            if action == LineDown { 1 } else { -1 },
-            state.mode,
-        )),
-        SideDeletions | SideAdditions => Some(nav::move_side(
-            &diff.targets,
-            cursor,
-            if action == SideDeletions {
-                Side::Deletions
-            } else {
-                Side::Additions
-            },
-            state.mode,
-        )),
+        LineDown | LineUp => {
+            let delta = if action == LineDown { 1 } else { -1 };
+            Some(
+                match state
+                    .visual
+                    .as_ref()
+                    .filter(|v| std::sync::Arc::ptr_eq(&v.diff, diff))
+                {
+                    Some(visual) => {
+                        review::step_on_side(diff, cursor, diff.targets[visual.start].side, delta)
+                    }
+                    None => nav::move_line(
+                        &diff.targets,
+                        &diff.unified_order,
+                        cursor,
+                        delta as i32,
+                        state.mode,
+                    ),
+                },
+            )
+        }
+        SideDeletions | SideAdditions => {
+            let target = nav::move_side(
+                &diff.targets,
+                cursor,
+                if action == SideDeletions {
+                    Side::Deletions
+                } else {
+                    Side::Additions
+                },
+                state.mode,
+            );
+            if state.mode == ViewMode::Split && target != cursor {
+                if let Some(visual) = &mut state.visual {
+                    visual.start = target;
+                }
+            }
+            Some(target)
+        }
         HunkPrev | HunkNext => {
             let hunk = if action == HunkNext {
                 current.hunk_index.checked_add(1)
@@ -497,6 +812,35 @@ pub fn handle_mouse(
     // The box has to be answered: no click or wheel reaches anything under it.
     if state.confirm.is_some() {
         return Outcome::Inert;
+    }
+    if let Some(editor) = state.editor.as_mut() {
+        return match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) if editor.pending.is_none() => {
+                match rendered.hit(ev.column, ev.row) {
+                    Some(Action::EditorCategory(category)) => {
+                        editor.category = *category;
+                        Outcome::Redraw
+                    }
+                    _ => Outcome::Inert,
+                }
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let Some(rows) = &state.rows else {
+                    return Outcome::Inert;
+                };
+                scroll(
+                    &mut state.offset,
+                    if ev.kind == MouseEventKind::ScrollDown {
+                        3
+                    } else {
+                        -3
+                    },
+                    rows.rows.len(),
+                    state.body_height,
+                )
+            }
+            _ => Outcome::Inert,
+        };
     }
     if ev.kind == MouseEventKind::Moved {
         let target = |point: Option<(u16, u16)>| {
@@ -581,9 +925,28 @@ pub fn handle_mouse(
             .map(|file| Outcome::Engine(Command::Select(FileKey::of(file))))
             .unwrap_or(Outcome::Inert),
         Some(Action::CursorToRow(row)) => {
-            if let (DiffState::Ready(diff), Some(rows)) = (&snapshot.diff, &state.rows) {
-                if let Some(target) = rows.row_of_target.iter().position(|r| r == row) {
-                    if state.cursor != Some(target) {
+            let Some(rows) = &state.rows else {
+                return Outcome::Inert;
+            };
+            if let Some(rows::Row::Card { id, .. }) = rows.rows.get(*row) {
+                if let Some(index) = rows.orphan_tops.iter().position(|(_, card)| card == id) {
+                    if state.orphan == Some(index) {
+                        return Outcome::Inert;
+                    }
+                    state.orphan = Some(index);
+                    state.keep_cursor_visible();
+                    return Outcome::Redraw;
+                }
+            }
+            if let DiffState::Ready(diff) = &snapshot.diff {
+                let target = match rows.rows.get(*row) {
+                    Some(rows::Row::Card { target, .. }) => *target,
+                    _ => rows.row_of_target.iter().position(|r| r == row),
+                };
+                if let Some(target) = target {
+                    let changed = state.cursor != Some(target) || state.orphan.is_some();
+                    state.orphan = None;
+                    if changed {
                         state.set_cursor(diff, target);
                         return Outcome::Redraw;
                     }
@@ -596,7 +959,7 @@ pub fn handle_mouse(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::engine::nav::ViewMode;
     use crate::engine::{Command, DiffState};
@@ -608,7 +971,7 @@ mod tests {
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
 
-    fn key(text: &str) -> KeyEvent {
+    pub(crate) fn key(text: &str) -> KeyEvent {
         let code = match text {
             "Enter" => KeyCode::Enter,
             "Esc" => KeyCode::Esc,
@@ -1107,7 +1470,7 @@ mod tests {
         st.reconcile(&snap);
         handle_key(&mut st, &snap, key("t"), 99);
         assert!(st.notice.is_some());
-        assert_eq!(handle_key(&mut st, &snap, key("x"), 99), Outcome::Inert);
+        assert_eq!(handle_key(&mut st, &snap, key("/"), 99), Outcome::Inert);
         assert!(st.notice.is_some());
         assert_eq!(handle_key(&mut st, &snap, key("k"), 99), Outcome::Redraw);
         assert!(st.notice.is_none());
@@ -2306,5 +2669,807 @@ mod tests {
         );
         handle_key(&mut st, &snap, key("j"), 120);
         assert!(st.notice.is_none());
+    }
+    use crate::engine::comments::{self, Anchor};
+    use crate::tui::{review, rows::Row};
+    /// `setup` plus what the review loop reads: the diff's row in `files`, numbered lines, a clipboard target.
+    pub(crate) fn review_setup(hunks: &[(u32, &str)]) -> (crate::engine::Snapshot, ViewState) {
+        let (mut snap, mut st) = setup(hunks);
+        snap.files = vec![crate::git::ChangedFile {
+            path: "a.rs".into(),
+            status: crate::git::ChangedFileStatus::Modified,
+            staged: false,
+            insertions: None,
+            deletions: None,
+        }];
+        if let DiffState::Ready(diff) = &mut snap.diff {
+            let mut numbered = (**diff).clone();
+            for hunk in &mut numbered.file_diff.hunks {
+                let (mut old, mut new) = (hunk.old_start, hunk.new_start);
+                for line in &mut hunk.lines {
+                    match line.line_type {
+                        crate::git::DiffLineType::Added => {
+                            line.new_line_number = Some(new);
+                            new += 1;
+                        }
+                        crate::git::DiffLineType::Removed => {
+                            line.old_line_number = Some(old);
+                            old += 1;
+                        }
+                        _ => {
+                            line.old_line_number = Some(old);
+                            line.new_line_number = Some(new);
+                            old += 1;
+                            new += 1;
+                        }
+                    }
+                }
+            }
+            snap.diff = DiffState::Ready(std::sync::Arc::new(numbered));
+        }
+        snap.target = Some(crate::engine::Target::Clipboard);
+        snap.target_state = crate::engine::TargetState::Clipboard;
+        st.observe(&snap);
+        st.reconcile(&snap);
+        (snap, st)
+    }
+
+    pub(crate) fn comment_at(anchor: &Anchor, text: &str, created_at: u64) -> comments::Comment {
+        comments::Comment {
+            id: format!("c{created_at}"),
+            anchor: anchor.clone(),
+            category: comments::Category::Bug,
+            text: text.into(),
+            created_at,
+            state: comments::CommentState::Pending,
+        }
+    }
+
+    pub(crate) fn anchor_on(snap: &crate::engine::Snapshot, line: u32) -> Anchor {
+        let DiffState::Ready(diff) = &snap.diff else {
+            panic!("ready")
+        };
+        Anchor {
+            key: diff.key.clone(),
+            side: Side::Additions,
+            line,
+            span: comments::Span::Line,
+            comparison: comments::AnchorComparison::Worktree,
+        }
+    }
+
+    #[test]
+    fn i_without_a_target_opens_the_picker_and_keeps_the_anchor() {
+        let (mut snap, mut st) = review_setup(&[(10, " --+ ")]);
+        snap.target = None;
+        snap.target_state = crate::engine::TargetState::Unverified;
+        assert_eq!(
+            handle_key(&mut st, &snap, key("i"), 120),
+            Outcome::Engine(Command::LoadPanes(1))
+        );
+        assert!(st.editor.is_none());
+        assert!(matches!(
+            st.panes.as_ref().map(|p| &p.return_to),
+            Some(crate::tui::panes::ReturnTo::Editor(_))
+        ));
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some(review::CHOOSE_PANE)
+        );
+
+        handle_key(&mut st, &snap, key("Esc"), 120);
+        assert!(st.panes.is_none() && st.editor.is_none());
+
+        handle_key(&mut st, &snap, key("i"), 120);
+        snap.panes = Some(std::sync::Arc::new(Vec::new()));
+        snap.panes_seq = 2;
+        st.observe(&snap);
+        assert!(matches!(
+            handle_key(&mut st, &snap, key("Enter"), 120),
+            Outcome::Engine(Command::SetTarget {
+                target: crate::engine::Target::Clipboard,
+                ..
+            })
+        ));
+        snap.target = Some(crate::engine::Target::Clipboard);
+        snap.target_state = crate::engine::TargetState::Clipboard;
+        snap.target_seq = 1;
+        snap.target_token = Some(1);
+        st.observe(&snap);
+        assert!(st.panes.is_none());
+        let editor = st
+            .editor
+            .as_ref()
+            .expect("the editor opened on the kept anchor");
+        assert_eq!(editor.place_label(), "L11"); // the fixture's first changed row is the deletion of old line 11
+    }
+
+    #[test]
+    fn the_editor_saves_edits_and_deletes_the_most_recent_card_of_the_line() {
+        let (mut snap, mut st) = review_setup(&[(10, " --+ ")]);
+        handle_key(&mut st, &snap, key("i"), 120);
+        for ch in "needs a test".chars() {
+            handle_key(&mut st, &snap, key(&ch.to_string()), 120);
+        }
+        handle_key(&mut st, &snap, key("ctrl+l"), 120);
+        let outcome = handle_key(&mut st, &snap, key("Enter"), 120);
+        let Outcome::Engine(Command::AddComment {
+            token,
+            anchor,
+            category,
+            text,
+        }) = outcome
+        else {
+            panic!("{outcome:?}")
+        };
+        assert_eq!(
+            (anchor.side, anchor.line, category, text.as_str()),
+            (Side::Deletions, 11, comments::Category::Bug, "needs a test")
+        );
+
+        assert_eq!(st.editor.as_ref().and_then(|e| e.pending), Some(token));
+        assert_eq!(
+            handle_key(&mut st, &snap, key("x"), 120),
+            Outcome::Inert,
+            "keys wait for the answer"
+        );
+        snap.comment_seq += 1;
+        snap.comment_token = None; // a refresh's notice: not this save's answer
+        st.observe(&snap);
+        assert!(
+            st.editor.is_some(),
+            "another answer leaves the editor waiting"
+        );
+        snap.comment_seq += 1;
+        snap.comment_token = Some(token);
+        st.observe(&snap);
+        assert!(st.editor.is_none());
+
+        let older = comment_at(&anchor, "older", 1);
+        let newer = comment_at(&anchor, "newer", 2);
+        snap.comments = std::sync::Arc::new(vec![older, newer.clone()]);
+        st.observe(&snap);
+        st.reconcile(&snap);
+        handle_key(&mut st, &snap, key("u"), 120);
+        assert_eq!(st.editor.as_ref().map(|e| e.text.as_str()), Some("newer"));
+        for _ in 0..5 {
+            handle_key(&mut st, &snap, key("Backspace"), 120);
+        }
+        for ch in "edited".chars() {
+            handle_key(&mut st, &snap, key(&ch.to_string()), 120);
+        }
+        let outcome = handle_key(&mut st, &snap, key("Enter"), 120);
+        let Outcome::Engine(Command::EditComment {
+            token, seen, text, ..
+        }) = outcome
+        else {
+            panic!("{outcome:?}")
+        };
+        assert!(seen == newer && text == "edited");
+        snap.comment_seq += 1;
+        snap.comment_token = Some(token);
+        st.observe(&snap);
+        assert!(st.editor.is_none());
+        assert!(
+            matches!(handle_key(&mut st, &snap, key("x"), 120), Outcome::Engine(Command::DeleteComment { seen }) if seen.id == newer.id)
+        );
+
+        let mut first = comment_at(&anchor, "made first", 7);
+        first.id = "00000000000000010000000000000000".into();
+        let mut second = comment_at(&anchor, "made second", 7);
+        second.id = "00000000000000020000000000000000".into();
+        snap.comments = std::sync::Arc::new(vec![second.clone(), first.clone()]);
+        st.observe(&snap);
+        st.reconcile(&snap);
+        assert!(
+            matches!(handle_key(&mut st, &snap, key("x"), 120), Outcome::Engine(Command::DeleteComment { seen }) if seen.id == second.id),
+            "the same-second tie goes to the later id"
+        );
+        handle_key(&mut st, &snap, key("u"), 120);
+        assert_eq!(
+            st.editor.as_ref().map(|e| e.text.as_str()),
+            Some("made second")
+        );
+        handle_key(&mut st, &snap, key("Esc"), 120);
+
+        handle_key(&mut st, &snap, key("i"), 120);
+        handle_key(&mut st, &snap, key(" "), 120);
+        assert_eq!(
+            handle_key(&mut st, &snap, key("Enter"), 120),
+            Outcome::Inert
+        );
+        assert_eq!(handle_key(&mut st, &snap, key("Esc"), 120), Outcome::Redraw);
+        assert!(st.editor.is_none());
+    }
+
+    #[test]
+    fn a_refused_save_hands_the_draft_back_and_a_journaled_one_counts_as_saved() {
+        let (mut snap, mut st) = review_setup(&[(10, " --+ ")]);
+        handle_key(&mut st, &snap, key("i"), 120);
+        for ch in "kept".chars() {
+            handle_key(&mut st, &snap, key(&ch.to_string()), 120);
+        }
+        let Outcome::Engine(Command::AddComment { token, .. }) =
+            handle_key(&mut st, &snap, key("Enter"), 120)
+        else {
+            panic!()
+        };
+
+        snap.comment_seq += 1;
+        snap.comment_error = Some(comments::NOTICE_CAP.to_string());
+        snap.comment_refused = true;
+        snap.comment_token = Some(token);
+        st.observe(&snap);
+        let editor = st.editor.as_ref().expect("the draft survives a refusal");
+        assert_eq!((editor.text.as_str(), editor.pending), ("kept", None));
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some(comments::NOTICE_CAP)
+        );
+
+        assert_eq!(handle_key(&mut st, &snap, key("!"), 120), Outcome::Redraw);
+        assert_eq!(st.editor.as_ref().unwrap().text, "kept!");
+
+        let Outcome::Engine(Command::AddComment { token, .. }) =
+            handle_key(&mut st, &snap, key("Enter"), 120)
+        else {
+            panic!()
+        };
+        snap.comment_seq += 1;
+        snap.comment_error = Some(format!("{}disk full", comments::NOTICE_NOT_REMEMBERED));
+        snap.comment_refused = false;
+        snap.comment_token = Some(token);
+        st.observe(&snap);
+        assert!(st.editor.is_none(), "a journaled save closes the editor");
+
+        handle_key(&mut st, &snap, key("i"), 120);
+        handle_key(&mut st, &snap, key("a"), 120);
+        let Outcome::Engine(Command::AddComment { token: first, .. }) =
+            handle_key(&mut st, &snap, key("Enter"), 120)
+        else {
+            panic!()
+        };
+        assert_eq!(handle_key(&mut st, &snap, key("Esc"), 120), Outcome::Redraw);
+        handle_key(&mut st, &snap, key("i"), 120);
+        handle_key(&mut st, &snap, key("b"), 120);
+        let Outcome::Engine(Command::AddComment { token: second, .. }) =
+            handle_key(&mut st, &snap, key("Enter"), 120)
+        else {
+            panic!()
+        };
+        assert!(second > first);
+        snap.comment_seq += 1;
+        snap.comment_error = None;
+        snap.comment_refused = false;
+        snap.comment_token = Some(first);
+        st.observe(&snap);
+        assert_eq!(
+            st.editor.as_ref().map(|e| (e.text.as_str(), e.pending)),
+            Some(("b", Some(second))),
+            "the first save's answer is not the second's"
+        );
+        snap.comment_seq += 1;
+        snap.comment_error = Some(comments::NOTICE_CAP.to_string());
+        snap.comment_refused = true;
+        snap.comment_token = Some(second);
+        st.observe(&snap);
+        assert_eq!(
+            st.editor.as_ref().map(|e| (e.text.as_str(), e.pending)),
+            Some(("b", None)),
+            "the second's refusal hands its draft back"
+        );
+        handle_key(&mut st, &snap, key("Esc"), 120);
+
+        let DiffState::Ready(diff) = &snap.diff else {
+            panic!("ready")
+        };
+
+        let anchor = Anchor {
+            key: diff.key.clone(),
+            side: Side::Deletions,
+            line: 11,
+            span: comments::Span::Line,
+            comparison: comments::AnchorComparison::Worktree,
+        };
+        let card = comment_at(&anchor, "theirs", 1);
+        snap.comments = std::sync::Arc::new(vec![card.clone()]);
+        st.observe(&snap);
+        st.reconcile(&snap);
+        handle_key(&mut st, &snap, key("u"), 120);
+        for ch in " mine".chars() {
+            handle_key(&mut st, &snap, key(&ch.to_string()), 120);
+        }
+        let Outcome::Engine(Command::EditComment { token, .. }) =
+            handle_key(&mut st, &snap, key("Enter"), 120)
+        else {
+            panic!()
+        };
+        snap.comment_seq += 1;
+        snap.comment_error = Some("No comment selected.".to_string());
+        snap.comment_refused = true;
+        snap.comment_token = Some(token);
+        st.observe(&snap);
+        assert_eq!(
+            st.editor.as_ref().map(|e| e.text.as_str()),
+            Some("theirs mine")
+        );
+    }
+
+    #[test]
+    fn a_draft_stays_on_screen_when_the_diff_goes_away() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        handle_key(&mut st, &snap, key("i"), 120);
+        for ch in "half".chars() {
+            handle_key(&mut st, &snap, key(&ch.to_string()), 120);
+        }
+
+        snap.files.clear();
+        snap.diff = DiffState::Idle;
+        st.observe(&snap);
+        st.reconcile(&snap);
+        assert!(
+            st.rows
+                .as_ref()
+                .is_some_and(|r| r.rows.iter().any(|row| matches!(row, Row::Editor { .. }))),
+            "the editor's rows survive the diff"
+        );
+        let rendered = crate::tui::view::render(&snap, &st, 120, 24);
+        assert!(
+            rendered.plain().iter().any(|line| line.contains("half_")),
+            "the draft is drawn, caret included"
+        );
+        assert_eq!(handle_key(&mut st, &snap, key("!"), 120), Outcome::Redraw);
+        assert!(
+            matches!(handle_key(&mut st, &snap, key("Enter"), 120), Outcome::Engine(Command::AddComment { text, .. }) if text == "half!")
+        );
+    }
+
+    #[test]
+    fn a_draft_keeps_its_file_when_another_diff_takes_the_screen() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        handle_key(&mut st, &snap, key("i"), 120);
+        handle_key(&mut st, &snap, key("k"), 120);
+
+        let other = crate::tui::state::tests::snapshot("b.rs", "r2", &[(10, " + ")]);
+        snap.diff = other.diff.clone();
+        snap.files = other.files.clone();
+        snap.selected = other.selected.clone();
+        st.observe(&snap);
+        st.reconcile(&snap);
+        let rows = st.rows.as_ref().unwrap();
+        let editor_rows: Vec<usize> = rows
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r, Row::Editor { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!editor_rows.is_empty());
+        assert_eq!(
+            *editor_rows.last().unwrap(),
+            rows.rows.len() - 1,
+            "the draft sits at the end, under no line of b.rs"
+        );
+        let outcome = handle_key(&mut st, &snap, key("Enter"), 120);
+        assert!(
+            matches!(&outcome, Outcome::Engine(Command::AddComment { anchor, .. }) if anchor.key.path == "a.rs"),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn in_split_mode_u_and_x_take_the_card_of_the_cursors_side_only() {
+        let (mut snap, mut st) = review_setup(&[(10, " -+ ")]);
+        st.requested_mode = ViewMode::Split;
+        st.resize(120, 20);
+        let DiffState::Ready(diff) = &snap.diff else {
+            panic!()
+        };
+        let left = comment_at(
+            &Anchor {
+                key: diff.key.clone(),
+                side: Side::Deletions,
+                line: 11,
+                span: comments::Span::Line,
+                comparison: comments::AnchorComparison::Worktree,
+            },
+            "left",
+            1,
+        );
+        let right = comment_at(
+            &Anchor {
+                key: diff.key.clone(),
+                side: Side::Additions,
+                line: 11,
+                span: comments::Span::Line,
+                comparison: comments::AnchorComparison::Worktree,
+            },
+            "right",
+            2,
+        );
+        snap.comments = std::sync::Arc::new(vec![left.clone(), right.clone()]);
+        st.observe(&snap);
+        st.reconcile(&snap);
+
+        handle_key(&mut st, &snap, key("h"), 120);
+        assert!(
+            matches!(handle_key(&mut st, &snap, key("x"), 120), Outcome::Engine(Command::DeleteComment { seen }) if seen.id == left.id)
+        );
+        handle_key(&mut st, &snap, key("l"), 120);
+        assert!(
+            matches!(handle_key(&mut st, &snap, key("x"), 120), Outcome::Engine(Command::DeleteComment { seen }) if seen.id == right.id)
+        );
+
+        let rendered = crate::tui::view::render(&snap, &st, 120, 24);
+        let rows = st.rows.as_ref().unwrap();
+        let (row, target) = rows
+            .rows
+            .iter()
+            .enumerate()
+            .find_map(|(i, r)| match r {
+                Row::Card {
+                    id,
+                    target: Some(t),
+                    ..
+                } if *id == right.id => Some((i, *t)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(diff.targets[target].side, Side::Additions);
+        let y = (row - st.offset) as u16 + 1;
+        let hit = rendered.hit(60, y).expect("the card row is a hit");
+        assert!(matches!(hit, crate::tui::view::Action::CursorToRow(r) if *r == row));
+    }
+
+    #[test]
+    fn file_comments_use_capital_keys_and_the_notices_say_what_is_missing() {
+        let (mut snap, mut st) = review_setup(&[(10, " --+ ")]);
+        handle_key(&mut st, &snap, key("I"), 120);
+        assert_eq!(
+            st.editor.as_ref().map(|e| e.place_label()),
+            Some("file".into())
+        );
+        handle_key(&mut st, &snap, key("Esc"), 120);
+        handle_key(&mut st, &snap, key("U"), 120);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some(review::NO_COMMENT)
+        );
+        handle_key(&mut st, &snap, key("x"), 120);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some(review::NO_COMMENT)
+        );
+        snap.diff = DiffState::Loading;
+        handle_key(&mut st, &snap, key("i"), 120);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some(review::NO_LINE)
+        );
+    }
+
+    #[test]
+    fn v_selects_a_range_on_one_side_and_i_comments_on_it() {
+        let (snap, mut st) = review_setup(&[(10, " --++ ")]);
+        st.requested_mode = ViewMode::Split;
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        handle_key(&mut st, &snap, key("v"), 120);
+        handle_key(&mut st, &snap, key("j"), 120);
+        handle_key(&mut st, &snap, key("i"), 120);
+        let editor = st.editor.as_ref().unwrap();
+        assert!(
+            matches!(editor.anchor.span, comments::Span::Range { .. }),
+            "{:?}",
+            editor.anchor
+        );
+        assert!(st.visual.is_none(), "i ends the selection");
+        handle_key(&mut st, &snap, key("Esc"), 120);
+        handle_key(&mut st, &snap, key("v"), 120);
+        assert_eq!(handle_key(&mut st, &snap, key("Esc"), 120), Outcome::Redraw);
+        assert!(st.visual.is_none());
+        assert_eq!(
+            handle_key(&mut st, &snap, key("y"), 120),
+            Outcome::Inert,
+            "y is inert without a selection"
+        );
+
+        handle_key(&mut st, &snap, key("v"), 120);
+        let other = crate::tui::state::tests::snapshot("b.rs", "r2", &[(5, " + ")]);
+        st.observe(&other);
+        st.reconcile(&other);
+        assert!(
+            st.visual.is_none(),
+            "a selection made on a.rs cannot name lines of b.rs"
+        );
+    }
+
+    #[test]
+    fn j_past_the_last_line_lands_on_an_orphan_card_where_u_and_x_act() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        let gone = comment_at(
+            &Anchor {
+                key: FileKey {
+                    path: "gone".into(),
+                    staged: false,
+                    untracked: false,
+                },
+                side: Side::Additions,
+                line: 1,
+                span: comments::Span::Line,
+                comparison: comments::AnchorComparison::Worktree,
+            },
+            "lost",
+            1,
+        );
+        snap.comments = std::sync::Arc::new(vec![gone.clone()]);
+        st.observe(&snap);
+        st.reconcile(&snap);
+        let last = st.cursor.unwrap();
+        handle_key(&mut st, &snap, key("G"), 120);
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert_eq!(st.orphan, Some(0));
+        assert_eq!(handle_key(&mut st, &snap, key("i"), 120), Outcome::Inert);
+        handle_key(&mut st, &snap, key("u"), 120);
+        assert_eq!(st.editor.as_ref().map(|e| e.text.as_str()), Some("lost"));
+        handle_key(&mut st, &snap, key("Esc"), 120);
+        assert!(
+            matches!(handle_key(&mut st, &snap, key("x"), 120), Outcome::Engine(Command::DeleteComment { seen }) if seen.id == gone.id)
+        );
+
+        for action in ["s", "d"] {
+            assert_eq!(
+                handle_key(&mut st, &snap, key(action), 120),
+                Outcome::Redraw,
+                "{action}"
+            );
+            assert!(
+                st.confirm.is_none(),
+                "{action} opened a box for a hunk under a hidden cursor"
+            );
+            assert_eq!(
+                st.notice.as_ref().map(|n| n.text.as_str()),
+                Some(crate::engine::actions::NOTICE_NO_HUNK)
+            );
+            st.notice = None;
+        }
+        handle_key(&mut st, &snap, key("k"), 120);
+        assert_eq!(st.orphan, None);
+        let _ = last;
+    }
+
+    #[test]
+    fn an_empty_list_with_orphans_is_reachable_and_editable() {
+        let (mut snap, mut st) = review_setup(&[]);
+        snap.files.clear();
+        snap.diff = DiffState::Idle;
+        let gone = comment_at(
+            &Anchor {
+                key: FileKey {
+                    path: "gone".into(),
+                    staged: false,
+                    untracked: false,
+                },
+                side: Side::Additions,
+                line: 1,
+                span: comments::Span::Line,
+                comparison: comments::AnchorComparison::Worktree,
+            },
+            "left behind",
+            1,
+        );
+        let mut unsure = gone.clone();
+        unsure.id = "u".into();
+        unsure.state = comments::CommentState::Unconfirmed {
+            stamp: comments::Stamp {
+                at: 1,
+                nonce: "abc123".into(),
+                item: 1,
+                to: crate::engine::target::Destination::clipboard(),
+            },
+            before: Vec::new(),
+        };
+        snap.comments = std::sync::Arc::new(vec![gone.clone(), unsure.clone()]);
+        st.observe(&snap);
+        st.reconcile(&snap);
+        assert!(
+            st.rows.as_ref().is_some_and(|r| r.orphan_tops.len() == 2),
+            "the orphan section is built without a diff"
+        );
+        assert_eq!(st.cursor, None);
+
+        let long = "x".repeat(300);
+        let mut wide = gone.clone();
+        wide.id = "wide".into();
+        wide.text = long.clone();
+        snap.comments = std::sync::Arc::new(vec![wide]);
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            st.requested_mode = mode;
+            st.resize(120, 20);
+            st.observe(&snap);
+            st.reconcile(&snap);
+            let rendered = crate::tui::view::render(&snap, &st, 120, 24).plain();
+            let pieces: Vec<String> = st
+                .rows
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .filter_map(|r| match r {
+                    Row::Card {
+                        line: crate::tui::cards::CardLine::Text(t),
+                        ..
+                    } => Some(t.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(pieces.concat(), long, "{mode:?}");
+            for piece in &pieces {
+                assert!(
+                    rendered.iter().any(|l| l.contains(piece.as_str())),
+                    "{mode:?}: a wrapped piece was cut: {piece}"
+                );
+            }
+        }
+        snap.comments = std::sync::Arc::new(vec![gone.clone(), unsure.clone()]);
+        st.requested_mode = ViewMode::Unified;
+        st.resize(120, 20);
+        st.observe(&snap);
+        st.reconcile(&snap);
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert_eq!(
+            st.orphan,
+            Some(0),
+            "j from nothing enters the orphan section"
+        );
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert_eq!(st.orphan, Some(1));
+
+        handle_key(&mut st, &snap, key("u"), 120);
+        assert_eq!(
+            st.editor
+                .as_ref()
+                .and_then(|e| e.editing.as_ref())
+                .map(|c| c.id.as_str()),
+            Some("u")
+        );
+        handle_key(&mut st, &snap, key("Esc"), 120);
+        assert!(
+            matches!(handle_key(&mut st, &snap, key("x"), 120), Outcome::Engine(Command::DeleteComment { seen }) if seen.id == "u")
+        );
+        let rendered = crate::tui::view::render(&snap, &st, 120, 24);
+        let plain = rendered.plain().join("\n");
+        assert!(
+            plain.contains("✎ on changes no longer shown (2)")
+                && !plain.contains("working tree clean"),
+            "{plain}"
+        );
+    }
+
+    #[test]
+    fn clicks_under_an_open_editor_are_inert_except_the_category_words() {
+        let (snap, mut st) = review_setup(&[(10, " + ")]);
+        st.files_panel = FilesPanel::Shown;
+        handle_key(&mut st, &snap, key("i"), 120);
+        st.reconcile(&snap);
+        let output = render(&snap, &st, 120, 24);
+        let click = |hit: &crate::tui::view::Hit| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x0,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        for hit in output.hits.iter().filter(|h| {
+            matches!(
+                h.action,
+                Action::PickPane | Action::SelectFile(_) | Action::CursorToRow(_)
+            )
+        }) {
+            assert_eq!(
+                handle_mouse(&mut st, &snap, &output, click(hit)),
+                Outcome::Inert
+            );
+        }
+        assert!(st.panes.is_none() && st.confirm.is_none() && st.editor.is_some());
+        let hit = output
+            .hits
+            .iter()
+            .find(|h| h.action == Action::EditorCategory(comments::Category::Question))
+            .expect("category hit");
+        assert_eq!(
+            handle_mouse(&mut st, &snap, &output, click(hit)),
+            Outcome::Redraw
+        );
+        assert_eq!(
+            st.editor.as_ref().unwrap().category,
+            comments::Category::Question
+        );
+        let text: String = output.lines[usize::from(hit.y)]
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(
+            text.chars()
+                .skip(usize::from(hit.x0))
+                .take(usize::from(hit.x1 - hit.x0))
+                .collect::<String>(),
+            "Question"
+        );
+        assert_eq!(
+            handle_key(&mut st, &snap, key("ctrl+c"), 120),
+            Outcome::Quit
+        );
+    }
+
+    #[test]
+    fn editing_an_orphan_replaces_its_card_until_the_editor_closes() {
+        for ready in [false, true] {
+            let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+            let mut orphan = comment_at(&anchor_on(&snap, 11), "orphan words", 1);
+            orphan.anchor.key.path = "gone.rs".into();
+            snap.comments = std::sync::Arc::new(vec![orphan]);
+            if !ready {
+                snap.diff = DiffState::Idle;
+            }
+            st.reconcile(&snap);
+            handle_key(&mut st, &snap, key("G"), 120);
+            handle_key(&mut st, &snap, key("j"), 120);
+            handle_key(&mut st, &snap, key("u"), 120);
+            st.reconcile(&snap);
+            let plain = render(&snap, &st, 120, 24).plain().join("\n");
+            assert_eq!(plain.matches("orphan words").count(), 1, "{plain}");
+            assert!(plain.contains("orphan words_"));
+            handle_key(&mut st, &snap, key("Esc"), 120);
+            st.reconcile(&snap);
+            assert!(st
+                .rows
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::Card { .. })));
+            assert_eq!(st.orphan, Some(0));
+        }
+    }
+
+    #[test]
+    fn leaving_an_orphan_always_redraws_or_changes_file() {
+        for movement in ["h", "l", "g", "n", "p"] {
+            let (mut snap, mut st) = review_setup(&[(10, "+")]);
+            let mut orphan = comment_at(&anchor_on(&snap, 10), "gone", 1);
+            orphan.anchor.key.path = "gone.rs".into();
+            snap.comments = std::sync::Arc::new(vec![orphan]);
+            st.reconcile(&snap);
+            handle_key(&mut st, &snap, key("j"), 120);
+            assert_eq!(st.orphan, Some(0));
+            let outcome = handle_key(&mut st, &snap, key(movement), 120);
+            assert_eq!(st.orphan, None, "{movement}");
+            assert_ne!(
+                outcome,
+                Outcome::Inert,
+                "{movement}: a changed cursor needs a frame"
+            );
+        }
+    }
+
+    #[test]
+    fn side_keys_collapse_a_selection_only_when_the_cursor_changes_side() {
+        let (snap, mut st) = review_setup(&[(10, " --++ ")]);
+        handle_key(&mut st, &snap, key("v"), 120);
+        let start = st.visual.as_ref().unwrap().start;
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert_ne!(st.cursor, Some(start));
+        assert_eq!(handle_key(&mut st, &snap, key("h"), 120), Outcome::Inert);
+        assert_eq!(
+            st.visual.as_ref().unwrap().start,
+            start,
+            "an inert key preserves the visible selection"
+        );
+        assert_eq!(handle_key(&mut st, &snap, key("l"), 120), Outcome::Redraw);
+        assert_eq!(st.visual.as_ref().unwrap().start, st.cursor.unwrap());
+        let DiffState::Ready(diff) = &snap.diff else {
+            panic!()
+        };
+        assert_eq!(diff.targets[st.cursor.unwrap()].side, Side::Additions);
     }
 }

@@ -23,6 +23,13 @@ pub enum KeyAction {
     PickBase,
     MarkReviewed,
     PickPane,
+    Comment,
+    CommentFile,
+    Visual,
+    EditComment,
+    EditFileComment,
+    DeleteComment,
+    DeleteFileComment,
     StageHunk,
     DiscardHunk,
     DiscardFile,
@@ -42,7 +49,7 @@ pub struct Binding {
     pub vimeflow: Option<&'static str>,
 }
 
-pub const RESERVED: &[&str] = &["i", "I", "u", "U", "x", "X", "v", "y", "Y", "@", "c", "/"];
+pub const RESERVED: &[&str] = &["y", "Y", "@", "c", "/"];
 
 pub const KEYS: &[Binding] = &[
     Binding {
@@ -169,6 +176,48 @@ pub const KEYS: &[Binding] = &[
         key: "A",
         label: "send to (pane)",
         action: KeyAction::PickPane,
+        vimeflow: None,
+    },
+    Binding {
+        key: "i",
+        label: "comment on line / selection",
+        action: KeyAction::Comment,
+        vimeflow: Some("diff-comment"),
+    },
+    Binding {
+        key: "I",
+        label: "comment on file",
+        action: KeyAction::CommentFile,
+        vimeflow: Some("diff-comment-file"),
+    },
+    Binding {
+        key: "v",
+        label: "select lines",
+        action: KeyAction::Visual,
+        vimeflow: Some("diff-visual"),
+    },
+    Binding {
+        key: "u",
+        label: "edit comment",
+        action: KeyAction::EditComment,
+        vimeflow: Some("diff-comment-edit"),
+    },
+    Binding {
+        key: "U",
+        label: "edit file comment",
+        action: KeyAction::EditFileComment,
+        vimeflow: None,
+    },
+    Binding {
+        key: "x",
+        label: "delete comment",
+        action: KeyAction::DeleteComment,
+        vimeflow: Some("diff-comment-delete"),
+    },
+    Binding {
+        key: "X",
+        label: "delete file comment",
+        action: KeyAction::DeleteFileComment,
         vimeflow: None,
     },
     Binding {
@@ -302,8 +351,8 @@ mod tests {
                 assert_eq!(lookup(&KeyEvent::new(code, modifiers)), None);
             }
         }
-        assert_eq!(KEYS.len(), 28);
-        assert_eq!(help_panel(false).rows.len(), 28);
+        assert_eq!(KEYS.len(), 35);
+        assert_eq!(help_panel(false).rows.len(), 35);
     }
 
     #[test]
