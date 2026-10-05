@@ -126,6 +126,41 @@ pub fn handle_key(
     }
 }
 
+pub fn handle_paste(state: &mut ViewState, snapshot: &Snapshot, text: &str) -> Outcome {
+    if state.help_open || state.confirm.is_some() || state.review_box.is_some() {
+        return Outcome::Inert;
+    }
+    if let Some(editor) = state.editor.as_mut() {
+        if editor.pending.is_some() {
+            return Outcome::Inert;
+        }
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    editor.newline();
+                }
+                '\n' => editor.newline(),
+                ch => editor.insert(ch),
+            }
+        }
+        state.reconcile(snapshot);
+        state.keep_cursor_visible();
+        return Outcome::Redraw;
+    }
+    if let Some(picker) = state.panes.as_mut() {
+        picker
+            .input
+            .extend(text.chars().filter(|ch| !ch.is_control()));
+        picker.retarget(snapshot);
+        return Outcome::Redraw;
+    }
+    Outcome::Inert
+}
+
 fn box_key(state: &mut ViewState, snapshot: &Snapshot, key: KeyEvent) -> Outcome {
     let Some(b) = state.review_box.as_mut() else {
         return Outcome::Inert;
@@ -2927,6 +2962,106 @@ pub(crate) mod tests {
             .as_ref()
             .expect("the editor opened on the kept anchor");
         assert_eq!(editor.place_label(), "L11"); // the fixture's first changed row is the deletion of old line 11
+    }
+
+    #[test]
+    fn paste_in_the_editor_inserts_newlines_without_submitting() {
+        for text in [
+            "first line\rd\ry",
+            "first line\r\nd\r\ny",
+            "first line\nd\ny",
+        ] {
+            let (snap, mut st) = review_setup(&[(10, " --+ ")]);
+            handle_key(&mut st, &snap, key("i"), 120);
+            let token = st.comment_token;
+            let outcome = handle_paste(&mut st, &snap, text);
+            let editor = st.editor.as_ref().unwrap();
+            assert_eq!(editor.text, "first line\nd\ny");
+            assert_eq!(outcome, Outcome::Redraw);
+            assert!(editor.pending.is_none());
+            assert_eq!(st.comment_token, token);
+            assert!(st.confirm.is_none());
+        }
+    }
+
+    #[test]
+    fn paste_outside_text_inputs_never_runs_shortcuts_or_confirms() {
+        let (snap, mut st) = review_setup(&[(10, " --+ ")]);
+        let before = (
+            st.confirm.is_some(),
+            st.editor.is_some(),
+            st.panes.is_some(),
+            st.cursor,
+        );
+        assert_eq!(
+            handle_paste(&mut st, &snap, "first line\rd\ry"),
+            Outcome::Inert
+        );
+        assert_eq!(
+            (
+                st.confirm.is_some(),
+                st.editor.is_some(),
+                st.panes.is_some(),
+                st.cursor
+            ),
+            before
+        );
+        handle_key(&mut st, &snap, key("d"), 120);
+        st.confirm.as_mut().unwrap().drawn = true;
+        assert_eq!(handle_paste(&mut st, &snap, "y\rn"), Outcome::Inert);
+        assert!(st.confirm.as_ref().unwrap().drawn);
+        assert!(st.pending_action.is_none());
+    }
+
+    #[test]
+    fn paste_in_the_pane_picker_filters_without_submitting() {
+        let (mut snap, mut st) = review_setup(&[(10, " --+ ")]);
+        handle_key(&mut st, &snap, key("A"), 120);
+        snap.panes_seq = st.panes.as_ref().unwrap().token;
+        snap.panes = Some(std::sync::Arc::new(
+            ["codex", "claude"]
+                .into_iter()
+                .map(|agent| crate::engine::PaneRow {
+                    record: crate::engine::host::PaneRecord {
+                        pane_id: format!("w1:p{}", if agent == "codex" { 1 } else { 2 }),
+                        agent: Some(agent.into()),
+                        ..Default::default()
+                    },
+                    this_worktree: true,
+                })
+                .collect(),
+        ));
+        assert_eq!(
+            handle_paste(&mut st, &snap, "co\r\nd\nex\t"),
+            Outcome::Redraw
+        );
+        let picker = st.panes.as_ref().unwrap();
+        assert_eq!(picker.input, "codex");
+        let choices = picker.choices(&snap);
+        assert_eq!(choices.len(), 2);
+        assert!(
+            matches!(&choices[0], panes::Choice::Pane(row) if row.record.agent.as_deref() == Some("codex"))
+        );
+        assert!(picker.pending.is_none());
+    }
+
+    #[test]
+    fn paste_respects_editor_caps_and_a_pending_save() {
+        let (snap, mut st) = review_setup(&[(10, " --+ ")]);
+        handle_key(&mut st, &snap, key("i"), 120);
+        handle_paste(&mut st, &snap, &"字".repeat(comments::MAX_CHARS + 1));
+        let editor = st.editor.as_mut().unwrap();
+        assert_eq!(editor.text.chars().count(), comments::MAX_CHARS);
+        assert!(editor.at_limit);
+        editor.text.clear();
+        handle_paste(&mut st, &snap, &"\r\n".repeat(comments::MAX_LINES + 1));
+        let editor = st.editor.as_mut().unwrap();
+        assert!(comments::within_caps(&editor.text));
+        assert!(editor.at_limit);
+        editor.text = "saving".into();
+        editor.pending = Some(1);
+        assert_eq!(handle_paste(&mut st, &snap, "extra"), Outcome::Inert);
+        assert_eq!(st.editor.as_ref().unwrap().text, "saving");
     }
 
     #[test]

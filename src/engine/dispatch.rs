@@ -98,6 +98,8 @@ pub struct Context {
     /// The generation this command was issued under, and the live one to compare with at the claim.
     pub generation: u64,
     pub latest_generation: Arc<AtomicU64>,
+    pub copy_generation: u64,
+    pub latest_copy: Arc<AtomicU64>,
     pub nonce: Arc<dyn Fn(u64) -> String + Send + Sync>,
     pub nonce_counter: u64,
     pub snapshot: Arc<Snapshot>,
@@ -367,9 +369,13 @@ fn now_label(kind: &SendKind) -> &'static str {
 }
 
 /// `clipboard.md` under the state lock; `Err` is the reason.
-fn write_clipboard(state_dir: Option<&Path>, text: &str) -> Result<PathBuf, String> {
+fn write_clipboard(
+    state_dir: Option<&Path>,
+    text: &str,
+    guard: &dyn Fn() -> Result<(), String>,
+) -> Result<PathBuf, String> {
     let dir = state_dir.ok_or_else(|| "no state directory".to_string())?;
-    comments::write_clipboard(dir, text).map_err(|e| e.to_string())
+    comments::write_clipboard(dir, text, guard).map_err(|e| e.to_string())
 }
 
 fn shown(path: &Path) -> String {
@@ -405,8 +411,11 @@ fn copy_out(
     state_dir: Option<&Path>,
     text: &str,
     what: &str,
-) -> (CopyOut, Result<PathBuf, String>) {
-    let file = write_clipboard(state_dir, text);
+    guard: &dyn Fn() -> Result<(), String>,
+) -> Option<(CopyOut, Result<PathBuf, String>)> {
+    guard().ok()?;
+    let file = write_clipboard(state_dir, text, guard);
+    guard().ok()?;
     let osc = osc52(text);
     let notice = match (&file, &osc) {
         (Ok(path), Some(_)) => format!("copied {what} · also in {}", shown(path)),
@@ -417,14 +426,14 @@ fn copy_out(
         (Err(reason), Some(_)) => format!("copied {what} · not saved to clipboard.md: {reason}"),
         (Err(reason), None) => format!("nothing could receive the copy: {reason}"),
     };
-    (
+    Some((
         CopyOut {
             osc,
             notice,
             urgent: file.is_err(),
         },
         file,
-    )
+    ))
 }
 
 /// The send task of spec 10.4, one at a time per viewer (the session refuses a second) and per user
@@ -783,9 +792,11 @@ async fn send_inner(
                         bail!(store, again());
                     }
                     let (dir2, text2) = (dir.clone(), text.clone());
-                    let (copy, file) =
-                        blocking(move || copy_out(dir2.as_deref(), &text2, "a review request"))
-                            .await;
+                    let (copy, file) = blocking(move || {
+                        copy_out(dir2.as_deref(), &text2, "a review request", &|| Ok(()))
+                            .expect("send copies are never superseded")
+                    })
+                    .await;
                     if file.is_err() && copy.osc.is_none() {
                         if let Some(dir) = dir.clone() {
                             let (top, n) = (ctx.toplevel.clone(), nonce.clone());
@@ -835,9 +846,16 @@ async fn send_inner(
     match &to {
         Destination::Clipboard { .. } => {
             let (dir, text2) = (ctx.state_dir.clone(), text.clone());
-            let (copy, file) =
-                blocking(move || copy_out(dir.as_deref(), &text2, &format!("{items} comments")))
-                    .await;
+            let (copy, file) = blocking(move || {
+                copy_out(
+                    dir.as_deref(),
+                    &text2,
+                    &format!("{items} comments"),
+                    &|| Ok(()),
+                )
+                .expect("send copies are never superseded")
+            })
+            .await;
             let settlement = match (&file, &copy.osc) {
                 (Ok(_), _) => Settlement::Sent,
                 (Err(_), Some(_)) => Settlement::Unconfirmed,
@@ -1110,12 +1128,23 @@ async fn call_host_late(
 }
 
 /// `c` in a box, `y` on a selection: nothing is claimed; a request copy is recorded once the text
-/// reached a destination (spec 10.4). Returns the copy and where the nonce counter stands.
+/// reached a destination (spec 10.4). Returns `None` for a superseded copy.
 pub async fn copy(
     ctx: Context,
     request: CopyRequest,
     comments: Vec<comments::Comment>,
-) -> Result<(CopyOut, u64), String> {
+) -> Result<Option<(CopyOut, u64)>, String> {
+    let (latest, generation) = (ctx.latest_copy.clone(), ctx.copy_generation);
+    let guard = move || {
+        if latest.load(Ordering::SeqCst) == generation {
+            Ok(())
+        } else {
+            Err("copy superseded".to_string())
+        }
+    };
+    if guard().is_err() {
+        return Ok(None);
+    }
     let mut counter = ctx.nonce_counter;
     let (text, what) = match &request.what {
         CopyWhat::Selection(text) => (text.clone(), "selection".to_string()),
@@ -1168,6 +1197,9 @@ pub async fn copy(
         }
         CopyWhat::Request { scope } => {
             let (lines, files) = request_files(&ctx, scope).await?;
+            if guard().is_err() {
+                return Ok(None);
+            }
             let scope_of = match comparison_of(&ctx.snapshot) {
                 comments::AnchorComparison::Branch { merge_base, .. } => Some(merge_base),
                 comments::AnchorComparison::Worktree => None,
@@ -1198,9 +1230,11 @@ pub async fn copy(
                         text_of.clone(),
                     );
                     let (latest, generation) = (ctx.latest_generation.clone(), ctx.generation);
+                    let copy_guard = guard.clone();
                     let (nonce, text, c) = blocking(move || {
                         // Refuse a copy whose target changed while it waited.
                         let guard = || {
+                            copy_guard()?;
                             if latest.load(Ordering::SeqCst) == generation {
                                 Ok(())
                             } else {
@@ -1242,35 +1276,70 @@ pub async fn copy(
                 }
             };
             let (dir, text2) = (ctx.state_dir.clone(), text.clone());
-            let (out, file) = blocking(move || {
+            let copied = blocking(move || {
                 copy_out(
                     dir.as_deref(),
                     &text2,
                     &format!("a review request for {} files", lines.len()),
+                    &guard,
                 )
             })
             .await;
-            if file.is_err() && out.osc.is_none() {
+            if copied
+                .as_ref()
+                .is_none_or(|(out, file)| file.is_err() && out.osc.is_none())
+            {
                 if let Some(dir) = ctx.state_dir.clone() {
                     let (top, n) = (ctx.toplevel.clone(), nonce.clone());
                     let _ = blocking(move || comments::remove_request(&dir, &top, &n)).await;
                 }
+            }
+            let Some((out, file)) = copied else {
+                return Ok(None);
+            };
+            if file.is_err() && out.osc.is_none() {
                 return Err(out.notice);
             }
-            return Ok((out, counter));
+            return Ok(Some((out, counter)));
         }
     };
     let (dir, text2) = (ctx.state_dir.clone(), text.clone());
-    let (out, file) = blocking(move || copy_out(dir.as_deref(), &text2, &what)).await;
+    let Some((out, file)) = blocking(move || copy_out(dir.as_deref(), &text2, &what, &guard)).await
+    else {
+        return Ok(None);
+    };
     if file.is_err() && out.osc.is_none() {
         return Err(out.notice);
     }
-    Ok((out, counter))
+    Ok(Some((out, counter)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_out_rechecks_supersession_under_the_lock_and_before_osc() {
+        for superseded_at in [2, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(CLIPBOARD_FILE);
+            std::fs::write(&path, "newer").unwrap();
+            let calls = std::cell::Cell::new(0);
+            let guard = || {
+                calls.set(calls.get() + 1);
+                if calls.get() >= superseded_at {
+                    Err("copy superseded".into())
+                } else {
+                    Ok(())
+                }
+            };
+            assert!(copy_out(Some(dir.path()), "older", "selection", &guard).is_none());
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                if superseded_at == 2 { "newer" } else { "older" }
+            );
+        }
+    }
 
     #[test]
     fn send_lock_rejects_relative_paths_before_opening_them() {

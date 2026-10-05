@@ -82,6 +82,8 @@ pub struct EngineHandle {
     pub target_writes_waiting: Arc<AtomicUsize>,
     /// Test hook: target writes finished, including superseded writes.
     pub target_writes_done: Arc<AtomicUsize>,
+    /// Test hook: copy replies handled, including superseded copies.
+    pub copies_answered: Arc<AtomicUsize>,
 }
 
 struct FrozenWatcher {
@@ -295,6 +297,8 @@ struct State {
     nonce_counter: u64,
     send_seq: u64,
     copy_seq: u64,
+    copy_generation: u64,
+    latest_copy: Arc<AtomicU64>,
     host_wait: Duration,
     send_gate: Option<Arc<dyn Fn() + Send + Sync>>,
     late_tx: UnboundedSender<(String, comments::Settlement)>,
@@ -376,7 +380,10 @@ fn markable(
 enum Done {
     SendWaiting(bool),
     Sent(dispatch::Finished),
-    Copied(Result<(dispatch::CopyOut, u64), String>),
+    Copied {
+        generation: u64,
+        outcome: Result<Option<(dispatch::CopyOut, u64)>, String>,
+    },
     StoreOpened(comments::Store, Vec<String>),
     StoreRefreshed(comments::Store, Vec<String>),
     Comment {
@@ -849,6 +856,8 @@ impl State {
             target: self.snapshot.target.clone(),
             generation: self.selection_generation,
             latest_generation: self.latest_selection.clone(),
+            copy_generation: self.copy_generation,
+            latest_copy: self.latest_copy.clone(),
             nonce: self.nonce.clone(),
             nonce_counter: self.nonce_counter,
             snapshot: Arc::new(self.snapshot.clone()),
@@ -1299,6 +1308,7 @@ async fn run(
     target_checks: Arc<AtomicUsize>,
     target_writes_waiting: Arc<AtomicUsize>,
     target_writes_done: Arc<AtomicUsize>,
+    copies_answered: Arc<AtomicUsize>,
 ) {
     let (late_tx, late_rx) = unbounded_channel();
     let mut state = State {
@@ -1348,6 +1358,8 @@ async fn run(
         nonce_counter: 0,
         send_seq: 0,
         copy_seq: 0,
+        copy_generation: 0,
+        latest_copy: Arc::new(AtomicU64::new(0)),
         host_wait: config.host_wait,
         send_gate: config.send_gate.clone(),
         late_tx,
@@ -1452,13 +1464,16 @@ async fn run(
                         }
                     }
                     Command::Copy(request) => {
+                        state.copy_generation += 1;
+                        state.latest_copy.store(state.copy_generation, Ordering::SeqCst);
+                        let generation = state.copy_generation;
                         // Copies read published comments without borrowing the store.
                         let ctx = state.dispatch_context(&cwd);
                         let comments = state.snapshot.comments.to_vec();
                         let results = results_tx.clone();
                         tokio::spawn(async move {
                             let outcome = dispatch::copy(ctx, request, comments).await;
-                            let _ = results.send(Done::Copied(outcome));
+                            let _ = results.send(Done::Copied { generation, outcome });
                         });
                     }
 
@@ -1786,17 +1801,20 @@ async fn run(
                         publish(&mut state, next, &snapshots);
                         state.run_store_queue(&results_tx);
                     }
-                    Done::Copied(outcome) => {
-                        state.copy_seq += 1;
-                        next.copy_seq = state.copy_seq;
-                        next.copy = Some(Arc::new(match outcome {
-                            Ok((out, counter)) => {
-                                state.nonce_counter = state.nonce_counter.max(counter);
-                                out
-                            }
-                            Err(notice) => dispatch::CopyOut { osc: None, notice, urgent: true },
-                        }));
-                        publish(&mut state, next, &snapshots);
+                    Done::Copied { generation, outcome } => {
+                        if let Some(outcome) = outcome.transpose().filter(|_| generation == state.copy_generation) {
+                            state.copy_seq += 1;
+                            next.copy_seq = state.copy_seq;
+                            next.copy = Some(Arc::new(match outcome {
+                                Ok((out, counter)) => {
+                                    state.nonce_counter = state.nonce_counter.max(counter);
+                                    out
+                                }
+                                Err(notice) => dispatch::CopyOut { osc: None, notice, urgent: true },
+                            }));
+                            publish(&mut state, next, &snapshots);
+                        }
+                        copies_answered.fetch_add(1, Ordering::SeqCst);
                     }
 
                     Done::StoreOpened(store, problems) | Done::StoreRefreshed(store, problems) => {
@@ -2185,6 +2203,7 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
     let target_checks = Arc::new(AtomicUsize::new(0));
     let target_writes_waiting = Arc::new(AtomicUsize::new(0));
     let target_writes_done = Arc::new(AtomicUsize::new(0));
+    let copies_answered = Arc::new(AtomicUsize::new(0));
     runtime.spawn(run(
         config,
         commands_rx,
@@ -2197,6 +2216,7 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
         target_checks.clone(),
         target_writes_waiting.clone(),
         target_writes_done.clone(),
+        copies_answered.clone(),
     ));
     EngineHandle {
         commands,
@@ -2209,6 +2229,7 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
         target_checks,
         target_writes_waiting,
         target_writes_done,
+        copies_answered,
     }
 }
 
@@ -7073,6 +7094,56 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_selection_copy_supersedes_a_request_waiting_for_diffs() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let gate = Arc::new(Semaphore::new(0));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.poll_interval = Duration::from_secs(3600);
+        config.state_dir = Some(state.path().to_path_buf());
+        config.diff_gate = Some(gate.clone());
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "rows awaiting their diff", |s| {
+            s.files.len() == 2 && !s.refreshing && matches!(s.diff, DiffState::Loading)
+        });
+        wait_cond("diff holds the lane at the gate", || {
+            handle.pre_images.load(Ordering::SeqCst) == 1
+        });
+        handle
+            .commands
+            .send(Command::Copy(dispatch::CopyRequest {
+                what: dispatch::CopyWhat::Request {
+                    scope: dispatch::ReviewScope::All,
+                },
+            }))
+            .unwrap();
+        handle
+            .commands
+            .send(Command::Copy(dispatch::CopyRequest {
+                what: dispatch::CopyWhat::Selection("newer".into()),
+            }))
+            .unwrap();
+        let mut last = wait_for(&handle, "selection copied", |s| s.copy_seq == 1);
+        let selection = last.copy.clone();
+        assert_eq!(selection.as_ref().unwrap().osc, dispatch::osc52("newer"));
+        let clipboard = state.path().join(dispatch::CLIPBOARD_FILE);
+        assert_eq!(std::fs::read_to_string(&clipboard).unwrap(), "newer");
+
+        gate.add_permits(1);
+        wait_cond("both copy replies handled", || {
+            handle.copies_answered.load(Ordering::SeqCst) == 2
+        });
+        while let Ok(snapshot) = handle.snapshots.try_recv() {
+            last = snapshot;
+        }
+        assert_eq!(
+            (last.copy_seq, std::fs::read_to_string(&clipboard).unwrap()),
+            (1, "newer".to_string())
+        );
+        assert_eq!(last.copy, selection);
+    }
+
+    #[test]
     fn c_still_copies_while_the_store_cannot_be_read() {
         let (dir, state, _top, host) = sending_fixture();
         let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
@@ -7234,6 +7305,8 @@ mod tests {
             worktree_renames: BTreeMap::new(),
             generation: 0,
             latest_generation: Arc::new(AtomicU64::new(0)),
+            copy_generation: 0,
+            latest_copy: Arc::new(AtomicU64::new(0)),
             nonce: Arc::new(|c| format!("n{c:05}")),
             nonce_counter: 0,
             snapshot: Arc::new(snapshot),

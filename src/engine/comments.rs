@@ -1113,7 +1113,11 @@ pub fn record_request_fresh(
     Ok(chosen)
 }
 
-pub fn write_clipboard(state_dir: &Path, text: &str) -> std::io::Result<PathBuf> {
+pub fn write_clipboard(
+    state_dir: &Path,
+    text: &str,
+    guard: &dyn Fn() -> Result<(), String>,
+) -> std::io::Result<PathBuf> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if !state_dir.is_absolute() {
         return Err(std::io::Error::new(
@@ -1122,6 +1126,7 @@ pub fn write_clipboard(state_dir: &Path, text: &str) -> std::io::Result<PathBuf>
         ));
     }
     reuse::with_lock(state_dir, || -> std::io::Result<PathBuf> {
+        guard().map_err(|e| std::io::Error::new(std::io::ErrorKind::Interrupted, e))?;
         let path = state_dir.join("clipboard.md");
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = state_dir.join(format!("clipboard.md.{}.{n}.tmp", std::process::id()));
@@ -1318,8 +1323,11 @@ mod tests {
             std::io::ErrorKind::InvalidInput
         );
         let dir = tempfile::tempdir().unwrap();
-        let path = write_clipboard(dir.path(), "first").unwrap();
-        assert_eq!(write_clipboard(dir.path(), "second").unwrap(), path);
+        let path = write_clipboard(dir.path(), "first", &|| Ok(())).unwrap();
+        assert_eq!(
+            write_clipboard(dir.path(), "second", &|| Ok(())).unwrap(),
+            path
+        );
         assert_eq!(std::fs::read_to_string(path).unwrap(), "second");
     }
 

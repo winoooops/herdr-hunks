@@ -63,6 +63,7 @@ fn install_panic_hook() {
         let _ = crossterm::execute!(
             io::stdout(),
             crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
             crossterm::terminal::LeaveAlternateScreen,
             crossterm::cursor::Show,
         );
@@ -122,6 +123,8 @@ fn run_terminal(
     path: &std::path::Path,
 ) -> io::Result<()> {
     let mut guard = TerminalGuard::enter()?;
+    // Bracketed paste is disabled by run and the panic hook on every exit.
+    crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
     let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(TerminalOutput(io::stdout())))?;
     let mut width = terminal.size()?.width;
     let mut state = initial_state(config, width);
@@ -216,6 +219,7 @@ fn run_terminal(
         }
         let outcome = match crossterm::event::read() {
             Ok(Event::Key(key)) => input::handle_key(&mut state, &snapshot, key, width),
+            Ok(Event::Paste(text)) => input::handle_paste(&mut state, &snapshot, &text),
             Ok(Event::Mouse(mouse)) => input::handle_mouse(&mut state, &snapshot, &rendered, mouse),
             Ok(Event::Resize(_, _)) => Outcome::Redraw,
             Ok(_) => Outcome::Inert,
@@ -282,6 +286,7 @@ pub fn run(path: PathBuf) -> i32 {
     let handle = engine::spawn(runtime.handle(), session);
     install_panic_hook();
     let result = run_terminal(&handle, &config, notice, &path);
+    let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
     let _ = handle.commands.send(Command::Shutdown);
     // A blocking git call must not keep a closed viewer alive for its full timeout.
     runtime.shutdown_timeout(Duration::from_secs(1));
