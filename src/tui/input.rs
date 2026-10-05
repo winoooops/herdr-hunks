@@ -1108,7 +1108,10 @@ pub fn handle_mouse(
         Some(Action::SelectFile(index)) => snapshot
             .files
             .get(*index)
-            .map(|file| Outcome::Engine(Command::Select(FileKey::of(file))))
+            .map(|file| {
+                state.orphan = None;
+                Outcome::Engine(Command::Select(FileKey::of(file)))
+            })
             .unwrap_or(Outcome::Inert),
         Some(Action::CursorToRow(row)) => {
             let Some(rows) = &state.rows else {
@@ -3564,6 +3567,53 @@ pub(crate) mod tests {
         handle_key(&mut st, &snap, key("k"), 120);
         assert_eq!(st.orphan, None);
         let _ = last;
+    }
+
+    #[test]
+    fn clicking_another_file_leaves_the_orphan_and_comments_on_the_new_diff() {
+        let (mut snap, mut st) = review_setup(&[(10, "++")]);
+        let mut other_file = snap.files[0].clone();
+        other_file.path = "b.rs".into();
+        snap.files.push(other_file);
+        let mut orphan = comment_at(&anchor_on(&snap, 10), "gone", 1);
+        orphan.anchor.key.path = "gone.rs".into();
+        snap.comments = std::sync::Arc::new(vec![orphan]);
+        st.files_panel = FilesPanel::Shown;
+        st.reconcile(&snap);
+        handle_key(&mut st, &snap, key("G"), 120);
+        assert_eq!(handle_key(&mut st, &snap, key("j"), 120), Outcome::Redraw);
+        assert_eq!(st.orphan, Some(0));
+
+        let rendered = render(&snap, &st, 120, 24);
+        let hit = rendered
+            .hits
+            .iter()
+            .find(|hit| hit.action == Action::SelectFile(1))
+            .unwrap();
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x0,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            handle_mouse(&mut st, &snap, &rendered, click),
+            Outcome::Engine(Command::Select(FileKey::of(&snap.files[1])))
+        );
+        assert_eq!(st.orphan, None);
+
+        let other = snapshot("b.rs", "r2", &[(30, "++")]);
+        snap.selected = other.selected;
+        snap.diff = DiffState::Loading;
+        st.observe(&snap);
+        st.reconcile(&snap);
+        snap.diff = other.diff;
+        st.observe(&snap);
+        st.reconcile(&snap);
+        assert_eq!(st.rows.as_ref().unwrap().orphan_tops.len(), 1);
+        assert_eq!(st.orphan, None);
+        assert_eq!(handle_key(&mut st, &snap, key("i"), 120), Outcome::Redraw);
+        assert_eq!(st.editor.as_ref().unwrap().anchor, anchor_on(&snap, 30));
     }
 
     #[test]

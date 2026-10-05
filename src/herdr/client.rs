@@ -60,7 +60,7 @@ fn left(deadline: Instant) -> std::io::Result<Duration> {
 }
 
 /// A connect that cannot outlive the deadline: `UnixStream::connect` blocks while the host's
-/// listen backlog is full, so the socket is made non-blocking and polled instead.
+/// listen backlog is full, so the socket is made non-blocking and retried or polled instead.
 fn connect_within(path: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
     use std::os::unix::ffi::OsStrExt;
     let bytes = path.as_os_str().as_bytes();
@@ -75,48 +75,54 @@ fn connect_within(path: &Path, deadline: Instant) -> std::io::Result<UnixStream>
     for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
         *slot = *byte as libc::c_char;
     }
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // Owned from here: dropped on every early return below.
-    let stream = unsafe { UnixStream::from_raw_fd(fd) };
-    stream.set_nonblocking(true)?;
     let length = std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1;
-    let connected = unsafe {
-        libc::connect(
-            stream.as_raw_fd(),
-            &address as *const libc::sockaddr_un as *const libc::sockaddr,
-            length as libc::socklen_t,
-        )
-    };
-    if connected != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EINPROGRESS)
-            && error.raw_os_error() != Some(libc::EAGAIN)
-        {
-            return Err(error);
-        }
-        let mut poll = libc::pollfd {
-            fd: stream.as_raw_fd(),
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        let wait = left(deadline)?.as_millis().min(i32::MAX as u128) as libc::c_int;
-        let ready = unsafe { libc::poll(&mut poll, 1, wait) };
-        if ready < 0 {
+    loop {
+        left(deadline)?;
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        if ready == 0 {
-            return Err(timed_out());
+        // Owned from here: dropped on every early return below.
+        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        stream.set_nonblocking(true)?;
+        let connected = unsafe {
+            libc::connect(
+                stream.as_raw_fd(),
+                &address as *const libc::sockaddr_un as *const libc::sockaddr,
+                length as libc::socklen_t,
+            )
+        };
+        if connected != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EAGAIN) {
+                drop(stream);
+                std::thread::sleep(Duration::from_millis(10).min(left(deadline)?));
+                continue;
+            }
+            if error.raw_os_error() != Some(libc::EINPROGRESS) {
+                return Err(error);
+            }
+            let mut poll = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let wait = left(deadline)?.as_millis().min(i32::MAX as u128) as libc::c_int;
+            let ready = unsafe { libc::poll(&mut poll, 1, wait) };
+            if ready < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if ready == 0 {
+                return Err(timed_out());
+            }
+            // The pending connect has an outcome now; read it the way std does.
+            if let Some(error) = stream.take_error()? {
+                return Err(error);
+            }
         }
-        // The pending connect has an outcome now; read it the way std does.
-        if let Some(error) = stream.take_error()? {
-            return Err(error);
-        }
+        stream.set_nonblocking(false)?;
+        return Ok(stream);
     }
-    stream.set_nonblocking(false)?;
-    Ok(stream)
 }
 
 impl HerdrClient {
@@ -263,6 +269,45 @@ mod tests {
             Err(HerdrClientError::Connect { .. })
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_full_listen_backlog_retries_until_the_server_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+        // Linux queues backlog + 1 connections before returning EAGAIN.
+        let mut queued = [
+            UnixStream::connect(&path).unwrap(),
+            UnixStream::connect(&path).unwrap(),
+        ];
+        for stream in &mut queued {
+            stream.write_all(b"{\"id\":\"queued\"}\n").unwrap();
+        }
+        let started = Instant::now();
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(DEADLINE)).unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let reply = json!({ "id": request["id"], "result": { "type": "pong" } });
+                stream.write_all(format!("{reply}\n").as_bytes()).unwrap();
+            }
+        });
+        let result = HerdrClient::new(path).request("ping", json!({}));
+        let took = started.elapsed();
+        assert!(result.is_ok(), "{result:?} after {took:?}");
+        assert_eq!(result.unwrap()["result"]["type"], "pong");
+        assert!(
+            took >= Duration::from_millis(200) && took < DEADLINE,
+            "{took:?}"
+        );
+        server.join().unwrap();
     }
 
     #[test]
