@@ -1754,6 +1754,38 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
     }
 
     #[test]
+    fn a_pick_answered_after_a_newer_pick_is_dropped() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+        let host = host::Scripted::with_panes(vec![agent_pane("w4:p2", "codex", "idle", Some("s1"), &top)]);
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.host = Some(host.clone());
+        config.socket_path = Some("/run/fake.sock".into());
+        // Both picks' writes wait at the gate; released in order, the older one runs first, finds the
+        // newer generation, and its answer must reach no one: the picker waits for its own pick's.
+        let gate = Arc::new(Semaphore::new(0));
+        config.target_write_gate = Some(gate.clone());
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "rows", |s| !s.files.is_empty());
+        handle.commands.send(Command::SetTarget(pane_target("w4:p2", "codex", Some("s1")))).unwrap();
+        wait_for(&handle, "first pick published", |s| matches!(&s.target, Some(Target::Pane { .. })));
+        handle.commands.send(Command::SetTarget(Target::Clipboard)).unwrap();
+        wait_for(&handle, "second pick published", |s| s.target == Some(Target::Clipboard));
+        gate.add_permits(1);
+        wait_cond("the older write ran", || handle.target_writes_done.load(Ordering::SeqCst) == 1);
+        std::thread::sleep(Duration::from_millis(100));
+        while let Ok(s) = handle.snapshots.try_recv() {
+            assert_eq!(s.target_seq, 0, "an older pick's answer reached the picker");
+        }
+        gate.add_permits(1);
+        let s = wait_for(&handle, "the newer pick answered", |s| s.target_seq == 1);
+        assert_eq!((s.target.clone(), s.target_error.clone()), (Some(Target::Clipboard), None));
+        assert_eq!(target::load_targets(state.path()).0.get(&top), Some(&Target::Clipboard));
+    }
+
+    #[test]
     fn load_panes_lists_agent_panes_in_groups_and_drops_stale_tokens() {
         let dir = fixture();
         let top = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
@@ -1951,7 +1983,7 @@ async fn resolve_target(job: &Job, toplevel: &str, opener: Option<&str>) -> Opti
 }
 ```
 
-`target_checks.fetch_add(1)` where the check runs (pass the counter into `Job` as `checks: Arc<AtomicUsize>`). The counter and `job.target` are filled in `request_status` from `self.snapshot.target` and `self.selection_generation`; `resolve_target` is `Some(self.config_opener.clone())` while `target_unresolved` (store `opener_pane`, `own_pane`, `host`, `socket_path` on `State` from the config at start).
+`target_checks.fetch_add(1)` where the check runs (pass the counter into `Job` as `checks: Arc<AtomicUsize>`). `target_writes_done` counts every finished target write, a pick's included, and `target_write_gate` holds every target write; both are declared here (`SessionConfig.target_write_gate: Option<Arc<Semaphore>>`, `None` in production; `EngineHandle.target_writes_waiting`, `target_writes_done: Arc<AtomicUsize>`), and Task 3's `write_target` uses the same three. The counter and `job.target` are filled in `request_status` from `self.snapshot.target` and `self.selection_generation`; `resolve_target` is `Some(self.config_opener.clone())` while `target_unresolved` (store `opener_pane`, `own_pane`, `host`, `socket_path` on `State` from the config at start).
 
 5. On `Done::Status`, after the `acted` block:
 
@@ -2011,7 +2043,12 @@ A resolved pane target is published `Unverified` and the refresh after it answer
                         let dir = state.state_dir.clone();
                         let results = results_tx.clone();
                         let (generation, latest) = (state.selection_generation, state.latest_selection.clone());
+                        let (gate, done) = (state.target_write_gate.clone(), state.target_writes_done.clone());
                         tokio::spawn(async move {
+                            // The test seam shared with `write_target`: a write waits here while a test lets another land.
+                            if let Some(gate) = gate {
+                                gate.acquire().await.expect("gate").forget();
+                            }
                             let written = match (dir, toplevel) {
                                 (Some(dir), Some(toplevel)) => tokio::task::spawn_blocking(move || {
                                     // Skipped, not failed, when a newer pick landed meanwhile: that pick writes its own.
@@ -2022,7 +2059,8 @@ A resolved pane target is published `Unverified` and the refresh after it answer
                                 (None, _) => Err("no state directory".to_string()),
                                 (_, None) => Err("not a git repository".to_string()),
                             };
-                            let _ = results.send(Done::Target { written });
+                            done.fetch_add(1, Ordering::SeqCst);
+                            let _ = results.send(Done::Target { generation, written });
                         });
                         // The new target is checked by the refresh this asks for.
                         state.request_status(&cwd, false, &results_tx, &refreshes);
@@ -2049,10 +2087,17 @@ A resolved pane target is published `Unverified` and the refresh after it answer
 and the two `Done` arms:
 
 ```rust
-                    Done::Target { written } => {
+                    Done::Target { generation, written } => {
+                        // An answer for an older pick is nobody's: the newer pick writes its own record and
+                        // answers for itself, so neither its error nor its sequence may reach the picker.
+                        if generation != state.selection_generation {
+                            continue;
+                        }
                         state.target_seq += 1;
                         next.target_seq = state.target_seq;
                         next.target_error = written.err().map(|e| format!("target not remembered: {e}"));
+                        // The file still differs from memory: the next record write (a comment, Task 3) tries again.
+                        state.target_write_pending |= next.target_error.is_some();
                         publish(&mut state, next, &snapshots);
                     }
                     Done::Panes { token, rows } => {
@@ -2069,7 +2114,7 @@ and the two `Done` arms:
                     }
 ```
 
-`Done` gains `Target { written: Result<(), String> }` and `Panes { token: u64, rows: Result<Vec<PaneRow>, host::HostFailure> }`. A `NoHost` failure from `pane_list` with a host configured is a listing failure like any other and is reported.
+`Done` gains `Target { generation: u64, written: Result<(), String> }` (the selection generation the write was made under, so a stale answer is told from the current pick's) and `Panes { token: u64, rows: Result<Vec<PaneRow>, host::HostFailure> }`. A `NoHost` failure from `pane_list` with a host configured is a listing failure like any other and is reported.
 
 7. `fingerprint` gains `s.target, s.target_state, s.target_seq, s.target_error, s.panes.as_ref().map(Arc::as_ptr), s.panes_seq, s.panes_error` (seven more `{:?}`/`{}` slots).
 
@@ -3736,13 +3781,14 @@ Write it as one arm per command that builds an `Operation` and calls a shared me
     /// Writes the target record when something in memory is newer than the file (an opener
     /// preselection on its first comment; an adopted session; Task 5's accepted restart), on the
     /// blocking pool, guarded by the selection generation so an older write never lands on a newer pick.
-    fn write_target(&mut self, next: &Snapshot) {
+    fn write_target(&mut self, next: &Snapshot, results: &UnboundedSender<Done>) {
         if !std::mem::take(&mut self.target_write_pending) {
             return;
         }
         let (Some(target), Some(dir), RepoState::Repo { toplevel, .. }) = (next.target.clone(), self.state_dir.clone(), &next.repo) else {
             return;
         };
+        let results = results.clone();
         let (toplevel, generation, latest) = (toplevel.clone(), self.selection_generation, self.latest_selection.clone());
         let (gate, waiting, done) = (self.target_write_gate.clone(), self.target_writes_waiting.clone(), self.target_writes_done.clone());
         tokio::spawn(async move {
@@ -3751,19 +3797,19 @@ Write it as one arm per command that builds an `Operation` and calls a shared me
                 waiting.fetch_add(1, Ordering::SeqCst);
                 gate.acquire().await.expect("gate").forget();
             }
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = target::save_target_if(&dir, &toplevel, &target, generation, &latest) {
-                    base::note_problem(&dir, &format!("targets.json: {e}"));
-                }
-                done.fetch_add(1, Ordering::SeqCst);
+            let written = tokio::task::spawn_blocking(move || {
+                target::save_target_if(&dir, &toplevel, &target, generation, &latest).map(|_| ()).map_err(|e| e.to_string())
             })
             .await
-            .ok();
+            .unwrap_or_else(|e| Err(e.to_string()));
+            done.fetch_add(1, Ordering::SeqCst);
+            // The same answer a pick's write gives: the notice of 10.7 when it fails, and the flag back on.
+            let _ = results.send(Done::Target { generation, written });
         });
     }
 ```
 
-`SessionConfig.target_write_gate: Option<Arc<Semaphore>>` (`None` in production) and two `EngineHandle` counters, `target_writes_waiting` and `target_writes_done`, are the seams; with the guard replaced by a plain `save_target`, the test fails on its last assertion every time, because the old write is held until after the new pick's own write.
+`SessionConfig.target_write_gate: Option<Arc<Semaphore>>` (`None` in production; Task 2's `SetTarget` arm waits at the same gate, so a test can hold any target write) and two `EngineHandle` counters, `target_writes_waiting` and `target_writes_done`, are the seams; with the guard replaced by a plain `save_target`, the test fails on its last assertion every time, because the old write is held until after the new pick's own write. Every target write, a pick's or this method's, answers `Done::Target { generation, written }`: the handler (Task 2) drops an answer whose generation is not the current selection's, publishes the others under `target_seq` with `target not remembered: <reason>` on failure (10.7's notice, for a pick and for the opener's first-comment write alike), and on failure sets `target_write_pending` again, so the next comment's write tries once more; `an_opener_write_that_fails_says_so_and_the_next_comment_retries` below pins the failure and the recovery, and `a_pick_answered_after_a_newer_pick_is_dropped` in Task 2 the stale answer.
 
 The regression for it is this task's, because it needs the comment command and the write; it sits in `session.rs`'s tests with the three below. Its race is made, not hoped for: the adoption's write is held at a seam while the re-pick lands and writes, then released, so it is always the later writer and only the generation guard stops it (the orchestrator should see this test fail with `save_target` in place of `save_target_if`):
 
@@ -3824,7 +3870,7 @@ with `Done::Comment { token: Option<u64>, store: Option<comments::Store>, outcom
                                 state.target_source = Some(target::Source::Remembered);
                             }
                             if state.target_write_pending {
-                                state.write_target(&next);
+                                state.write_target(&next, &results_tx);
                             }
                         }
                         publish(&mut state, next, &snapshots);
@@ -3895,6 +3941,34 @@ The refresh: `run_job` cannot carry the store (it lives on `State`), so on every
         a.commands.send(pending(2, &"x".repeat(comments::MAX_CHARS + 1))).unwrap();
         let s = wait_for(&a, "limit", |s| s.comment_seq == 4);
         assert_eq!(s.comment_error.as_deref(), Some(comments::NOTICE_LIMIT));
+    }
+
+    #[test]
+    fn an_opener_write_that_fails_says_so_and_the_next_comment_retries() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+        let host = host::Scripted::with_panes(vec![agent_pane("w4:p1", "claude", "idle", Some("c1"), &top)]);
+        // A directory where targets.json should be: the record cannot be written until it is gone.
+        std::fs::create_dir(state.path().join("targets.json")).unwrap();
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.host = Some(host.clone());
+        config.socket_path = Some("/run/fake.sock".into());
+        config.opener_pane = Some("w4:p1".into());
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "opener preselected", |s| s.target.is_some());
+        // The first comment writes the opener's record; the write fails and says so (10.7).
+        handle.commands.send(pending(2, "x")).unwrap();
+        let s = wait_for(&handle, "the write answered", |s| s.target_seq == 1);
+        assert!(s.target_error.as_deref().is_some_and(|e| e.starts_with("target not remembered: ")), "{:?}", s.target_error);
+        assert!(matches!(&s.target, Some(Target::Pane { pane, .. }) if pane == "w4:p1"), "the target stays in memory");
+        // Room again: the next comment carries the write, which now lands without a notice.
+        std::fs::remove_dir(state.path().join("targets.json")).unwrap();
+        handle.commands.send(pending(1, "y")).unwrap();
+        let s = wait_for(&handle, "written", |s| s.target_seq == 2);
+        assert_eq!(s.target_error, None);
+        assert!(matches!(target::load_targets(state.path()).0.get(&top), Some(Target::Pane { pane, .. }) if pane == "w4:p1"));
     }
 
     #[test]
@@ -4553,7 +4627,9 @@ Add to `comments.rs`'s tests:
         let mut bare = Store::open(None, "/repo", 1_000).0;
         let mut j = comment("j", "v", 5);
         j.state = CommentState::Unconfirmed { stamp: stamp("kkkkkk"), before: vec![stamp("jjjjjj")] };
-        bare.transact(Operation::Add(j), 1_017).unwrap();
+        // The first add of a session without a state directory says so once, and keeps the record.
+        assert_eq!(bare.transact(Operation::Add(j), 1_017).unwrap_err(), format!("{NOTICE_NOT_REMEMBERED}no state directory"));
+        assert_eq!(bare.comments().len(), 1);
         bare.transact(Operation::Add(comment("l", "u", 6)), 1_017).unwrap();
         let colliding = |c: u64| ["jjjjjj", "kkkkkk", "llllll"][c as usize - 1].to_string();
         let mut counter = 0;
@@ -5204,6 +5280,18 @@ fn shown(path: &Path) -> String {
     }
 }
 
+/// The next nonce `make` yields that `used` does not hold: the loop `Store::claim` and
+/// `record_request_fresh` run under their locks, for the paths that have no file to lock.
+fn fresh_nonce(make: &dyn Fn(u64) -> String, counter: &mut u64, used: &std::collections::BTreeSet<String>) -> String {
+    loop {
+        *counter += 1;
+        let candidate = make(*counter);
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+}
+
 /// The copy of 10.4: the sequence when the text fits, the file when it can be written; the notice names both.
 fn copy_out(state_dir: Option<&Path>, text: &str, what: &str) -> (CopyOut, Result<PathBuf, String>) {
     let file = write_clipboard(state_dir, text);
@@ -5402,13 +5490,13 @@ async fn send_inner(
                         Err(e) => bail!(store, format!("request not recorded: {e}")),
                     }
                 }
-                // No state directory: nothing can be recorded; the request still goes out.
+                // No state directory: nothing can be recorded; the request still goes out, under a nonce
+                // no stamp in memory carries (the array is the store, and its chains count).
                 (Destination::Pane { .. }, None) => {
                     if let Err(e) = guard() {
                         bail!(store, e);
                     }
-                    *counter += 1;
-                    let nonce = (ctx.nonce)(*counter);
+                    let nonce = fresh_nonce(ctx.nonce.as_ref(), counter, &comments::nonces_of(store.comments()));
                     let text = text_of(&nonce);
                     if let Some(e) = over_bound(&text) {
                         bail!(store, e);
@@ -5444,8 +5532,7 @@ async fn send_inner(
                             if let Err(e) = guard() {
                                 bail!(store, e);
                             }
-                            *counter += 1;
-                            let nonce = (ctx.nonce)(*counter);
+                            let nonce = fresh_nonce(ctx.nonce.as_ref(), counter, &comments::nonces_of(store.comments()));
                             let text = text_of(&nonce);
                             if let Some(e) = over_bound(&text) {
                                 bail!(store, e);
@@ -5785,8 +5872,7 @@ pub async fn copy(ctx: Context, request: CopyRequest, comments: Vec<comments::Co
                     (nonce, text)
                 }
                 None => {
-                    counter += 1;
-                    let nonce = (ctx.nonce)(counter);
+                    let nonce = fresh_nonce(ctx.nonce.as_ref(), &mut counter, &comments::nonces_of(&comments));
                     (nonce.clone(), text_of(&nonce))
                 }
             };
@@ -5936,7 +6022,7 @@ The three `Done` arms:
                                 *known = session;
                             }
                             state.target_write_pending = true;
-                            state.write_target(&next);
+                            state.write_target(&next, &results_tx);
                         }
                         publish(&mut state, next, &snapshots);
                         state.run_store_queue(&cwd, &results_tx);
@@ -6424,17 +6510,28 @@ The three `Done` arms:
         assert!(matches!(&s.comments[0].state, comments::CommentState::Sent(st) if st.to == target::Destination::clipboard()));
         // Without a state directory: the sequence alone, Unconfirmed.
         let mut config = config_no_state(dir.path());
-        config.nonce = Arc::new(|counter| format!("n{counter:05}"));
+        // The maker's second nonce is the first one again: the request must pass it over.
+        config.nonce = Arc::new(|counter| if counter == 2 { "n00001".to_string() } else { format!("n{counter:05}") });
         let (_rt2, bare) = start_from(config);
-        wait_for(&bare, "rows", |s| !s.files.is_empty());
+        wait_for(&bare, "rows, diff ready", |s| !s.files.is_empty() && matches!(s.diff, DiffState::Ready(_)));
         bare.commands.send(Command::SetTarget(Target::Clipboard)).unwrap();
         bare.commands.send(pending(2, "x")).unwrap();
         wait_for(&bare, "pending", |s| s.comments.len() == 1);
         bare.commands.send(feedback(dispatch::Accepted::default())).unwrap();
         let s = wait_for(&bare, "unconfirmed copy", |s| s.send_seq == 1);
         assert!(s.send_outcome.as_ref().unwrap().unconfirmed);
-        assert!(matches!(s.comments[0].state, comments::CommentState::Unconfirmed { .. }));
+        assert!(matches!(&s.comments[0].state, comments::CommentState::Unconfirmed { stamp, .. } if stamp.nonce == "n00001"));
         assert!(s.send_outcome.as_ref().unwrap().copy.as_ref().unwrap().osc.is_some());
+        // A request with no file to record in still takes a nonce the array does not hold: the maker's
+        // "n00001" (counter 2) is passed over for counter 3, so the next feedback is stamped under counter 4.
+        bare.commands.send(Command::Send(dispatch::SendRequest { kind: dispatch::SendKind::Review { scope: dispatch::ReviewScope::All }, accepted: Default::default() })).unwrap();
+        let s = wait_for(&bare, "request copied", |s| s.send_seq == 2);
+        assert!(s.send_error.is_none(), "{:?}", s.send_error);
+        bare.commands.send(pending(1, "y")).unwrap();
+        wait_for(&bare, "pending again", |s| s.comments.iter().any(|c| c.is_pending()));
+        bare.commands.send(feedback(dispatch::Accepted::default())).unwrap();
+        let s = wait_for(&bare, "sent again", |s| s.send_seq == 3);
+        assert!(s.comments.iter().any(|c| matches!(&c.state, comments::CommentState::Unconfirmed { stamp, .. } if stamp.nonce == "n00004")), "the request took n00003, not the stamped n00001: {:?}", s.comments.iter().map(|c| &c.state).collect::<Vec<_>>());
         // Over the OSC limit with a writable directory: the file alone, no sequence, still Sent.
         let wide = "字".repeat(comments::MAX_CHARS);
         for _ in 0..30 {
@@ -7994,7 +8091,8 @@ pub fn selection_text(diff: &LoadedDiff, side: Side, start: u32, end: u32) -> St
     let mut lines = Vec::new();
     for hunk in &diff.file_diff.hunks {
         for line in &hunk.lines {
-            let (number, mine) = match (side, line.line_type) {
+            // By reference: the frozen `DiffLineType` is `Clone`, not `Copy`, and `line` is borrowed.
+            let (number, mine) = match (side, &line.line_type) {
                 (Side::Additions, DiffLineType::Removed) | (Side::Deletions, DiffLineType::Added) => continue,
                 (Side::Additions, _) => (line.new_line_number, true),
                 (Side::Deletions, _) => (line.old_line_number, true),
@@ -8232,7 +8330,7 @@ pub fn step_on_side(diff: &LoadedDiff, cursor: usize, side: Side, delta: isize) 
 
 The orphan cursor: in `move_cursor`'s `LineDown`, when the cursor is the last target of the unified order (or `targets.len() - 1` in split) and `rows.orphan_tops` is non-empty, set `state.orphan = Some(0)` and keep the cursor; with **no targets at all** (an empty list, or a diff that is not `Ready`, with orphans drawn by `orphans_only`), `LineDown` from nothing sets `orphan = Some(0)` too, which is the entry path into an orphan-only view; `LineDown` on orphan `n` moves to `n + 1` while one exists; `LineUp` on orphan 0 clears `orphan` (and leaves the cursor where it was, or nowhere); `LineUp` on `n` moves to `n - 1`; every other movement key clears `orphan`. `keep_cursor_visible` scrolls to `orphan_tops[n].0` when `orphan` is set. `move_cursor`'s early return on `(DiffState::Ready, Some(cursor))` must therefore give way to the orphan rules before it returns `Inert`.
 
-4. `view.rs`: `body_line`'s two card arms are Step 4's; here they gain the cursor: an orphan card under the orphan cursor is drawn in reverse video as a cursor row is. A visual selection is drawn: every row whose target lies on the selection's side between its first and last line takes the cursor's reverse video on its text span (`render` computes the selected target set from `review::selection` once per frame and passes `selected: bool` to `body_line` beside `cursor`), so what `i` or `y` will act on is visible; a view test, `a_visual_selection_is_drawn_in_reverse_over_its_lines`, selects two lines with `v`, `j` and asserts the reverse flag on exactly those rows' text spans and on no other. `Action` gains `EditorCategory(Category)` (`key_action()` → `None`), handled in `handle_mouse`'s click arm by setting the open editor's category. The editor is modal for the mouse as the y/n box is: while `state.editor.is_some()`, `handle_mouse` handles `EditorCategory` clicks and the wheel (scrolling the body) and nothing else, so a click on the toolbar, the files panel or a diff row cannot open a picker, a box or another action under an open editor; a test, `clicks_under_an_open_editor_are_inert_except_the_category_words`, presses a toolbar hit and a file hit while editing and asserts `Outcome::Inert`, then clicks a category word and asserts the category changed. When the diff is not `Ready` but `rows::orphans` is non-empty or the editor is open, `render` draws `state.rows` (built by `orphans_only`) instead of `state_message`'s centred text, so an empty list with comments left behind shows the orphan section, not `working tree clean`, and a draft is never hidden behind that message. The editor's rows are real rows, so one coordinate system serves scrolling, hits and drawing: `Row::Editor { line: usize }`, one per line of `editor.lines(card_width)`, spliced by `rows::build` (and `orphans_only`) after the row the editor sits under, which `build` receives as `editor: Option<EditorPlace>` with `EditorPlace { after: EditorAnchor, lines: usize }` and `enum EditorAnchor { Anchor(Anchor), Orphan(String) /* the card's id */, End }`: the anchor's row through `attach_row` for an anchor in the loaded diff, the last `Row::Card` row carrying the id for an orphan being edited (the editor replaces the card visually), the last body row when the anchor's line is not in the diff. The rows carry no text; `view::body_line` draws `Row::Editor { line }` from `state.editor.lines(card_width)[line]`, `frame_top(editor.title(), …)` for the first, `frame_bottom(if editor.pending.is_some() { "saving…" } else { EDITOR_FOOTER }, …)` for the last, so typing never rebuilds the rows: `reconcile`'s key gains `(editor anchor, line count)` and rebuilds only when the editor opens, closes, moves or grows a line, which is rare and cheap. The title line pushes one hit per category word, `Action::EditorCategory(Category)`, and a click sets `editor.category` (spec 10.3's clickable words); the text rows push no hit. `view::body_is_drawn` stays true while the editor is open (it is a card, not a modal).
+4. `view.rs`: `body_line`'s two card arms are Step 4's; here they gain the cursor: an orphan card under the orphan cursor is drawn in reverse video as a cursor row is. A visual selection is drawn: every row whose target lies on the selection's side between its first and last line takes the cursor's reverse video on its text span (`render` computes the selected target set from `review::selection` once per frame and passes `selected: bool` to `body_line` beside `cursor`), so what `i` or `y` will act on is visible; a view test, `a_visual_selection_is_drawn_in_reverse_over_its_lines`, selects two lines with `v`, `j` and asserts the reverse flag on exactly those rows' text spans and on no other. `Action` gains `EditorCategory(Category)` (`key_action()` → `None`), handled in `handle_mouse`'s click arm by setting the open editor's category. The editor is modal for the mouse as the y/n box is: while `state.editor.is_some()`, `handle_mouse` handles `EditorCategory` clicks and the wheel (scrolling the body) and nothing else, so a click on the toolbar, the files panel or a diff row cannot open a picker, a box or another action under an open editor; a test, `clicks_under_an_open_editor_are_inert_except_the_category_words`, presses a toolbar hit and a file hit while editing and asserts `Outcome::Inert`, then clicks a category word and asserts the category changed. When the diff is not `Ready` but `rows::orphans` is non-empty or the editor is open, `render` draws `state.rows` (built by `orphans_only`) instead of `state_message`'s centred text, so an empty list with comments left behind shows the orphan section, not `working tree clean`, and a draft is never hidden behind that message. The editor's rows are real rows, so one coordinate system serves scrolling, hits and drawing: `Row::Editor { line: usize }`, one per line of `editor.lines(card_width)`, spliced by `rows::build` (and `orphans_only`) after the row the editor sits under, which `build` receives as `editor: Option<EditorPlace>` with `EditorPlace { after: EditorAnchor, lines: usize }` and `enum EditorAnchor { Anchor(Anchor), Orphan(String) /* the card's id */, End }`: the anchor's row through `attach_row` for an anchor in the loaded diff — only when `anchor.key == diff.key` and the anchor's comparison kind is the diff's, the rule `in_place` applies to cards, so a draft never sits under another file's line of the same number when a refresh replaces the diff (`a_draft_keeps_its_file_when_another_diff_takes_the_screen`) — the last `Row::Card` row carrying the id for an orphan being edited (the editor replaces the card visually), the last body row when the anchor's line is not in the diff or the diff is another file's. The rows carry no text; `view::body_line` draws `Row::Editor { line }` from `state.editor.lines(card_width)[line]`, `frame_top(editor.title(), …)` for the first, `frame_bottom(if editor.pending.is_some() { "saving…" } else { EDITOR_FOOTER }, …)` for the last, so typing never rebuilds the rows: `reconcile`'s key gains `(editor anchor, line count)` and rebuilds only when the editor opens, closes, moves or grows a line, which is rare and cheap. The title line pushes one hit per category word, `Action::EditorCategory(Category)`, and a click sets `editor.category` (spec 10.3's clickable words); the text rows push no hit. `view::body_is_drawn` stays true while the editor is open (it is a card, not a modal).
 
 With the editor's rows in `rows`, keeping it on screen is the existing machinery: `keep_cursor_visible` scrolls to the span from the editor's first row to its last (`ensure_visible` over `first..=last`), after `reconcile` and after every editor key; when the editor is taller than the body, the offset puts its last row (the caret's) on the bottom row, and the anchor above scrolls out as any row does. Tests in `state.rs`: `an_editor_opened_on_the_bottom_row_scrolls_into_view` (a 40-target diff in a 10-row body, the editor opened on the last target, its bottom row within the viewport), `an_editor_taller_than_the_body_keeps_its_caret_visible` (120 lines typed through `ctrl+j`, the last rendered row carries `_`), and `a_partially_visible_editor_whose_anchor_scrolled_away_still_draws` (the offset moved past the anchor row by `ctrl+d`: the editor's remaining rows are drawn at the top of the body, nothing is skipped). `files_lines`: the `✎` cell before the marker when any comment of the file exists under the current comparison kind (`snapshot.comments.iter().any(|c| c.anchor.key.path == file.path && kind matches)`), the name fitted to `FILES_WIDTH - 3`; the header `CHANGED {n} · ✎ {pending}` when `pending > 0`, counting `comments.iter().filter(|c| c.is_pending()).count()` across both scopes. Card rows push `Action::CursorToRow(row)` hits as other rows do; `CursorToRow` on a card row with `target: Some(t)` sets the cursor to `t`, the anchor's own target (in `handle_mouse`'s click arm: look the row up in `state.rows`), so the cursor lands on the comment's side.
 
@@ -8462,6 +8560,27 @@ The tests that follow start from `review_setup` where they need a listed file, l
         assert!(rendered.plain().iter().any(|line| line.contains("half_")), "the draft is drawn, caret included");
         assert_eq!(handle_key(&mut st, &snap, key("!"), 120), Outcome::Redraw);
         assert!(matches!(handle_key(&mut st, &snap, key("Enter"), 120), Outcome::Engine(Command::AddComment { text, .. }) if text == "half!"));
+    }
+
+    #[test]
+    fn a_draft_keeps_its_file_when_another_diff_takes_the_screen() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        handle_key(&mut st, &snap, key("i"), 120);
+        handle_key(&mut st, &snap, key("k"), 120);
+        // A refresh replaces a.rs with b.rs, which has the same changed line: the draft is drawn at the
+        // end, not under b.rs's line, and saves against a.rs.
+        let other = crate::tui::state::tests::snapshot("b.rs", "r2", &[(10, " + ")]);
+        snap.diff = other.diff.clone();
+        snap.files = other.files.clone();
+        snap.selected = other.selected.clone();
+        st.observe(&snap);
+        st.reconcile(&snap);
+        let rows = st.rows.as_ref().unwrap();
+        let editor_rows: Vec<usize> = rows.rows.iter().enumerate().filter(|(_, r)| matches!(r, Row::Editor { .. })).map(|(i, _)| i).collect();
+        assert!(!editor_rows.is_empty());
+        assert_eq!(*editor_rows.last().unwrap(), rows.rows.len() - 1, "the draft sits at the end, under no line of b.rs");
+        let outcome = handle_key(&mut st, &snap, key("Enter"), 120);
+        assert!(matches!(outcome, Outcome::Engine(Command::AddComment { anchor, .. }) if anchor.key.path == "a.rs"), "{outcome:?}");
     }
 
     #[test]
@@ -10024,3 +10143,17 @@ unrelated snapshot in between); `orphans_only` wraps at `cards::card_width`, the
 are drawn at (a 300-character orphan tested whole in both modes); and a write that drops
 unusable records logs it first, in `comments.json`'s rewrite and in `requests.json`'s, with a
 test that plants an unknown-state record after the store opened.
+
+**Round 12 (codex, plan-complete, 2026-10-05).** Six findings, all applied. Two were HIGH:
+`selection_text` moved the frozen `DiffLineType` out of a borrowed line (it matches by
+reference), and the retry-chain test's first add on a store without a state directory expected
+`Ok` where Task 3 answers `comments not remembered: no state directory` (asserted, with the
+record kept). Then: every target write, a pick's or a comment's, answers `Done::Target {
+generation, written }`, the handler drops an answer for an older selection and, on failure,
+publishes the notice of 10.7 and sets `target_write_pending` again so the next comment retries
+(two tests: an opener write failing and recovering, and two picks' writes released in order
+through the shared gate); the editor's anchor attaches only to its own file's diff under the
+same comparison kind, else to the end (a refresh that replaces a.rs with b.rs under an open
+draft is tested, and the save still names a.rs); and a request or its copy without a state
+directory takes its nonce through the same collision loop as everything else (`fresh_nonce`
+over `nonces_of`, tested with a maker that repeats a stamped nonce).
