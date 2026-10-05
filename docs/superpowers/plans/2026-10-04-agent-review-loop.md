@@ -774,7 +774,7 @@ with `host: None, socket_path: None` in `production()` and `use super::host;`. I
 The session tests build `SessionConfig` as a struct literal in `start` (`src/engine/session.rs`, the `tests` module). Every task of this plan adds fields, so change that helper once, now, to start from `production` and override:
 
 ```rust
-    fn config(dir: &std::path::Path, allow: Arc<AtomicBool>) -> SessionConfig {
+    fn test_config(dir: &std::path::Path, allow: Arc<AtomicBool>) -> SessionConfig {
         let mut config = SessionConfig::production(dir.to_path_buf());
         config.poll_interval = Duration::from_millis(50);
         config.watcher = Arc::new(FlakyWatcher { allow });
@@ -783,7 +783,7 @@ The session tests build `SessionConfig` as a struct literal in `start` (`src/eng
     }
 
     fn start(dir: &std::path::Path, allow: Arc<AtomicBool>) -> (tokio::runtime::Runtime, EngineHandle) {
-        start_with(config(dir, allow))
+        start_with(test_config(dir, allow))
     }
 
     fn start_with(config: SessionConfig) -> (tokio::runtime::Runtime, EngineHandle) {
@@ -797,7 +797,7 @@ The session tests build `SessionConfig` as a struct literal in `start` (`src/eng
     }
 ```
 
-Every existing test keeps calling `start`; the new tests of Tasks 2-5 call `start_with(config(..))` after setting `host`, `state_dir` and the other seams. Do the same in `tests/readonly_guarantee.rs` and `tests/hunk_actions.rs` if they build a literal (they use `production` already, so nothing changes there).
+Every existing test keeps calling `start`; the new tests of Tasks 2-5 call `start_with(test_config(..))` after setting `host`, `state_dir` and the other seams (the helper is `test_config`, not `config`, because those tests bind a local named `config` and a local shadows a function of the same name). The session tests also hold nineteen other complete `SessionConfig { .. }` literals (`grep -n 'SessionConfig {' src/engine/session.rs`): give each one `..SessionConfig::production(dir.to_path_buf())` as its last line (struct update syntax, with `dir` being whatever path that literal uses), so every field this plan adds defaults there without further edits. `tests/readonly_guarantee.rs` and `tests/hunk_actions.rs` use `production` already, so nothing changes there.
 
 - [ ] **Step 7: The fake host learns the three methods**
 
@@ -1077,8 +1077,8 @@ mod tests {
         assert!(!is_under("/home/u/repo2", "/home/u/repo"));
         assert!(!is_under("/home/u", "/home/u/repo"));
         let mut here = PaneRecord { pane_id: "w1:p1".into(), agent: Some("codex".into()), cwd: Some("/home/u/repo2".into()), ..PaneRecord::default() };
-        let rows = rows(vec![here.clone()], "/home/u/repo", None);
-        assert!(!rows[0].this_worktree);
+        let listed = rows(vec![here.clone()], "/home/u/repo", None);
+        assert!(!listed[0].this_worktree);
         here.foreground_cwd = Some("/home/u/repo/sub".into());
         assert!(rows(vec![here], "/home/u/repo", None)[0].this_worktree);
     }
@@ -1521,7 +1521,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         let state = tempfile::tempdir().unwrap();
         let top = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
         let host = host::Scripted::with_panes(vec![agent_pane("w4:p2", "codex", "idle", Some("s1"), &top)]);
-        let mut config = config(dir.path(), Arc::new(AtomicBool::new(true)));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.state_dir = Some(state.path().to_path_buf());
         config.host = Some(host.clone());
         config.socket_path = Some("/run/fake.sock".into());
@@ -1559,7 +1559,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
     #[test]
     fn a_clipboard_target_needs_no_host_and_a_pane_target_without_one_is_no_host() {
         let dir = fixture();
-        let mut config = config(dir.path(), Arc::new(AtomicBool::new(true)));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.state_dir = None;
         let (_rt, handle) = start_with(config);
         wait_for(&handle, "rows", |s| !s.files.is_empty());
@@ -1584,7 +1584,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
             agent_pane("w4:p2", "codex", "idle", Some("s1"), &top),
         ]);
         // Nothing remembered: the opener pane is preselected, unwritten.
-        let mut config = config(dir.path(), Arc::new(AtomicBool::new(true)));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.state_dir = Some(state.path().to_path_buf());
         config.host = Some(host.clone());
         config.socket_path = Some("/run/fake.sock".into());
@@ -1598,7 +1598,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         drop(rt);
         // Remembered: it wins over the opener.
         target::save_target(state.path(), &top, &pane_target("w4:p2", "codex", Some("s1"))).unwrap();
-        let mut config = config(dir.path(), Arc::new(AtomicBool::new(true)));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.state_dir = Some(state.path().to_path_buf());
         config.host = Some(host.clone());
         config.socket_path = Some("/run/fake.sock".into());
@@ -1609,7 +1609,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         // An opener that runs a shell is nothing.
         let shell_host = host::Scripted::with_panes(vec![host::PaneRecord { pane_id: "w4:p1".into(), ..host::PaneRecord::default() }]);
         let empty_state = tempfile::tempdir().unwrap();
-        let mut config = config(dir.path(), Arc::new(AtomicBool::new(true)));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.state_dir = Some(empty_state.path().to_path_buf());
         config.host = Some(shell_host);
         config.socket_path = Some("/run/fake.sock".into());
@@ -1625,7 +1625,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         let dir = fixture();
         let top = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
         let host = host::Scripted::with_panes(vec![agent_pane("w4:p2", "codex", "idle", Some("s1"), &top)]);
-        let mut config = config(dir.path(), Arc::new(AtomicBool::new(true)));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.host = Some(host.clone());
         config.socket_path = Some("/run/fake.sock".into());
         config.poll_interval = Duration::from_secs(3600);
@@ -1647,30 +1647,6 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
     }
 
     #[test]
-    fn a_delayed_adoption_write_never_overwrites_a_newer_pick() {
-        let dir = fixture();
-        let state = tempfile::tempdir().unwrap();
-        let top = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
-        // The remembered record has no session; the host reports one, which the check adopts.
-        target::save_target(state.path(), &top, &pane_target("w4:p2", "codex", None)).unwrap();
-        let host = host::Scripted::with_panes(vec![agent_pane("w4:p2", "codex", "idle", Some("s1"), &top)]);
-        let mut config = config(dir.path(), Arc::new(AtomicBool::new(true)));
-        config.state_dir = Some(state.path().to_path_buf());
-        config.host = Some(host.clone());
-        config.socket_path = Some("/run/fake.sock".into());
-        let (_rt, handle) = start_with(config);
-        wait_for(&handle, "adopted in memory", |s| matches!(&s.target, Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s1"));
-        // The adoption is written with the next comment; a re-pick lands first (Task 3 adds the comment command).
-        handle.commands.send(Command::SetTarget(Target::Clipboard)).unwrap();
-        wait_for(&handle, "re-picked", |s| s.target_seq == 1 && s.target == Some(Target::Clipboard));
-        handle.commands.send(pending(2, "x")).unwrap();
-        wait_for(&handle, "comment", |s| s.comment_seq == 1);
-        wait_until("the file settles", || target::load_targets(state.path()).0.get(&top) == Some(&Target::Clipboard));
-        std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(target::load_targets(state.path()).0.get(&top), Some(&Target::Clipboard), "an older write replaced the newer pick");
-    }
-
-    #[test]
     fn load_panes_lists_agent_panes_in_groups_and_drops_stale_tokens() {
         let dir = fixture();
         let top = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
@@ -1680,7 +1656,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
             agent_pane("w1:p3", "claude", "working", None, &format!("{top}/src")),
             agent_pane("w1:p9", "kimi", "idle", None, &top),
         ]);
-        let mut config = config(dir.path(), Arc::new(AtomicBool::new(true)));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.host = Some(host.clone());
         config.socket_path = Some("/run/fake.sock".into());
         config.own_pane = Some("w1:p9".into());
@@ -1706,7 +1682,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         std::thread::sleep(Duration::from_millis(200));
         assert!(handle.snapshots.try_iter().all(|s| s.panes_seq == 9));
         // No host: an empty list, no error; the picker then offers the clipboard alone.
-        let mut config = config(dir.path(), Arc::new(AtomicBool::new(true)));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.host = None;
         let (_rt2, handle2) = start_with(config);
         handle2.commands.send(Command::LoadPanes(1)).unwrap();
@@ -2037,7 +2013,9 @@ pub struct Stamp { pub at: u64, pub nonce: String, pub item: u32, pub to: Destin
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] #[serde(tag = "state", rename_all = "lowercase")]
 pub enum CommentState { Pending, Sending { #[serde(flatten)] stamp: Stamp, before: Option<Stamp> },
-                        Unconfirmed(Stamp), Sent(Stamp) }   // newtype variants of a tagged enum merge the stamp's fields
+                        Unconfirmed { #[serde(flatten)] stamp: Stamp, before: Option<Stamp> }, Sent(Stamp) }
+// `before` on Sending and Unconfirmed is the earlier Unconfirmed stamp a retry replaced: it survives the timeout, so a
+// late definite failure restores it rather than Pending. The newtype variant Sent merges the stamp's fields beside the tag.
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comment { pub id: String, pub anchor: Anchor, pub category: Category, pub text: String,
@@ -2075,7 +2053,7 @@ pub struct RequestRecord { pub nonce: String, pub at: u64, pub target: Destinati
 pub fn load_requests(state_dir: &Path, toplevel: &str) -> (Vec<RequestRecord>, Option<String>);
 pub fn record_request(state_dir: &Path, toplevel: &str, record: &RequestRecord) -> std::io::Result<()>;
 /// Nonces any retained record of either file carries, for 10.4's uniqueness check.
-pub fn nonces_in_use(state_dir: &Path, toplevel: &str, comments: &[Comment]) -> BTreeSet<String>;
+pub fn nonces_in_use(state_dir: &Path, own: &[Comment]) -> BTreeSet<String>;   // every worktree's records in both files, plus `own`
 
 // src/engine/types.rs: Snapshot gains
 pub comments: Arc<Vec<Comment>>,
@@ -2154,10 +2132,10 @@ mod tests {
         assert_eq!(a.comments()[1].text, "third");
         // An unconfirmed record is still the reviewer's to edit or delete.
         let mut unconfirmed = comment("u1", "maybe", 9);
-        unconfirmed.state = CommentState::Unconfirmed(stamp("abc123"));
+        unconfirmed.state = CommentState::Unconfirmed { before: None, stamp: stamp("abc123") };
         a.transact(Operation::Add(unconfirmed.clone()), 9).unwrap();
         a.transact(Operation::Edit { id: "u1".into(), category: Category::Bug, text: "maybe not".into(), seen: unconfirmed.clone() }, 10).unwrap();
-        assert!(matches!(&a.comments().iter().find(|c| c.id == "u1").unwrap().state, CommentState::Unconfirmed(s) if s.nonce == "abc123"), "the stamp stays");
+        assert!(matches!(&a.comments().iter().find(|c| c.id == "u1").unwrap().state, CommentState::Unconfirmed { stamp: s, .. } if s.nonce == "abc123"), "the stamp stays");
         let mut edited = unconfirmed.clone();
         edited.text = "maybe not".into();
         edited.category = Category::Bug;
@@ -2264,16 +2242,16 @@ mod tests {
         // On load at 1_061: `old` (claimed at 950) expires, `young` (1_010) does not.
         let (loaded, _) = Store::open(Some(dir.path().to_path_buf()), "/repo", 1_061);
         assert!(matches!(&loaded.comments()[0].state, CommentState::Sending { .. }));
-        assert!(matches!(&loaded.comments()[1].state, CommentState::Unconfirmed(s) if s.nonce == "bbbbbb"));
+        assert!(matches!(&loaded.comments()[1].state, CommentState::Unconfirmed { stamp: s, .. } if s.nonce == "bbbbbb"));
         // In a refresh whose mtime did not move: `young` expires once its 60 s pass.
         let mut store = loaded;
         let before = std::fs::metadata(dir.path().join("comments.json")).unwrap().modified().unwrap();
         store.refresh(1_071);
-        assert!(matches!(&store.comments()[0].state, CommentState::Unconfirmed(s) if s.nonce == "aaaaaa"));
+        assert!(matches!(&store.comments()[0].state, CommentState::Unconfirmed { stamp: s, .. } if s.nonce == "aaaaaa"));
         assert!(std::fs::metadata(dir.path().join("comments.json")).unwrap().modified().unwrap() >= before);
         // Expiry writes through, so another viewer reads it.
         let (other, _) = Store::open(Some(dir.path().to_path_buf()), "/repo", 1_071);
-        assert!(other.comments().iter().all(|c| matches!(c.state, CommentState::Unconfirmed(_))));
+        assert!(other.comments().iter().all(|c| matches!(c.state, CommentState::Unconfirmed { .. })));
     }
 
     #[test]
@@ -2388,8 +2366,14 @@ mod tests {
         assert_eq!((loaded, problem), (vec![record.clone()], None));
         let mut sent = comment("c", "x", 1);
         sent.state = CommentState::Sent(stamp("oqzpww"));
-        let used = nonces_in_use(dir.path(), "/repo", &[sent.clone()]);
+        let used = nonces_in_use(dir.path(), &[sent.clone()]);
         assert_eq!(used, ["oqzpww", "wvpx71"].into_iter().map(String::from).collect::<BTreeSet<_>>());
+        // Another worktree's records count too: two worktrees can share one agent pane.
+        let mut elsewhere = Store::open(Some(dir.path().to_path_buf()), "/other", 1_000).0;
+        let mut theirs = comment("t", "x", 1);
+        theirs.state = CommentState::Sent(stamp("zzzzz9"));
+        elsewhere.transact(Operation::Add(theirs), 1_001).unwrap();
+        assert!(nonces_in_use(dir.path(), &[]).contains("zzzzz9"));
         // A fresh request reads the comments file under the lock, not a captured array.
         let mut store = open(dir.path());
         store.transact(Operation::Add(sent), 1_001).unwrap();
@@ -2560,8 +2544,15 @@ pub enum CommentState {
         #[serde(default)]
         before: Option<Stamp>,
     },
+    /// Kept through the timeout that made it: a late definite failure restores `before`, because
+    /// that failure says nothing about the earlier send that may have arrived.
+    Unconfirmed {
+        #[serde(flatten)]
+        stamp: Stamp,
+        #[serde(default)]
+        before: Option<Stamp>,
+    },
     // A newtype variant of an internally tagged enum serialises its struct's fields beside the tag.
-    Unconfirmed(Stamp),
     Sent(Stamp),
 }
 
@@ -2589,14 +2580,14 @@ impl Comment {
 
     /// Pending or unconfirmed: what `u` and `x` may change (spec 10.3; sent comments are never edited).
     pub fn is_editable(&self) -> bool {
-        matches!(self.state, CommentState::Pending | CommentState::Unconfirmed(_))
+        matches!(self.state, CommentState::Pending | CommentState::Unconfirmed { .. })
     }
 
     pub fn stamp(&self) -> Option<&Stamp> {
         match &self.state {
             CommentState::Pending => None,
-            CommentState::Sending { stamp, .. } => Some(stamp),
-            CommentState::Unconfirmed(s) | CommentState::Sent(s) => Some(s),
+            CommentState::Sending { stamp, .. } | CommentState::Unconfirmed { stamp, .. } => Some(stamp),
+            CommentState::Sent(s) => Some(s),
         }
     }
 }
@@ -2661,10 +2652,10 @@ pub fn check_record(comment: &Comment) -> bool {
         || (!comment.id.is_empty() && comment.id.len() <= 32 && comment.id.bytes().all(|b| b.is_ascii_alphanumeric()));
     let state_ok = match &comment.state {
         CommentState::Pending => true,
-        CommentState::Sending { stamp, before } => {
+        CommentState::Sending { stamp, before } | CommentState::Unconfirmed { stamp, before } => {
             stamp_ok(stamp) && before.as_ref().is_none_or(stamp_ok)
         }
-        CommentState::Unconfirmed(s) | CommentState::Sent(s) => stamp_ok(s),
+        CommentState::Sent(s) => stamp_ok(s),
     };
     path_ok && span_ok && comparison_ok && text_ok && id_ok && state_ok
 }
@@ -2673,9 +2664,9 @@ pub fn check_record(comment: &Comment) -> bool {
 pub fn expire(comments: &mut [Comment], now: u64) -> bool {
     let mut changed = false;
     for comment in comments {
-        if let CommentState::Sending { stamp, .. } = &comment.state {
+        if let CommentState::Sending { stamp, before } = &comment.state {
             if now.saturating_sub(stamp.at) >= EXPIRY.as_secs() {
-                comment.state = CommentState::Unconfirmed(stamp.clone());
+                comment.state = CommentState::Unconfirmed { stamp: stamp.clone(), before: before.clone() };
                 changed = true;
             }
         }
@@ -2872,6 +2863,8 @@ impl Store {
             None => (BTreeMap::new(), Vec::new(), None),
             Some((text, _)) => parse_comments(&text, &self.toplevel),
         };
+        // The other worktrees' arrays, kept for this write and for the next claim or settlement's.
+        self.others = all.clone();
         let mut changed = false;
         let mut dropped = None;
         let mut kept_journal = Vec::new();
@@ -3100,19 +3093,107 @@ pub fn record_request(state_dir: &Path, toplevel: &str, record: &RequestRecord) 
     })?
 }
 
-/// Nonces any retained record of either file carries, for 10.4's uniqueness check.
-pub fn nonces_in_use(state_dir: &Path, toplevel: &str, comments: &[Comment]) -> BTreeSet<String> {
-    let mut used: BTreeSet<String> = comments.iter().filter_map(|c| c.stamp().map(|s| s.nonce.clone())).collect();
-    used.extend(comments.iter().filter_map(|c| match &c.state {
-        CommentState::Sending { before: Some(b), .. } => Some(b.nonce.clone()),
-        _ => None,
-    }));
-    used.extend(load_requests(state_dir, toplevel).0.into_iter().map(|r| r.nonce));
+/// A request recorded under a nonce no retained record of either file carries (spec 10.4 step 2).
+/// Both files are read under the lock: a captured array could miss a nonce a concurrent send stamped.
+pub fn record_request_fresh(
+    state_dir: &Path,
+    toplevel: &str,
+    make: &dyn Fn(u64) -> String,
+    counter: &mut u64,
+    guard: &dyn Fn() -> Result<(), String>,
+    build: impl FnOnce(&str) -> RequestRecord,
+) -> std::io::Result<String> {
+    if !state_dir.is_absolute() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "state directory must be absolute"));
+    }
+    let mut build = Some(build);
+    let mut chosen = String::new();
+    reuse::with_lock(state_dir, || -> std::io::Result<()> {
+        guard().map_err(|e| std::io::Error::new(std::io::ErrorKind::Interrupted, e))?;
+        let comments = match read_file(&state_dir.join(COMMENTS_FILE)) {
+            Ok(Some((text, _))) => parse_comments(&text, toplevel).1,
+            _ => Vec::new(),
+        };
+        let used = nonces_in_use(state_dir, &comments);
+        let nonce = loop {
+            *counter += 1;
+            let candidate = make(*counter);
+            if !used.contains(&candidate) {
+                break candidate;
+            }
+        };
+        let record = (build.take().expect("built once"))(&nonce);
+        append_request(state_dir, toplevel, &record)?;
+        chosen = nonce;
+        Ok(())
+    })??;
+    Ok(chosen)
+}
+
+/// `clipboard.md` replaced under the state lock through a temporary file named by pid and a counter,
+/// so two copies of one viewer, or a copy and a clipboard send, never truncate each other's work.
+pub fn write_clipboard(state_dir: &Path, text: &str) -> std::io::Result<PathBuf> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !state_dir.is_absolute() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "state directory must be absolute"));
+    }
+    reuse::with_lock(state_dir, || -> std::io::Result<PathBuf> {
+        let path = state_dir.join("clipboard.md");
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = state_dir.join(format!("clipboard.md.{}.{n}.tmp", std::process::id()));
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(path)
+    })?
+}
+
+/// Removes this worktree's request under `nonce`: a request whose send definitely failed.
+pub fn remove_request(state_dir: &Path, toplevel: &str, nonce: &str) -> std::io::Result<()> {
+    reuse::with_lock(state_dir, || {
+        let path = state_dir.join(REQUESTS_FILE);
+        let mut all: BTreeMap<String, Vec<serde_json::Value>> = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let (mine, _) = load_requests(state_dir, toplevel);
+        let kept: Vec<_> = mine.into_iter().filter(|r| r.nonce != nonce).map(|r| serde_json::to_value(r).unwrap_or_default()).collect();
+        all.insert(toplevel.to_string(), kept);
+        let tmp = state_dir.join(format!("{REQUESTS_FILE}.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&all).unwrap_or_default())?;
+        std::fs::rename(tmp, path)
+    })?
+}
+
+/// Nonces any retained record of either file carries, every worktree's (two worktrees can share an
+/// agent pane, and a reply is matched by nonce alone), plus `own`, the array the caller holds.
+pub fn nonces_in_use(state_dir: &Path, own: &[Comment]) -> BTreeSet<String> {
+    fn nonces_of(comments: &[Comment]) -> impl Iterator<Item = String> + '_ {
+        comments.iter().flat_map(|c| {
+            let before = match &c.state {
+                CommentState::Sending { before: Some(b), .. } | CommentState::Unconfirmed { before: Some(b), .. } => Some(b.nonce.clone()),
+                _ => None,
+            };
+            c.stamp().map(|s| s.nonce.clone()).into_iter().chain(before)
+        })
+    }
+    let mut used: BTreeSet<String> = nonces_of(own).collect();
+    if let Ok(Some((text, _))) = read_file(&state_dir.join(COMMENTS_FILE)) {
+        if let Ok(all) = serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&text) {
+            for toplevel in all.keys() {
+                used.extend(nonces_of(&parse_comments(&text, toplevel).1));
+            }
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(state_dir.join(REQUESTS_FILE)) {
+        if let Ok(all) = serde_json::from_str::<BTreeMap<String, Vec<serde_json::Value>>>(&text) {
+            used.extend(all.values().flatten().filter_map(|v| v["nonce"].as_str().map(str::to_string)));
+        }
+    }
     used
 }
 ```
 
-Points the implementer must not smooth over: `apply` on an `Edit`/`Delete` compares the whole seen record (`current != seen`), which is the journal's conflict rule and, for a live transaction, catches an edit another viewer made between this viewer's last reread and now; the TUI always passes the comment as the snapshot shows it. A refused add from the journal (the cap) stays journaled rather than dropped, so a cap reached by another viewer never destroys this viewer's unsent text. The `id_ok` branch accepts short alphanumeric ids so the tests above and Task 5's fixtures can name comments `a1`; production ids are `new_id()`'s 32 hex characters and pass the first arm. Add `pub mod comments;` to `src/engine/mod.rs` and the serde derives on `FileKey` (`types.rs`) and `Side` (`nav.rs`: `#[derive(Serialize, Deserialize)] #[serde(rename_all = "lowercase")]`).
+`record_request` is the lock-taking wrapper around a private `append_request(state_dir, toplevel, record)` that does the read-merge-write without taking the lock, so `record_request_fresh` can call it under the lock it already holds; `write_clipboard` writes under the same lock through a counter-named temporary file, so two copies, or a copy and a clipboard send, never truncate each other's work. Points the implementer must not smooth over: `apply` on an `Edit`/`Delete` compares the whole seen record (`current != seen`), which is the journal's conflict rule and, for a live transaction, catches an edit another viewer made between this viewer's last reread and now; the TUI always passes the comment as the snapshot shows it. A refused add from the journal (the cap) stays journaled rather than dropped, so a cap reached by another viewer never destroys this viewer's unsent text. The `id_ok` branch accepts short alphanumeric ids so the tests above and Task 5's fixtures can name comments `a1`; production ids are `new_id()`'s 32 hex characters and pass the first arm. Add `pub mod comments;` to `src/engine/mod.rs` and the serde derives on `FileKey` (`types.rs`) and `Side` (`nav.rs`: `#[derive(Serialize, Deserialize)] #[serde(rename_all = "lowercase")]`).
 
 - [ ] **Step 4: Run the module tests**
 
@@ -3141,7 +3222,7 @@ In `types.rs`: `Snapshot` gains
     DeleteComment { seen: Comment },
 ```
 
-In `session.rs`, `State` gains `store: Option<comments::Store>` (opened on the first `Done::Status` that finds a toplevel, with `state.state_dir` and the toplevel; its problems go to `note_problem`), and a helper:
+In `session.rs`, `State` gains `store: Option<comments::Store>`, `store_opened: bool` and `store_opening: bool`. The first `Done::Status` that finds a toplevel, with `!store_opened && !store_opening`, sets `store_opening` and runs `comments::Store::open(state_dir, &toplevel, now())` on the blocking pool (`Store::open` takes the state lock and may write expiries: never on the loop), answering `Done::StoreOpened(store, problems)`, whose handler sets `store`, `store_opened`, clears `store_opening`, notes the problems and publishes `comments`; commands that arrive before it is open are queued (`store_queue`, below) and run when it is. The helper the arms share:
 
 ```rust
 fn now() -> u64 {
@@ -3215,7 +3296,33 @@ Write it as one arm per command that builds an `Operation` and calls a shared me
     }
 ```
 
-`a_delayed_adoption_write_never_overwrites_a_newer_pick` (Task 2's tests, which needs this task's comment command) runs green from here on, because this is the write it exercises; move it to this task's test step if the orchestrator wants every Task 2 test green at Task 2's gate.
+The regression for it is this task's, because it needs the comment command and the write; it sits in `session.rs`'s tests with the three below:
+
+```rust
+    #[test]
+    fn a_delayed_adoption_write_never_overwrites_a_newer_pick() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+        // The remembered record has no session; the host reports one, which the check adopts.
+        target::save_target(state.path(), &top, &pane_target("w4:p2", "codex", None)).unwrap();
+        let host = host::Scripted::with_panes(vec![agent_pane("w4:p2", "codex", "idle", Some("s1"), &top)]);
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.host = Some(host.clone());
+        config.socket_path = Some("/run/fake.sock".into());
+        let (_rt, handle) = start_with(config);
+        wait_for(&handle, "adopted in memory", |s| matches!(&s.target, Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s1"));
+        // The adoption is written with the next comment; a re-pick lands first.
+        handle.commands.send(Command::SetTarget(Target::Clipboard)).unwrap();
+        wait_for(&handle, "re-picked", |s| s.target_seq == 1 && s.target == Some(Target::Clipboard));
+        handle.commands.send(pending(2, "x")).unwrap();
+        wait_for(&handle, "comment", |s| s.comment_seq == 1);
+        wait_until("the file settles", || target::load_targets(state.path()).0.get(&top) == Some(&Target::Clipboard));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(target::load_targets(state.path()).0.get(&top), Some(&Target::Clipboard), "an older write replaced the newer pick");
+    }
+```
 
 with `Done::Comment { store: Option<comments::Store>, outcome: Result<Option<String>, String> }` handled as:
 
@@ -3273,10 +3380,10 @@ The refresh: `run_job` cannot carry the store (it lives on `State`), so on every
     fn comments_are_added_edited_deleted_and_shared_between_two_sessions() {
         let dir = fixture();
         let state = tempfile::tempdir().unwrap();
-        let mut config = config(dir.path(), Arc::new(AtomicBool::new(true)));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.state_dir = Some(state.path().to_path_buf());
         let (_rt, a) = start_with(config);
-        let mut config = config(dir.path(), Arc::new(AtomicBool::new(true)));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.state_dir = Some(state.path().to_path_buf());
         let (_rt2, b) = start_with(config);
         wait_for(&a, "rows", |s| !s.files.is_empty());
@@ -3344,10 +3451,10 @@ The refresh: `run_job` cannot carry the store (it lives on `State`), so on every
             before: None,
         };
         std::fs::write(state.path().join("comments.json"), serde_json::json!({ top.as_str(): [stale] }).to_string()).unwrap();
-        let mut config = config(dir.path(), Arc::new(AtomicBool::new(true)));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.state_dir = Some(state.path().to_path_buf());
         let (_rt, handle) = start_with(config);
-        let s = wait_for(&handle, "unconfirmed", |s| matches!(s.comments.first().map(|c| &c.state), Some(comments::CommentState::Unconfirmed(_))));
+        let s = wait_for(&handle, "unconfirmed", |s| matches!(s.comments.first().map(|c| &c.state), Some(comments::CommentState::Unconfirmed { .. })));
         assert_eq!(s.comments[0].stamp().unwrap().nonce, "abcdef");
     }
 ```
@@ -3793,7 +3900,8 @@ pub const NOTICE_NO_PENDING: &str = "nothing to send: no pending comments";
 #[derive(Debug, Clone, PartialEq, Eq)] pub enum ReviewScope { File(FileKey), All }
 #[derive(Debug, Clone, PartialEq, Eq)] pub enum SendKind { Feedback, Review { scope: ReviewScope } }
 /// What a "send anyway" row stands for (spec 10.4): the status it named, the session it found restarted.
-#[derive(Debug, Clone, PartialEq, Eq, Default)] pub struct Accepted { pub busy: bool, pub restarted: Option<SessionRef> }
+/// `restarted`: `None` accepts no restart; `Some(session)` accepts a restart into exactly that session, `Some(None)` one into a pane whose agent reports no session.
+#[derive(Debug, Clone, PartialEq, Eq, Default)] pub struct Accepted { pub busy: bool, pub restarted: Option<Option<SessionRef>> }
 #[derive(Debug, Clone, PartialEq, Eq)] pub struct SendRequest { pub kind: SendKind, pub accepted: Accepted }
 #[derive(Debug, Clone, PartialEq, Eq)] pub enum CopyWhat { Review, Request { scope: ReviewScope }, Selection(String) }
 #[derive(Debug, Clone, PartialEq, Eq)] pub struct CopyRequest { pub what: CopyWhat }
@@ -3891,13 +3999,15 @@ Add to `comments.rs`'s tests:
         let mut store = open(dir.path());
         store.transact(Operation::Add(comment("p1", "first", 1)), 1_010).unwrap();
         let mut unconfirmed = comment("u1", "second", 2);
-        unconfirmed.state = CommentState::Unconfirmed(stamp("oldone"));
+        unconfirmed.state = CommentState::Unconfirmed { before: None, stamp: stamp("oldone") };
         store.transact(Operation::Add(unconfirmed), 1_010).unwrap();
         let mut theirs = comment("s1", "third", 3);
         // Claimed by another viewer a second ago: still theirs, not expired.
         theirs.state = CommentState::Sending { stamp: Stamp { at: 1_010, ..stamp("theirs") }, before: None };
         store.transact(Operation::Add(theirs), 1_010).unwrap();
         store.transact(Operation::Add(comment("p2", "fourth", 4)), 1_010).unwrap();
+        // An older comment that landed late in the array (a journal replay) is numbered by its creation time.
+        store.transact(Operation::Add(comment("p0", "zeroth", 0)), 1_010).unwrap();
         let to = Destination::Pane { pane: "w4:p2".into(), agent: "codex".into(), session: None };
         let make = |counter: u64| format!("n{counter:05}");
         let ok = || Ok(());
@@ -3910,12 +4020,15 @@ Add to `comments.rs`'s tests:
             .unwrap();
         // `theirs` and `oldone` are retained nonces, but `n00001` is free: the first candidate is taken.
         assert_eq!(claimed.nonce, "n00001");
-        assert_eq!(claimed.text, "n00001|1:p1,2:u1,3:p2");
-        assert_eq!(claimed.comments.len(), 3);
-        for (i, c) in claimed.comments.iter().enumerate() {
+        // Numbered by creation time, not array order: p0 first, p2 last.
+        assert_eq!(claimed.text, "n00001|1:p0,2:p1,3:u1,4:p2");
+        assert_eq!(claimed.comments.len(), 4);
+        for c in &claimed.comments {
             match &c.state {
                 CommentState::Sending { stamp, before } => {
-                    assert_eq!((stamp.nonce.as_str(), stamp.item, &stamp.to), ("n00001", i as u32 + 1, &to));
+                    assert_eq!((stamp.nonce.as_str(), &stamp.to), ("n00001", &to));
+                    let expected_item = ["p0", "p1", "u1", "p2"].iter().position(|id| *id == c.id).unwrap() as u32 + 1;
+                    assert_eq!(stamp.item, expected_item);
                     assert_eq!(before.is_some(), c.id == "u1", "only the unconfirmed one remembers its earlier stamp");
                 }
                 other => panic!("{other:?}"),
@@ -3941,13 +4054,21 @@ Add to `comments.rs`'s tests:
         assert!(other.claim(1_015, &to, &make, &mut counter, &ok, |_, _| Ok(String::new())).is_err());
         assert!(other.comments().iter().find(|c| c.id == "p3").unwrap().is_pending(), "a failed write never shows a claim the file does not have");
         other.fail_writes_for_tests(false);
+        // Another worktree's array survives a claim and a settlement.
+        let mut elsewhere = Store::open(Some(dir.path().to_path_buf()), "/other", 1_000).0;
+        elsewhere.transact(Operation::Add(comment("e1", "theirs", 1)), 1_015).unwrap();
+        other.transact(Operation::Add(comment("p4", "sixth", 6)), 1_016).unwrap();
+        let claimed = other.claim(1_017, &to, &make, &mut counter, &ok, |_, nonce| Ok(nonce.to_string())).unwrap();
+        other.settle(1_018, &claimed.nonce, Settlement::Sent).unwrap();
+        elsewhere.refresh(1_019);
+        assert_eq!(elsewhere.comments().iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["e1"], "the other worktree's records were dropped by a write");
         // Without a state directory the claim runs on the array alone.
         let mut bare = Store::open(None, "/repo", 1_000).0;
         bare.transact(Operation::Add(comment("x", "bare", 1)), 1_000).unwrap_err();
         let claimed = bare.claim(1_001, &Destination::clipboard(), &make, &mut 0, &ok, |_, nonce| Ok(nonce.to_string())).unwrap();
         assert_eq!(claimed.comments.len(), 1);
         bare.settle(1_002, &claimed.nonce, Settlement::Unconfirmed).unwrap();
-        assert!(matches!(bare.comments()[0].state, CommentState::Unconfirmed(_)));
+        assert!(matches!(bare.comments()[0].state, CommentState::Unconfirmed { .. }));
     }
 
     #[test]
@@ -3956,7 +4077,7 @@ Add to `comments.rs`'s tests:
         let mut store = open(dir.path());
         store.transact(Operation::Add(comment("p1", "a", 1)), 10).unwrap();
         let mut unconfirmed = comment("u1", "b", 2);
-        unconfirmed.state = CommentState::Unconfirmed(stamp("oldone"));
+        unconfirmed.state = CommentState::Unconfirmed { before: None, stamp: stamp("oldone") };
         store.transact(Operation::Add(unconfirmed), 10).unwrap();
         let to = Destination::clipboard();
         let fixed = |name: &'static str| move |_: u64| name.to_string();
@@ -3969,11 +4090,11 @@ Add to `comments.rs`'s tests:
         store.settle(1_013, "aaa111", Settlement::Failed).unwrap();
         let by_id = |store: &Store, id: &str| store.comments().iter().find(|c| c.id == id).unwrap().state.clone();
         assert_eq!(by_id(&store, "p1"), CommentState::Pending);
-        assert!(matches!(by_id(&store, "u1"), CommentState::Unconfirmed(s) if s.nonce == "oldone"), "the earlier stamp came back");
+        assert!(matches!(by_id(&store, "u1"), CommentState::Unconfirmed { stamp: s, .. } if s.nonce == "oldone"), "the earlier stamp came back");
         assert!(matches!(by_id(&store, "p9"), CommentState::Sending { stamp, .. } if stamp.nonce == "bbb222"));
         store.claim(1_014, &to, &fixed("ccc333"), &mut 0, &ok, |_, _| Ok(String::new())).unwrap();
         store.settle(1_015, "ccc333", Settlement::Unconfirmed).unwrap();
-        assert!(matches!(by_id(&store, "p1"), CommentState::Unconfirmed(s) if s.nonce == "ccc333"));
+        assert!(matches!(by_id(&store, "p1"), CommentState::Unconfirmed { stamp: s, .. } if s.nonce == "ccc333"));
         // A late answer settles records the timeout already marked unconfirmed (spec 10.6).
         store.settle(1_016, "ccc333", Settlement::Sent).unwrap();
         assert!(matches!(by_id(&store, "p1"), CommentState::Sent(s) if s.nonce == "ccc333"));
@@ -3981,7 +4102,7 @@ Add to `comments.rs`'s tests:
         store.claim(1_016, &to, &fixed("ddd444"), &mut 0, &ok, |_, _| Ok(String::new())).unwrap();
         store.settle(1_017, "ddd444", Settlement::Sent).unwrap();
         assert!(matches!(by_id(&store, "p2"), CommentState::Sent(s) if s.nonce == "ddd444" && s.item == 1));
-        assert!(matches!(by_id(&store, "u1"), CommentState::Sent(s) if s.nonce == "ddd444" && s.item == 2));
+        assert!(matches!(by_id(&store, "u1"), CommentState::Sent(s) if s.nonce == "ccc333"), "a sent record is never claimed again");
         // A failed settlement write leaves the array as the file has it.
         store.transact(Operation::Add(comment("p3", "later", 18)), 1_018).unwrap();
         store.claim(1_018, &to, &fixed("fff666"), &mut 0, &ok, |_, _| Ok(String::new())).unwrap();
@@ -4047,7 +4168,7 @@ Then the methods, after `refresh`:
             // The caller's last word before anything is stamped: the send's selection generation.
             guard().map_err(TxError::Refused)?;
             let used = match &store.state_dir {
-                Some(dir) => nonces_in_use(dir, &store.toplevel, &store.comments),
+                Some(dir) => nonces_in_use(dir, &store.comments),
                 None => store.comments.iter().filter_map(|c| c.stamp().map(|s| s.nonce.clone())).collect(),
             };
             let nonce = loop {
@@ -4057,13 +4178,14 @@ Then the methods, after `refresh`:
                     break candidate;
                 }
             };
-            let eligible: Vec<(u32, &Comment)> = store
+            // Creation order, by `created_at` then id: a journal replay can leave the array out of order.
+            let mut ordered: Vec<&Comment> = store
                 .comments
                 .iter()
-                .filter(|c| matches!(c.state, CommentState::Pending | CommentState::Unconfirmed(_)))
-                .enumerate()
-                .map(|(i, c)| (i as u32 + 1, c))
+                .filter(|c| matches!(c.state, CommentState::Pending | CommentState::Unconfirmed { .. }))
                 .collect();
+            ordered.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+            let eligible: Vec<(u32, &Comment)> = ordered.into_iter().enumerate().map(|(i, c)| (i as u32 + 1, c)).collect();
             if eligible.is_empty() {
                 return Err(TxError::Refused(NOTICE_NOTHING.to_string()));
             }
@@ -4074,8 +4196,9 @@ Then the methods, after `refresh`:
             let mut claimed = Vec::new();
             for comment in &mut working {
                 if let Some((_, item)) = ids.iter().find(|(id, _)| id == &comment.id) {
+                    // The stamp a retry replaces is the one that may have arrived: the latest unconfirmed one.
                     let before = match &comment.state {
-                        CommentState::Unconfirmed(s) => Some(s.clone()),
+                        CommentState::Unconfirmed { stamp, .. } => Some(stamp.clone()),
                         _ => None,
                     };
                     comment.state = CommentState::Sending {
@@ -4116,15 +4239,16 @@ Then the methods, after `refresh`:
             for comment in &mut working {
                 let (stamp, before) = match &comment.state {
                     CommentState::Sending { stamp, before } if stamp.nonce == nonce => (stamp.clone(), before.clone()),
-                    // A late answer: the timeout marked it unconfirmed; the host's word is final either way.
-                    CommentState::Unconfirmed(stamp) if stamp.nonce == nonce && outcome != Settlement::Unconfirmed => (stamp.clone(), None),
+                    // A late answer: the timeout marked it unconfirmed and kept `before`; the host's word is final.
+                    CommentState::Unconfirmed { stamp, before } if stamp.nonce == nonce && outcome != Settlement::Unconfirmed => (stamp.clone(), before.clone()),
                     _ => continue,
                 };
                 comment.state = match outcome {
                     Settlement::Sent => CommentState::Sent(stamp),
-                    Settlement::Unconfirmed => CommentState::Unconfirmed(stamp),
+                    Settlement::Unconfirmed => CommentState::Unconfirmed { stamp, before },
+                    // Nothing arrived this time; the earlier send may have: back to its stamp, or to pending.
                     Settlement::Failed => match before {
-                        Some(earlier) => CommentState::Unconfirmed(earlier),
+                        Some(earlier) => CommentState::Unconfirmed { stamp: earlier, before: None },
                         None => CommentState::Pending,
                     },
                 };
@@ -4150,86 +4274,7 @@ Then the methods, after `refresh`:
     }
 ```
 
-`Claimed { comments, text, nonce }` is a plain struct beside `Settlement`. Two more functions in `comments.rs`, both under the state lock:
-
-```rust
-/// A request recorded under a nonce no retained record of either file carries (spec 10.4 step 2).
-/// Both files are read under the lock: a captured array could miss a nonce a concurrent send stamped.
-pub fn record_request_fresh(
-    state_dir: &Path,
-    toplevel: &str,
-    make: &dyn Fn(u64) -> String,
-    counter: &mut u64,
-    guard: &dyn Fn() -> Result<(), String>,
-    build: impl FnOnce(&str) -> RequestRecord,
-) -> std::io::Result<String> {
-    if !state_dir.is_absolute() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "state directory must be absolute"));
-    }
-    let mut build = Some(build);
-    let mut chosen = String::new();
-    reuse::with_lock(state_dir, || -> std::io::Result<()> {
-        guard().map_err(|e| std::io::Error::new(std::io::ErrorKind::Interrupted, e))?;
-        let comments = match read_file(&state_dir.join(COMMENTS_FILE)) {
-            Ok(Some((text, _))) => parse_comments(&text, toplevel).1,
-            _ => Vec::new(),
-        };
-        let used = nonces_in_use(state_dir, toplevel, &comments);
-        let nonce = loop {
-            *counter += 1;
-            let candidate = make(*counter);
-            if !used.contains(&candidate) {
-                break candidate;
-            }
-        };
-        let record = (build.take().expect("built once"))(&nonce);
-        append_request(state_dir, toplevel, &record)?;
-        chosen = nonce;
-        Ok(())
-    })??;
-    Ok(chosen)
-}
-
-/// `clipboard.md` replaced under the state lock through a temporary file named by pid and a counter,
-/// so two copies of one viewer, or a copy and a clipboard send, never truncate each other's work.
-pub fn write_clipboard(state_dir: &Path, text: &str) -> std::io::Result<PathBuf> {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if !state_dir.is_absolute() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "state directory must be absolute"));
-    }
-    reuse::with_lock(state_dir, || -> std::io::Result<PathBuf> {
-        let path = state_dir.join("clipboard.md");
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = state_dir.join(format!("clipboard.md.{}.{n}.tmp", std::process::id()));
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(path)
-    })?
-}
-```
-
-`record_request` of Task 3 becomes the lock-taking wrapper around a private `append_request(state_dir, toplevel, record)` that does the read-merge-write without taking the lock, so `record_request_fresh` can call it under the lock it already holds.
-
-`write_locked_with(&working)` is the write half of `read_and_apply`, factored out to take the array to write (the `others` map read by `read_and_apply` is written back around it). A late `Failed` settlement of an `Unconfirmed` record returns it to `Pending`: the record's own `before` was consumed when the timeout marked it unconfirmed, and a definite failure after that means the host never acted. `journal_reason: Option<String>` is set by `transact` when it journals an operation (the `e` of the `Io` arm) and cleared when the journal empties. Add `Settlement` beside `Operation`, and:
-
-```rust
-/// Removes this worktree's request under `nonce`: a request whose send definitely failed.
-pub fn remove_request(state_dir: &Path, toplevel: &str, nonce: &str) -> std::io::Result<()> {
-    reuse::with_lock(state_dir, || {
-        let path = state_dir.join(REQUESTS_FILE);
-        let mut all: BTreeMap<String, Vec<serde_json::Value>> = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
-        let (mine, _) = load_requests(state_dir, toplevel);
-        let kept: Vec<_> = mine.into_iter().filter(|r| r.nonce != nonce).map(|r| serde_json::to_value(r).unwrap_or_default()).collect();
-        all.insert(toplevel.to_string(), kept);
-        let tmp = state_dir.join(format!("{REQUESTS_FILE}.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&all).unwrap_or_default())?;
-        std::fs::rename(tmp, path)
-    })?
-}
-```
+`write_locked_with(&working)` is the write half of `read_and_apply`, factored out to take the array to write: it writes `self.others` (every other worktree's array as `read_and_apply` last read it) plus `{toplevel: working}`, so a claim or a settlement never drops another worktree's records; `read_and_apply` sets `self.others` from `parse_comments`'s remainder on every read. A late `Failed` settlement of an `Unconfirmed` record restores the `before` it kept through the timeout, or `Pending` when it had none: the failure says nothing about the earlier send that may have arrived, and that correlation is what a reply would still match. `journal_reason: Option<String>` is set by `transact` when it journals an operation (the `e` of the `Io` arm) and cleared when the journal empties. Add `Settlement` beside `Operation`. `Claimed { comments, text, nonce }` is a plain struct beside it. `record_request_fresh`, `remove_request` and `write_clipboard` are Task 3's (its Step 3 defines them), used here unchanged.
 
 Run: `cargo test --locked --lib engine::comments`. Expected: the three new tests pass with the twelve of Task 3.
 
@@ -4279,10 +4324,12 @@ pub enum SendKind {
 }
 
 /// What a "send anyway" row stands for: the status it named, the session it found restarted.
+/// `restarted` is `None` for no restart accepted, `Some(session)` for a restart into exactly that
+/// session, `Some(None)` for one into a pane whose agent reports no session at all.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Accepted {
     pub busy: bool,
-    pub restarted: Option<SessionRef>,
+    pub restarted: Option<Option<SessionRef>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4484,7 +4531,8 @@ fn gates(target: &Target, state: Option<TargetState>, record: Option<&host::Pane
         TargetState::NoHost => return Err(("No host: this viewer runs outside herdr.".to_string(), Refusal::Other)),
         TargetState::Restarted(_) => {
             let now = record.and_then(|r| r.agent_session.clone());
-            if accepted.restarted.is_none() || accepted.restarted != now {
+            // Accepted only for the very session the check found, a missing one included.
+            if accepted.restarted.as_ref() != Some(&now) {
                 return Err((
                     format!("{agent} in {pane} was restarted since you picked it and has not seen earlier messages."),
                     Refusal::Restarted(now),
@@ -4574,9 +4622,6 @@ async fn send_inner(
     let Some(target) = ctx.target.clone() else {
         bail!(store, "no target: press A".to_string());
     };
-    let Some(target) = ctx.target.clone() else {
-        return Err("no target: press A".to_string());
-    };
     // The reads come first (spec 10.4 "Request review"): the check below is then a moment from the dispatch.
     let request_files = match &request.kind {
         SendKind::Review { scope } => match request_files(ctx, scope).await {
@@ -4586,7 +4631,7 @@ async fn send_inner(
         SendKind::Feedback => None,
     };
     // Step 1a, the lock: every send of every viewer of this user takes it, so two never paste at once.
-    let _held = match ctx.state_dir.as_ref().map(|dir| dir.join(SEND_LOCK)) {
+    let mut _held = match ctx.state_dir.as_ref().map(|dir| dir.join(SEND_LOCK)) {
         Some(path) => match hold_send_lock(path, waiting.clone()).await {
             Ok(lock) => Some(lock),
             Err(e) => bail!(store, e),
@@ -4830,7 +4875,10 @@ async fn send_inner(
         }
         Destination::Pane { pane, .. } => {
             let (pane_id, text_sent) = (pane.clone(), text.clone());
-            let answer = call_host_late(ctx, move |h| h.agent_prompt(&pane_id, &text_sent), nonce.clone(), claimed).await;
+            // The lock travels with the call: a call that outlives the engine's wait keeps it until the
+            // host has answered and the Enter delay has passed, so no second viewer pastes meanwhile.
+            let (answer, held_back) = call_host_late(ctx, move |h| h.agent_prompt(&pane_id, &text_sent), nonce.clone(), claimed, _held.take()).await;
+            _held = held_back;
             // The lock outlives the host's Enter delay, so the next sender pastes into an empty line.
             tokio::time::sleep(ENTER_MARGIN).await;
             let settlement = match &answer {
@@ -4883,7 +4931,7 @@ async fn hold_send_lock(path: PathBuf, waiting: Arc<dyn Fn(bool) + Send + Sync>)
     taken
 }
 
-/// An exclusive `flock` on `send.lock`, released on drop.
+/// An exclusive `flock` on `send.lock`, released on drop. `Send`, so a late call can carry it.
 pub struct SendLock {
     _file: std::fs::File,
 }
@@ -4953,36 +5001,43 @@ pub async fn call_host_within<T: Send + 'static>(
 
 /// The prompt call: when the engine's wait passes, the records are settled `Unconfirmed` by the
 /// caller, and the late answer, when it comes, settles them again by nonce (spec 10.6): `Sent` on
-/// success, `Pending` or their earlier stamp on a definite failure. `Unconfirmed` stays for an
-/// `After` failure, which says nothing new.
+/// success, their earlier stamp or `Pending` on a definite failure; an `After` failure says nothing
+/// new and leaves them. The send lock goes with a call that outlives the wait and is released only
+/// after that call has answered and the Enter delay has passed; a call that answered in time gives
+/// the lock back to the caller.
 async fn call_host_late(
     ctx: &Context,
     call: impl FnOnce(&dyn HostClient) -> Result<(), host::HostFailure> + Send + 'static,
     nonce: String,
     claimed: bool,
-) -> Result<(), host::HostFailure> {
+    held: Option<SendLock>,
+) -> (Result<(), host::HostFailure>, Option<SendLock>) {
     let (answer, late) = call_host_within(ctx.host.clone(), ctx.host_wait, call).await;
-    if let Some(handle) = late {
-        let (state_dir, toplevel, now, late_tx) = (ctx.state_dir.clone(), ctx.toplevel.clone(), ctx.now, ctx.late.clone());
-        tokio::spawn(async move {
-            let Ok(result) = handle.await else { return };
-            let settlement = match result {
-                Ok(()) => Settlement::Sent,
-                Err(host::HostFailure::After(_)) => return,
-                Err(_) => Settlement::Failed,
-            };
-            if claimed {
-                // The store is the session's; the late settlement goes through it (Done::LateAnswer).
-                let _ = late_tx.send((nonce, settlement));
-            } else if settlement == Settlement::Failed {
-                if let Some(dir) = state_dir {
-                    let _ = blocking(move || comments::remove_request(&dir, &toplevel, &nonce)).await;
-                }
+    let Some(handle) = late else {
+        return (answer, held);
+    };
+    let (state_dir, toplevel, late_tx) = (ctx.state_dir.clone(), ctx.toplevel.clone(), ctx.late.clone());
+    tokio::spawn(async move {
+        let result = handle.await;
+        // The host has answered, or the task died: the paste, if any, is done once the Enter delay passes.
+        tokio::time::sleep(ENTER_MARGIN).await;
+        drop(held);
+        let Ok(result) = result else { return };
+        let settlement = match result {
+            Ok(()) => Settlement::Sent,
+            Err(host::HostFailure::After(_)) => return,
+            Err(_) => Settlement::Failed,
+        };
+        if claimed {
+            // The store is the session's; the late settlement goes through it (Done::LateAnswer).
+            let _ = late_tx.send((nonce, settlement));
+        } else if settlement == Settlement::Failed {
+            if let Some(dir) = state_dir {
+                let _ = blocking(move || comments::remove_request(&dir, &toplevel, &nonce)).await;
             }
-            let _ = now;
-        });
-    }
-    answer
+        }
+    });
+    (answer, None)
 }
 
 /// `c` in a box, `y` on a selection: nothing is claimed; a request copy is recorded once the text
@@ -4994,14 +5049,14 @@ pub async fn copy(ctx: Context, request: CopyRequest, comments: Vec<comments::Co
         CopyWhat::Review => {
             let eligible: Vec<&comments::Comment> = comments
                 .iter()
-                .filter(|c| matches!(c.state, comments::CommentState::Pending | comments::CommentState::Unconfirmed(_)))
+                .filter(|c| matches!(c.state, comments::CommentState::Pending | comments::CommentState::Unconfirmed { .. }))
                 .collect();
             if eligible.is_empty() {
                 return Err(NOTICE_NO_PENDING.to_string());
             }
             // Nothing is stamped by a copy, so the nonce only has to be fresh against what is retained now.
             let used: std::collections::BTreeSet<String> = match &ctx.state_dir {
-                Some(dir) => comments::nonces_in_use(dir, &ctx.toplevel, &comments),
+                Some(dir) => comments::nonces_in_use(dir, &comments),
                 None => comments.iter().filter_map(|c| c.stamp().map(|s| s.nonce.clone())).collect(),
             };
             let nonce = loop {
@@ -5011,6 +5066,8 @@ pub async fn copy(ctx: Context, request: CopyRequest, comments: Vec<comments::Co
                     break candidate;
                 }
             };
+            let mut eligible = eligible;
+            eligible.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
             let items: Vec<prompt::Item<'_>> = eligible.iter().enumerate().map(|(i, c)| prompt::Item { number: i as u32 + 1, comment: c }).collect();
             (prompt::review(&ctx.toplevel, &items, &nonce), format!("{} comments", eligible.len()))
         }
@@ -5025,8 +5082,11 @@ pub async fn copy(ctx: Context, request: CopyRequest, comments: Vec<comments::Co
             let nonce = match &ctx.state_dir {
                 Some(dir) => {
                     let (dir, top, make, mut c, files2, now) = (dir.clone(), ctx.toplevel.clone(), ctx.nonce.clone(), counter, files.clone(), ctx.now);
+                    let (latest, generation) = (ctx.latest_generation.clone(), ctx.generation);
                     let (nonce, c) = blocking(move || {
-                        let nonce = comments::record_request_fresh(&dir, &top, &comments, make.as_ref(), &mut c, |nonce| RequestRecord {
+                        // A copy made for one target must not be recorded against another picked meanwhile.
+                        let guard = || if latest.load(Ordering::SeqCst) == generation { Ok(()) } else { Err("the target changed; press @ again".to_string()) };
+                        let nonce = comments::record_request_fresh(&dir, &top, make.as_ref(), &mut c, &guard, |nonce| RequestRecord {
                             nonce: nonce.to_string(),
                             at: now,
                             target: Destination::clipboard(),
@@ -5089,7 +5149,7 @@ pub async fn copy(ctx: Context, request: CopyRequest, comments: Vec<comments::Co
                         } else if !state.store_opened {
                             Some("not a git repository".to_string())
                         } else if matches!(request.kind, dispatch::SendKind::Feedback)
-                            && !state.snapshot.comments.iter().any(|c| matches!(c.state, comments::CommentState::Pending | comments::CommentState::Unconfirmed(_)))
+                            && !state.snapshot.comments.iter().any(|c| matches!(c.state, comments::CommentState::Pending | comments::CommentState::Unconfirmed { .. }))
                         {
                             Some(dispatch::NOTICE_NO_PENDING.to_string())
                         } else {
@@ -5222,7 +5282,7 @@ The three `Done` arms:
     }
 
     fn sending_config(dir: &std::path::Path, state: &std::path::Path, host: Arc<host::Scripted>) -> SessionConfig {
-        let mut config = config(dir, Arc::new(AtomicBool::new(true)));
+        let mut config = test_config(dir, Arc::new(AtomicBool::new(true)));
         config.state_dir = Some(state.to_path_buf());
         config.host = Some(host);
         config.socket_path = Some("/run/fake.sock".into());
@@ -5303,7 +5363,7 @@ The three `Done` arms:
         host.set_pane(agent_pane("w4:p2", "codex", "working", Some("s2"), &top));
         assert!(send(dispatch::Accepted { busy: true, restarted: None }).send_error.as_deref().unwrap().contains("was restarted since you picked it"));
         host.set_pane(agent_pane("w4:p2", "codex", "idle", Some("s2"), &top));
-        assert!(send(dispatch::Accepted { busy: false, restarted: Some(host::SessionRef { kind: "id".into(), value: "s9".into() }) }).send_error.is_some(), "the wrong session is not the one the box showed");
+        assert!(send(dispatch::Accepted { busy: false, restarted: Some(Some(host::SessionRef { kind: "id".into(), value: "s9".into() })) }).send_error.is_some(), "the wrong session is not the one the box showed");
         host.set_pane(host::PaneRecord { pane_id: "w4:p2".into(), agent_status: Some("unknown".into()), ..host::PaneRecord::default() });
         assert_eq!(send(dispatch::Accepted::default()).send_error.as_deref(), Some("codex · w4:p2 is gone · pick a pane"));
         *host.list_failure.lock().unwrap() = Some(host::HostFailure::After("deadline".into()));
@@ -5312,7 +5372,15 @@ The three `Done` arms:
         assert_eq!(host.prompts.lock().unwrap().len(), 0, "nothing was sent by a refusal");
         // The accepted restart sends, and the target record adopts the new session.
         host.set_pane(agent_pane("w4:p2", "codex", "idle", Some("s2"), &top));
-        let s = send(dispatch::Accepted { busy: false, restarted: Some(host::SessionRef { kind: "id".into(), value: "s2".into() }) });
+        let s = send(dispatch::Accepted { busy: false, restarted: Some(Some(host::SessionRef { kind: "id".into(), value: "s2".into() })) });
+        assert!(s.send_error.is_none(), "{:?}", s.send_error);
+        // A restart into an agent that reports no session is accepted as that absence.
+        host.set_pane(host::PaneRecord { pane_id: "w4:p2".into(), agent: Some("codex".into()), agent_status: Some("idle".into()), ..host::PaneRecord::default() });
+        wait_for(&handle, "restarted again", |s| s.target_state == TargetState::Restarted("idle".into()));
+        handle.commands.send(pending(1, "more")).unwrap();
+        wait_for(&handle, "pending again", |s| s.comments.iter().any(|c| c.is_pending()));
+        assert!(matches!(send(dispatch::Accepted::default()).send_refusal, Some(dispatch::Refusal::Restarted(None))));
+        let s = send(dispatch::Accepted { busy: false, restarted: Some(None) });
         assert!(s.send_error.is_none(), "{:?}", s.send_error);
         assert!(matches!(&s.target, Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s2"));
         let (targets, _) = target::load_targets(state.path());
@@ -5338,13 +5406,13 @@ The three `Done` arms:
         let s = wait_for(&handle, "unconfirmed", |s| s.send_seq == 2);
         assert!(s.send_error.is_none());
         assert!(s.send_outcome.as_ref().unwrap().unconfirmed);
-        assert!(matches!(state_of(&s, 0), comments::CommentState::Unconfirmed(st) if st.nonce == "n00002"));
+        assert!(matches!(state_of(&s, 0), comments::CommentState::Unconfirmed { stamp: st, .. } if st.nonce == "n00002"));
         // A retry that definitely fails restores the earlier Unconfirmed stamp, not Pending.
         host.prompt_results.lock().unwrap().push(Err(host::HostFailure::Before("connection refused".into())));
         handle.commands.send(feedback(dispatch::Accepted::default())).unwrap();
         let s = wait_for(&handle, "retry failed", |s| s.send_seq == 3);
         assert!(s.send_error.is_some());
-        assert!(matches!(state_of(&s, 0), comments::CommentState::Unconfirmed(st) if st.nonce == "n00002"), "{:?}", state_of(&s, 0));
+        assert!(matches!(state_of(&s, 0), comments::CommentState::Unconfirmed { stamp: st, .. } if st.nonce == "n00002"), "{:?}", state_of(&s, 0));
         // A success after that is Sent under the newest nonce, both items.
         handle.commands.send(feedback(dispatch::Accepted::default())).unwrap();
         let s = wait_for(&handle, "sent", |s| s.send_seq == 4);
@@ -5473,7 +5541,7 @@ The three `Done` arms:
     fn a_clipboard_send_is_sent_when_the_file_was_written_and_unconfirmed_when_only_the_sequence_went_out() {
         let dir = fixture();
         let state = tempfile::tempdir().unwrap();
-        let mut config = config(dir.path(), Arc::new(AtomicBool::new(true)));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.state_dir = Some(state.path().to_path_buf());
         config.nonce = Arc::new(|counter| format!("n{counter:05}"));
         let (_rt, handle) = start_with(config);
@@ -5501,8 +5569,32 @@ The three `Done` arms:
         bare.commands.send(feedback(dispatch::Accepted::default())).unwrap();
         let s = wait_for(&bare, "unconfirmed copy", |s| s.send_seq == 1);
         assert!(s.send_outcome.as_ref().unwrap().unconfirmed);
-        assert!(matches!(s.comments[0].state, comments::CommentState::Unconfirmed(_)));
+        assert!(matches!(s.comments[0].state, comments::CommentState::Unconfirmed { .. }));
         assert!(s.send_outcome.as_ref().unwrap().copy.as_ref().unwrap().osc.is_some());
+        // Over the OSC limit with a writable directory: the file alone, no sequence, still Sent.
+        let wide = "字".repeat(comments::MAX_CHARS);
+        for _ in 0..30 {
+            handle.commands.send(pending(2, &wide)).unwrap();
+        }
+        wait_for(&handle, "thirty more", |s| s.comments.iter().filter(|c| c.is_pending()).count() == 30);
+        handle.commands.send(feedback(dispatch::Accepted::default())).unwrap();
+        let s = wait_for(&handle, "file only", |s| s.send_seq == 2);
+        let out = s.send_outcome.clone().unwrap();
+        assert!(out.copy.as_ref().unwrap().osc.is_none() && !out.unconfirmed);
+        assert!(out.copy.as_ref().unwrap().notice.contains("too long for the terminal's clipboard"));
+        assert!(s.comments.iter().all(|c| matches!(c.state, comments::CommentState::Sent(_))));
+        // Over the limit with no directory either: nothing can receive it; nothing is stamped, the
+        // earlier unconfirmed record keeps its stamp, the box says why.
+        for _ in 0..30 {
+            bare.commands.send(pending(2, &wide)).unwrap();
+        }
+        wait_for(&bare, "thirty pending", |s| s.comments.iter().filter(|c| c.is_pending()).count() == 30);
+        let earlier = bare.snapshots.try_iter().last().map(|s| s.comments[0].state.clone());
+        bare.commands.send(feedback(dispatch::Accepted::default())).unwrap();
+        let s = wait_for(&bare, "nothing could receive", |s| s.send_seq == 2);
+        assert!(s.send_error.as_deref().unwrap().starts_with("nothing could receive the copy: "), "{:?}", s.send_error);
+        assert_eq!(s.comments.iter().filter(|c| c.is_pending()).count(), 30);
+        assert!(matches!(&s.comments[0].state, comments::CommentState::Unconfirmed { stamp, .. } if Some(stamp.nonce.as_str()) == earlier.as_ref().and_then(|e| e.stamp_nonce())));
     }
 
     #[test]
@@ -5511,18 +5603,19 @@ The three `Done` arms:
         let (_rt, handle) = start_with(sending_config(dir.path(), state.path(), host.clone()));
         ready_to_send(&handle);
         handle.commands.send(Command::Copy(dispatch::CopyRequest { what: dispatch::CopyWhat::Review })).unwrap();
-        let s = wait_for(&handle, "copied", |s| s.copy_seq == 1);
+        // One predicate: the copy's answer and the ready diff the request needs may arrive together.
+        let s = wait_for(&handle, "copied, diff ready", |s| s.copy_seq == 1 && matches!(s.diff, DiffState::Ready(_)));
         assert!(s.copy.as_ref().unwrap().notice.starts_with("copied 2 comments · also in "));
         assert!(s.comments.iter().all(|c| c.is_pending()), "`c` claims nothing");
         // An all-changes request: one entry per row, ranges from the diffs, the selected row's included.
-        wait_for(&handle, "a diff is ready", |s| matches!(s.diff, DiffState::Ready(_)));
         handle.commands.send(Command::Send(dispatch::SendRequest { kind: dispatch::SendKind::Review { scope: dispatch::ReviewScope::All }, accepted: Default::default() })).unwrap();
         let s = wait_for(&handle, "requested", |s| s.send_seq == 1);
         assert!(s.send_error.is_none(), "{:?}", s.send_error);
         let (requests, _) = comments::load_requests(state.path(), &top);
         assert_eq!(requests.len(), 1);
+        // `-U3` context makes a.txt's one hunk span both lines; b.txt is one line.
         let files: Vec<_> = requests[0].files.iter().map(|f| (f.key.path.as_str(), f.additions.clone())).collect();
-        assert_eq!(files, [("a.txt", vec![(2, 2)]), ("b.txt", vec![(1, 1)])]);
+        assert_eq!(files, [("a.txt", vec![(1, 2)]), ("b.txt", vec![(1, 1)])]);
         assert_eq!(requests[0].target, target::Destination::Pane { pane: "w4:p2".into(), agent: "codex".into(), session: Some(host::SessionRef { kind: "id".into(), value: "s1".into() }) });
         let prompts = host.prompts.lock().unwrap().clone();
         assert!(prompts[0].1.starts_with(&format!("> Delegate a code review of these 2 changes:\n> unstaged diff (`git -C '{top}' diff`):\n> ─ a.txt ({top}/a.txt)\n> ─ b.txt ({top}/b.txt)\n>\n")));
@@ -5543,7 +5636,7 @@ The three `Done` arms:
     }
 ```
 
-`config_no_state(dir)` is `config(dir, Arc::new(AtomicBool::new(true)))` with `state_dir` left `None`; write it as a two-line helper beside `config`. The refusal-before-stamp path of the bound is `a_claim_takes_pending...`'s `Err("too large")` case in `comments.rs`; `encoded_len` is proven here on synthetic texts because fifty comments within the caps cannot reach 512 KiB.
+`config_no_state(dir)` is `test_config(dir, Arc::new(AtomicBool::new(true)))` with `state_dir` left `None`; write it as a two-line helper beside `test_config`. `stamp_nonce()` in the clipboard test is a three-line test helper on `CommentState` returning the nonce of an `Unconfirmed` or `Sent` state (`Option<&str>`). The refusal-before-stamp path of the bound is `a_claim_takes_pending...`'s `Err("too large")` case in `comments.rs`; `encoded_len` is proven here on synthetic texts because fifty comments within the caps cannot reach 512 KiB.
 
 Two more session tests, for the late answer and the oversized review:
 
@@ -5559,7 +5652,7 @@ Two more session tests, for the late answer and the oversized review:
         handle.commands.send(feedback(dispatch::Accepted::default())).unwrap();
         let s = wait_for(&handle, "unconfirmed at the wait", |s| s.send_seq == 1);
         assert!(s.send_outcome.as_ref().unwrap().unconfirmed);
-        assert!(s.comments.iter().all(|c| matches!(c.state, comments::CommentState::Unconfirmed(_))));
+        assert!(s.comments.iter().all(|c| matches!(c.state, comments::CommentState::Unconfirmed { .. })));
         // The host's yes arrives 600 ms later and is final.
         wait_for(&handle, "settled late", |s| s.comments.iter().all(|c| matches!(&c.state, comments::CommentState::Sent(st) if st.nonce == "n00001")));
         // A late definite failure returns a record to what it was.
@@ -5569,6 +5662,34 @@ Two more session tests, for the late answer and the oversized review:
         handle.commands.send(feedback(dispatch::Accepted::default())).unwrap();
         wait_for(&handle, "unconfirmed again", |s| s.send_seq == 2 && s.send_outcome.as_ref().is_some_and(|o| o.unconfirmed));
         wait_for(&handle, "returned to pending", |s| s.comments.iter().any(|c| c.text == "third" && c.is_pending()));
+    }
+
+    #[test]
+    fn a_call_that_outlives_the_wait_keeps_the_send_lock_until_it_answers() {
+        let (dir, state, _top, host) = sending_fixture();
+        let mut config = sending_config(dir.path(), state.path(), host.clone());
+        config.host_wait = Duration::from_millis(300);
+        *host.prompt_delay.lock().unwrap() = Some(Duration::from_millis(900));
+        let (_rt, a) = start_with(config);
+        ready_to_send(&a);
+        let dir2 = fixture();
+        let mut config = sending_config(dir2.path(), state.path(), host.clone());
+        config.nonce = Arc::new(|counter| format!("m{counter:05}"));
+        let (_rt2, b) = start_with(config);
+        wait_for(&b, "rows", |s| !s.files.is_empty());
+        b.commands.send(Command::SetTarget(pane_target("w4:p2", "codex", Some("s1")))).unwrap();
+        wait_for(&b, "live", |s| s.target_state == TargetState::Live("idle".into()));
+        b.commands.send(pending(2, "from b")).unwrap();
+        wait_for(&b, "pending", |s| s.comments.len() == 1);
+        a.commands.send(feedback(dispatch::Accepted::default())).unwrap();
+        wait_for(&a, "a unconfirmed at the wait", |s| s.send_seq == 1 && s.send_outcome.as_ref().is_some_and(|o| o.unconfirmed));
+        // a's call is still running; b's send must wait for it, not paste into the same line.
+        b.commands.send(feedback(dispatch::Accepted::default())).unwrap();
+        wait_for(&b, "b sent", |s| s.send_seq == 1 && s.send_error.is_none());
+        let starts = host.prompt_started.lock().unwrap().clone();
+        assert_eq!(starts.len(), 2);
+        assert!(starts[1].duration_since(starts[0]) >= Duration::from_millis(900 + 500), "{:?}", starts[1].duration_since(starts[0]));
+        wait_for(&a, "a settled late", |s| s.comments.iter().all(|c| matches!(c.state, comments::CommentState::Sent(_))));
     }
 
     #[test]
@@ -6308,9 +6429,12 @@ pub struct Rows { /* existing */ pub orphan_tops: Vec<(usize, String)> }   // ro
 pub fn in_place<'a>(comments: &'a [Comment], diff: &LoadedDiff, branch: bool) -> Vec<&'a Comment>;
 /// Pending or unconfirmed comments under the current comparison kind whose row is gone.
 pub fn orphans<'a>(comments: &'a [Comment], snapshot: &Snapshot) -> Vec<&'a Comment>;
-pub fn build(diff: &LoadedDiff, mode: ViewMode, comments: &[&Comment], orphans: &[&Comment], width: usize) -> Rows;
+pub fn build(diff: &LoadedDiff, mode: ViewMode, comments: &[&Comment], orphans: &[&Comment], width: usize, editor: Option<&EditorPlace>) -> Rows;
 /// The body with no diff loaded: the orphan section alone (an empty list with comments left behind).
-pub fn orphans_only(orphans: &[&Comment], width: usize) -> Rows;
+pub fn orphans_only(orphans: &[&Comment], width: usize, editor: Option<&EditorPlace>) -> Rows;
+Row::Editor { line: usize }                       // one per editor line; the text comes from ViewState.editor at draw time
+pub struct EditorPlace { pub after: EditorAnchor, pub lines: usize }
+pub enum EditorAnchor { Anchor(Anchor), Orphan(String), End }
 /// The row a card for `anchor` sits after, in `rows` without cards: the line's row, the range's last, the header.
 pub fn attach_row(diff: &LoadedDiff, row_of_target: &[usize], anchor: &Anchor) -> Option<usize>;
 
@@ -6376,7 +6500,7 @@ mod tests {
     fn titles_name_the_category_state_and_for_an_orphan_the_place() {
         let mut c = test_comment();
         assert_eq!(title(&c, false), "Bug · pending");
-        c.state = crate::engine::comments::CommentState::Unconfirmed(test_stamp());
+        c.state = crate::engine::comments::CommentState::Unconfirmed { stamp: test_stamp(), before: None };
         assert_eq!(title(&c, false), "Bug · sent?");
         c.state = crate::engine::comments::CommentState::Sent(test_stamp());
         assert_eq!(title(&c, true), "src/cart.py:16 · Bug · sent");
@@ -6418,7 +6542,7 @@ mod tests {
         let range = comment("r", &diff.key, Side::Deletions, 11, Span::Range { end: 12 });
         let file = comment("f", &diff.key, Side::Additions, 0, Span::File);
         let orphan = comment("o", &FileKey { path: "gone.rs".into(), staged: false, untracked: false }, Side::Additions, 3, Span::Line);
-        let rows = build(&diff, ViewMode::Unified, &[&line, &range, &file], &[&orphan], 60);
+        let rows = build(&diff, ViewMode::Unified, &[&line, &range, &file], &[&orphan], 60, None);
         let kinds: Vec<String> = rows.rows.iter().map(|r| match r {
             Row::FileHeader { .. } => "H".into(),
             Row::HunkHeader { .. } => "@".into(),
@@ -6527,7 +6651,7 @@ pub fn state_word(state: &CommentState) -> &'static str {
     match state {
         CommentState::Pending => "pending",
         CommentState::Sending { .. } => "sending",
-        CommentState::Unconfirmed(_) => "sent?",
+        CommentState::Unconfirmed { .. } => "sent?",
         CommentState::Sent(_) => "sent",
     }
 }
@@ -6674,7 +6798,7 @@ pub fn orphans<'a>(comments: &'a [Comment], snapshot: &Snapshot) -> Vec<&'a Comm
     let listed: std::collections::HashSet<FileKey> = snapshot.files.iter().map(FileKey::of).collect();
     comments
         .iter()
-        .filter(|c| matches!(c.state, CommentState::Pending | CommentState::Unconfirmed(_)))
+        .filter(|c| matches!(c.state, CommentState::Pending | CommentState::Unconfirmed { .. }))
         .filter(|c| matches!(c.anchor.comparison, AnchorComparison::Branch { .. }) == branch)
         .filter(|c| !listed.contains(&c.anchor.key))
         .collect()
@@ -6693,7 +6817,7 @@ pub fn attach_row(diff: &LoadedDiff, row_of_target: &[usize], anchor: &Anchor) -
 }
 ```
 
-`build` becomes `build(diff, mode, comments: &[&Comment], orphans: &[&Comment], card_width)`, the last argument `cards::card_width(body_width, mode)` computed by the caller: it builds the rows and `row_of_target` as today into `plain`, then splices:
+`build` becomes `build(diff, mode, comments: &[&Comment], orphans: &[&Comment], card_width, editor: Option<&EditorPlace>)`, `card_width` being `cards::card_width(body_width, mode)` computed by the caller and `editor` the open editor's place and height: it builds the rows and `row_of_target` as today into `plain`, then splices the cards, and last the editor's `Row::Editor { line }` rows after the row its `EditorAnchor` names:
 
 ```rust
     let card_width = card_width.max(MIN_WIDTH);
@@ -6731,7 +6855,7 @@ where `row_target(row)` is the target a `Unified` row carries or the first cell 
 - [ ] **Step 5: Run the rows and cards tests**
 
 Run: `cargo test --locked --lib tui::cards && cargo test --locked --lib tui::rows`
-Expected: six pass (the three of each module). Every existing `rows::build(diff, mode)` call in tests and in `state.rs` gains `, &[], &[], 80`.
+Expected: six pass (the three of each module). Every existing `rows::build(diff, mode)` call in tests and in `state.rs` gains `, &[], &[], 80, None`.
 
 - [ ] **Step 6: The editor and the selection, `review.rs`**
 
@@ -6918,7 +7042,7 @@ Tests in `review.rs`: `the_editor_title_names_the_place_and_the_chosen_category`
 
 `RESERVED` shrinks to `["y", "Y", "@", "c", "/"]` (Task 8 finishes it); `KEYS.len()` becomes 35.
 
-2. `state.rs`: the new fields; `reconcile` rebuilds when any of the five parts of `built_from` changed, where the files hash is `(snapshot.scope, snapshot.files.iter().map(FileKey::of))` hashed with `DefaultHasher`, and the width is the body width (`self.width` minus the panel); `rows::build(diff, self.mode, &rows::in_place(&snapshot.comments, diff, branch), &rows::orphans(&snapshot.comments, snapshot), cards::card_width(body_width, self.mode))`. `reconcile` also drops a visual selection whose diff is no longer the one on screen (below). When the diff is not `Ready` but orphans exist, `reconcile` builds `rows::orphans_only(&orphans, body_width)` instead of clearing `self.rows`, with `cursor = None`, and clears it only when there are no orphans either; the five-part `built_from` key is kept with a `None` diff in that case. `observe` gains:
+2. `state.rs`: the new fields; `reconcile` rebuilds when any of the six parts of `built_from` changed (the diff's `Arc`, the mode, the comments' `Arc`, the files hash, the width, the editor's place and line count), where the files hash is `(snapshot.scope, snapshot.files.iter().map(FileKey::of))` hashed with `DefaultHasher`, and the width is the body width (`self.width` minus the panel); `rows::build(diff, self.mode, &rows::in_place(&snapshot.comments, diff, branch), &rows::orphans(&snapshot.comments, snapshot), cards::card_width(body_width, self.mode), self.editor_place().as_ref())`, with `editor_place()` deriving `EditorPlace` from `self.editor` (its anchor, or the orphan id it edits, and `editor.lines(card_width).len()`). `reconcile` also drops a visual selection whose diff is no longer the one on screen (below). When the diff is not `Ready` but orphans exist, `reconcile` builds `rows::orphans_only(&orphans, body_width)` instead of clearing `self.rows`, with `cursor = None`, and clears it only when there are no orphans either; the five-part `built_from` key is kept with a `None` diff in that case. `observe` gains:
 
 ```rust
         if snapshot.comment_seq != self.seen_comment_seq {
@@ -7104,9 +7228,9 @@ pub fn step_on_side(diff: &LoadedDiff, cursor: usize, side: Side, delta: isize) 
 
 The orphan cursor: in `move_cursor`'s `LineDown`, when the cursor is the last target of the unified order (or `targets.len() - 1` in split) and `rows.orphan_tops` is non-empty, set `state.orphan = Some(0)` and keep the cursor; with **no targets at all** (an empty list, or a diff that is not `Ready`, with orphans drawn by `orphans_only`), `LineDown` from nothing sets `orphan = Some(0)` too, which is the entry path into an orphan-only view; `LineDown` on orphan `n` moves to `n + 1` while one exists; `LineUp` on orphan 0 clears `orphan` (and leaves the cursor where it was, or nowhere); `LineUp` on `n` moves to `n - 1`; every other movement key clears `orphan`. `keep_cursor_visible` scrolls to `orphan_tops[n].0` when `orphan` is set. `move_cursor`'s early return on `(DiffState::Ready, Some(cursor))` must therefore give way to the orphan rules before it returns `Inert`.
 
-4. `view.rs`: `body_line`'s two card arms are Step 4's; here they gain the cursor: an orphan card under the orphan cursor is drawn in reverse video as a cursor row is. `Action` gains `EditorCategory(Category)` (`key_action()` → `None`), handled in `handle_mouse`'s click arm by setting the open editor's category. When the diff is not `Ready` but `rows::orphans` is non-empty, `render` draws `state.rows` (built by `orphans_only`) instead of `state_message`'s centred text, so an empty list with comments left behind shows the orphan section, not `working tree clean`. The editor splice: in `render`'s row loop, after drawing the row the editor sits under, emit `editor.lines(card_width)` with `frame_top(editor.title(), …)` on the first and `frame_bottom(EDITOR_FOOTER, …)` on the last, each consuming one screen row. The row it sits under is `rows::attach_row(diff, &rows.row_of_target, &editor.anchor)` for an anchor in the loaded diff; for an orphan being edited (`editor.editing` names an id in `rows.orphan_tops`) it is the last `Row::Card` row carrying that id, so the editor replaces the card visually; with neither (the anchor's line is not in the diff), the editor is drawn after the last body row. The title line pushes one hit per category word, `Action::EditorCategory(Category)`, and a click sets `editor.category` (spec 10.3's clickable words); the text rows push no hit. `view::body_is_drawn` stays true while the editor is open (it is a card, not a modal).
+4. `view.rs`: `body_line`'s two card arms are Step 4's; here they gain the cursor: an orphan card under the orphan cursor is drawn in reverse video as a cursor row is. `Action` gains `EditorCategory(Category)` (`key_action()` → `None`), handled in `handle_mouse`'s click arm by setting the open editor's category. The editor is modal for the mouse as the y/n box is: while `state.editor.is_some()`, `handle_mouse` handles `EditorCategory` clicks and the wheel (scrolling the body) and nothing else, so a click on the toolbar, the files panel or a diff row cannot open a picker, a box or another action under an open editor; a test, `clicks_under_an_open_editor_are_inert_except_the_category_words`, presses a toolbar hit and a file hit while editing and asserts `Outcome::Inert`, then clicks a category word and asserts the category changed. When the diff is not `Ready` but `rows::orphans` is non-empty, `render` draws `state.rows` (built by `orphans_only`) instead of `state_message`'s centred text, so an empty list with comments left behind shows the orphan section, not `working tree clean`. The editor's rows are real rows, so one coordinate system serves scrolling, hits and drawing: `Row::Editor { line: usize }`, one per line of `editor.lines(card_width)`, spliced by `rows::build` (and `orphans_only`) after the row the editor sits under, which `build` receives as `editor: Option<EditorPlace>` with `EditorPlace { after: EditorAnchor, lines: usize }` and `enum EditorAnchor { Anchor(Anchor), Orphan(String) /* the card's id */, End }`: the anchor's row through `attach_row` for an anchor in the loaded diff, the last `Row::Card` row carrying the id for an orphan being edited (the editor replaces the card visually), the last body row when the anchor's line is not in the diff. The rows carry no text; `view::body_line` draws `Row::Editor { line }` from `state.editor.lines(card_width)[line]`, `frame_top(editor.title(), …)` for the first, `frame_bottom(EDITOR_FOOTER, …)` for the last, so typing never rebuilds the rows: `reconcile`'s key gains `(editor anchor, line count)` and rebuilds only when the editor opens, closes, moves or grows a line, which is rare and cheap. The title line pushes one hit per category word, `Action::EditorCategory(Category)`, and a click sets `editor.category` (spec 10.3's clickable words); the text rows push no hit. `view::body_is_drawn` stays true while the editor is open (it is a card, not a modal).
 
-The editor must be on screen while it is typed into: `ViewState::editor_span(&self) -> Option<LineSpan>` returns the row it sits under and its height (`editor.lines(card_width).len()`), and `keep_cursor_visible` (called by `reconcile` and after every editor key, through `input.rs`) scrolls so that span is visible, with `ensure_visible` over `start..start + height + 1`; when the editor is taller than the body, the offset is set so its last row (the caret's) is the bottom row. Tests in `state.rs`: `an_editor_opened_on_the_bottom_row_scrolls_into_view` (a 40-target diff in a 10-row body, the editor opened on the last target, the editor's bottom row within the viewport) and `an_editor_taller_than_the_body_keeps_its_caret_visible` (120 lines typed through `ctrl+j`, the last rendered row carries `_`). `files_lines`: the `✎` cell before the marker when any comment of the file exists under the current comparison kind (`snapshot.comments.iter().any(|c| c.anchor.key.path == file.path && kind matches)`), the name fitted to `FILES_WIDTH - 3`; the header `CHANGED {n} · ✎ {pending}` when `pending > 0`, counting `comments.iter().filter(|c| c.is_pending()).count()` across both scopes. Card rows push `Action::CursorToRow(row)` hits as other rows do; `CursorToRow` on a card row with `target: Some(t)` sets the cursor to `t` (in `handle_mouse`'s click arm: look the row up in `state.rows`).
+With the editor's rows in `rows`, keeping it on screen is the existing machinery: `keep_cursor_visible` scrolls to the span from the editor's first row to its last (`ensure_visible` over `first..=last`), after `reconcile` and after every editor key; when the editor is taller than the body, the offset puts its last row (the caret's) on the bottom row, and the anchor above scrolls out as any row does. Tests in `state.rs`: `an_editor_opened_on_the_bottom_row_scrolls_into_view` (a 40-target diff in a 10-row body, the editor opened on the last target, its bottom row within the viewport), `an_editor_taller_than_the_body_keeps_its_caret_visible` (120 lines typed through `ctrl+j`, the last rendered row carries `_`), and `a_partially_visible_editor_whose_anchor_scrolled_away_still_draws` (the offset moved past the anchor row by `ctrl+d`: the editor's remaining rows are drawn at the top of the body, nothing is skipped). `files_lines`: the `✎` cell before the marker when any comment of the file exists under the current comparison kind (`snapshot.comments.iter().any(|c| c.anchor.key.path == file.path && kind matches)`), the name fitted to `FILES_WIDTH - 3`; the header `CHANGED {n} · ✎ {pending}` when `pending > 0`, counting `comments.iter().filter(|c| c.is_pending()).count()` across both scopes. Card rows push `Action::CursorToRow(row)` hits as other rows do; `CursorToRow` on a card row with `target: Some(t)` sets the cursor to `t` (in `handle_mouse`'s click arm: look the row up in `state.rows`).
 
 - [ ] **Step 8: Input and view tests**
 
@@ -7181,7 +7305,7 @@ The tests that follow start from `review_setup` where they need a listed file, l
         st.observe(&snap);
         assert!(st.panes.is_none());
         let editor = st.editor.as_ref().expect("the editor opened on the kept anchor");
-        assert_eq!(editor.place_label(), "R12");   // the first target of the fixture
+        assert_eq!(editor.place_label(), "L11");   // the fixture's first changed row is the deletion of old line 11
     }
 
     #[test]
@@ -7194,7 +7318,7 @@ The tests that follow start from `review_setup` where they need a listed file, l
         handle_key(&mut st, &snap, key("ctrl+l"), 120);
         let outcome = handle_key(&mut st, &snap, key("Enter"), 120);
         let Outcome::Engine(Command::AddComment { anchor, category, text }) = outcome else { panic!("{outcome:?}") };
-        assert_eq!((anchor.line, category, text.as_str()), (12, comments::Category::Bug, "needs a test"));
+        assert_eq!((anchor.side, anchor.line, category, text.as_str()), (Side::Deletions, 11, comments::Category::Bug, "needs a test"));
         assert!(st.editor.is_none());
         // Two cards on the line: u and x take the most recent.
         let older = comment_at(&anchor, "older", 1);
@@ -7285,7 +7409,7 @@ The tests that follow start from `review_setup` where they need a listed file, l
         let gone = comment_at(&Anchor { key: FileKey { path: "gone".into(), staged: false, untracked: false }, side: Side::Additions, line: 1, span: comments::Span::Line, comparison: comments::AnchorComparison::Worktree }, "left behind", 1);
         let mut unsure = gone.clone();
         unsure.id = "u".into();
-        unsure.state = comments::CommentState::Unconfirmed(stamp());
+        unsure.state = comments::CommentState::Unconfirmed { before: None, stamp: stamp());
         snap.comments = std::sync::Arc::new(vec![gone.clone(), unsure.clone()]);
         st.observe(&snap);
         st.reconcile(&snap);
@@ -7381,7 +7505,7 @@ In `review.rs`'s tests:
         }
         for i in 0..unconfirmed {
             let mut c = comment_at(&anchor("other.rs", 1), &format!("u{i}"), 100 + i as u64);
-            c.state = CommentState::Unconfirmed(stamp("aaaaaa"));
+            c.state = CommentState::Unconfirmed { before: None, stamp: stamp("aaaaaa") };
             comments.push(c);
         }
         s.comments = std::sync::Arc::new(comments);
@@ -7445,11 +7569,16 @@ In `review.rs`'s tests:
         assert_eq!(texts(&refused.panel(&s, 60))[0], "codex in w4:p2 was restarted since you picked it and has not seen earlier messages.");
         assert_eq!(refused.offers(&s).y, Some("send anyway"));
         let Some(Command::Send(request)) = refused.submit(&s) else { panic!() };
-        assert_eq!(request.accepted, Accepted { busy: false, restarted: Some(session.clone()) });
+        assert_eq!(request.accepted, Accepted { busy: false, restarted: Some(Some(session.clone())) });
         // A second refusal for the other gate adds to what was accepted; nothing is forgotten.
         refused.refuse("codex is working in w4:p2; the review would queue behind its current turn.".into(), Refusal::Busy);
         let Some(Command::Send(request)) = refused.submit(&s) else { panic!() };
-        assert_eq!(request.accepted, Accepted { busy: true, restarted: Some(session) }, "a restarted and working agent asks twice, not forever");
+        assert_eq!(request.accepted, Accepted { busy: true, restarted: Some(Some(session)) }, "a restarted and working agent asks twice, not forever");
+        // A restart into an agent with no session is accepted as that absence, not as "no restart".
+        let mut sessionless = ReviewBox::finish();
+        sessionless.refuse("codex in w4:p2 was restarted since you picked it and has not seen earlier messages.".into(), Refusal::Restarted(None));
+        let Some(Command::Send(request)) = sessionless.submit(&s) else { panic!() };
+        assert_eq!(request.accepted.restarted, Some(None));
         let mut other = ReviewBox::finish();
         other.refuse("could not verify w4:p2: deadline".into(), Refusal::Other);
         assert_eq!(other.offers(&s).y, Some("send"), "an unacceptable refusal keeps a plain retry");
@@ -7537,11 +7666,11 @@ pub struct ReviewBox {
 /// Pending comments, unconfirmed ones, and the files they are on, across both scopes.
 pub fn counts(snapshot: &Snapshot) -> (usize, usize, usize) {
     let pending = snapshot.comments.iter().filter(|c| c.is_pending()).count();
-    let unconfirmed = snapshot.comments.iter().filter(|c| matches!(c.state, CommentState::Unconfirmed(_))).count();
+    let unconfirmed = snapshot.comments.iter().filter(|c| matches!(c.state, CommentState::Unconfirmed { .. })).count();
     let files: std::collections::HashSet<&str> = snapshot
         .comments
         .iter()
-        .filter(|c| matches!(c.state, CommentState::Pending | CommentState::Unconfirmed(_)))
+        .filter(|c| matches!(c.state, CommentState::Pending | CommentState::Unconfirmed { .. }))
         .map(|c| c.anchor.key.path.as_str())
         .collect();
     (pending, unconfirmed, files.len())
@@ -7579,7 +7708,8 @@ impl ReviewBox {
     pub fn refuse(&mut self, message: String, refusal: Refusal) {
         match &refusal {
             Refusal::Busy => self.accepted.busy = true,
-            Refusal::Restarted(session) => self.accepted.restarted = session.clone(),
+            // `Some(None)` accepts a restart into an agent that reports no session.
+            Refusal::Restarted(session) => self.accepted.restarted = Some(session.clone()),
             Refusal::Other => {}
         }
         self.refusal = Some((message, refusal));
@@ -7701,7 +7831,7 @@ impl ReviewBox {
                 TargetState::Restarted(_) => {
                     // The chip does not carry the new session, so this names the old one; the engine
                     // refuses with the session it found and `refuse` folds that in for the next Y.
-                    accepted.restarted = snapshot.target.as_ref().and_then(|t| match t { Target::Pane { session, .. } => session.clone(), _ => None });
+                    accepted.restarted = Some(snapshot.target.as_ref().and_then(|t| match t { Target::Pane { session, .. } => session.clone(), _ => None }));
                 }
                 _ => {}
             }
@@ -8124,9 +8254,8 @@ fn the_review_loop_talks_to_the_host_alone_and_writes_only_its_files() {
     assert!(std::fs::read_to_string(state.path().join("clipboard.md")).unwrap().starts_with("> Inline review — 1 item."));
     assert!(s.comments[0].is_pending(), "a copy stamps nothing");
     handle.commands.send(Command::Send(SendRequest { kind: SendKind::Feedback, accepted: Accepted::default() })).unwrap();
-    let s = recv("sent", &|s| s.send_seq == 1);
+    let s = recv("sent, diff ready", &|s| s.send_seq == 1 && matches!(s.diff, DiffState::Ready(_)));
     assert!(s.send_error.is_none(), "{:?}", s.send_error);
-    recv("a diff", &|s| matches!(s.diff, DiffState::Ready(_)));
     handle.commands.send(Command::Send(SendRequest { kind: SendKind::Review { scope: ReviewScope::All }, accepted: Accepted::default() })).unwrap();
     let s = recv("requested", &|s| s.send_seq == 2);
     assert!(s.send_error.is_none(), "{:?}", s.send_error);
@@ -8145,10 +8274,10 @@ fn the_review_loop_talks_to_the_host_alone_and_writes_only_its_files() {
     assert!(prompts.iter().all(|p| p["params"].get("wait").is_none()));
     fake.stop();
 
-    // Every git call is one of the ten reads; the request's diff loads among them.
+    // Every git call is one of the ten reads (`--version` among them); the request's diff loads too.
     let recorded = std::fs::read_to_string(&log).unwrap();
     for line in recorded.lines() {
-        let sub = line.split_whitespace().find(|w| !w.starts_with('-') && *w != "-C" && !w.starts_with('/')).unwrap_or("");
+        let sub = subcommand_of(line);
         assert!(ALLOWED.contains(&sub), "`{line}` runs {sub}, which is not allow-listed");
     }
     // The state directory holds what the script wrote and nothing else.
@@ -8163,7 +8292,7 @@ fn the_review_loop_talks_to_the_host_alone_and_writes_only_its_files() {
 }
 ```
 
-`FakeHerdr::all_calls()` is a one-line addition to `tests/support/mod.rs` returning every recorded request. The `-C <toplevel>` argument of the engine's git calls means the subcommand is the first word that is neither a flag, `-C` nor a path; the first test's parser does the same thing differently — copy its approach rather than this sketch if it is simpler. The file list is the one this script produces: no base is picked and no mark made, so `bases.json` and `marks.json` are absent. Spec 10.6 and 10.9 (test 10) list eight files for this script; amend both sentences in this task's commit to "the files the script writes: `targets.json`, `comments.json`, `requests.json`, `clipboard.md`, `send.lock` and `split-panes.lock`, and `bases.json`/`marks.json` only when a base or a mark was made" — the guarantee is "nothing else", which the assertion keeps exact.
+`FakeHerdr::all_calls()` is a one-line addition to `tests/support/mod.rs` returning every recorded request. `subcommand_of(line)` is the first test's subcommand parser factored into a function the two tests share: it skips `-C <directory>` pairs and nothing else, so `--version`, which `SessionConfig::production` runs at start, is read as the subcommand it is. The file list is the one this script produces: no base is picked and no mark made, so `bases.json` and `marks.json` are absent. Spec 10.6 and 10.9 (test 10) list eight files for this script; amend both sentences in this task's commit to "the files the script writes: `targets.json`, `comments.json`, `requests.json`, `clipboard.md`, `send.lock` and `split-panes.lock`, and `bases.json`/`marks.json` only when a base or a mark was made" — the guarantee is "nothing else", which the assertion keeps exact.
 
 - [ ] **Step 2: Run it**
 
@@ -8190,11 +8319,13 @@ In `tests/e2e_real_herdr.rs`, after the hunk-action block (`staged hunk 1/1 of a
         iso.herdr(&["pane", "wait-output", viewer_id, "--match", "to the clipboard?", "--source", "visible", "--timeout", "15000"]);
         iso.herdr(&["pane", "send-text", viewer_id, "Y"]);
         wait_for("clipboard.md holds the review", || {
-            std::fs::read_to_string(state_dir.join("clipboard.md")).map(|t| t.starts_with("> Inline review — 1 item.")).unwrap_or(false)
+            host_paths(&iso.root, Path::new("clipboard.md"))
+                .iter()
+                .any(|p| std::fs::read_to_string(p).map(|t| t.starts_with("> Inline review — 1 item.")).unwrap_or(false))
         });
 ```
 
-`send_enter` is a helper on the isolated-host struct that sends the Enter key through the host's key command (`herdr pane send-keys <id> enter` on herdr; check `herdr pane` for the exact name on each host and keep the fallback `send-text` with `"\r"` if the host accepts it). `state_dir` is the isolated session's `HERDR_PLUGIN_STATE_DIR`, which the test already sets for the plugin. The assertion is on the file, not the OSC sequence: whether the host forwards OSC 52 is the open question 10.4 names, and this is the first place it is tried by hand (acceptance row 10 records the answer).
+`send_enter` is a helper on the isolated-host struct that sends the Enter key through the host's key command (`herdr pane send-keys <id> enter` on herdr; check `herdr pane` for the exact name on each host and keep the fallback `send-text` with `"\r"` if the host accepts it). The plugin's state directory is not set by the test: the host runs the viewer with its own `HERDR_PLUGIN_STATE_DIR` under the isolated session's state root, so the test finds the file as it finds the plugin's other files, with the existing `host_paths(root, suffix)` helper: `wait_for("clipboard.md holds the review", || host_paths(&iso.root, Path::new("clipboard.md")).iter().any(|p| std::fs::read_to_string(p).map(|t| t.starts_with("> Inline review — 1 item.")).unwrap_or(false)))`, `iso.root` being the isolated XDG root the test already creates. The assertion is on the file, not the OSC sequence: whether the host forwards OSC 52 is the open question 10.4 names, and this is the first place it is tried by hand (acceptance row 10 records the answer).
 
 Run as `docs/acceptance-p1.md` says, against both hosts. Expected: green on herdr 0.8.0 and vimeflow-terminal 0.8.0.
 
@@ -8341,7 +8472,7 @@ The acceptance row's evidence and `Status: PASS` are a separate commit after the
 - **10.8**: boundaries honoured by construction: no key of section 9 is touched; `to` and `requests.json` carry what part 2 needs (Tasks 3, 5); nothing here reads a pane or a transcript.
 - **10.9 tests 1-11**: 1 Task 2; 2 Task 2 and Task 6; 3 Task 3; 4 Task 5; 5 Task 5; 6 Task 4; 7 Task 1; 8 Tasks 6, 7, 8; 9 Tasks 6, 7, 8; 10 Task 9; 11 Task 9. Criteria 12-17: acceptance row 10 (Task 9).
 
-Placeholder scan: none. Type consistency: `HostFailure`, `PaneRecord`, `SessionRef`, `Target`, `TargetState`, `Destination`, `Comment`, `Anchor`, `Span`, `AnchorComparison`, `Category`, `CommentState`, `Stamp`, `Operation`, `Store`, `Claimed`, `Settlement`, `RequestRecord`, `RequestFile`, `StoreOp`, `SendRequest`, `Accepted`, `SendKind`, `ReviewScope`, `CopyRequest`, `CopyWhat`, `CopyOut`, `SendOutcome`, `Finished`, `Refusal`, `PanePicker`, `Choice`, `ReturnTo`, `CardLine`, `Editor`, `Visual`, `ReviewBox`, `Offers` are each defined once and used by those names throughout; `call_host` is defined in Task 2 and moved to `dispatch` in Task 5, which the Task 5 text says; `NOTICE_NOTHING` is `comments.rs`'s and re-exported by `dispatch`. Three deliberate simplifications are recorded above: the Finish box names the pane rather than its directory (the target record carries none), a `Y` on a box opened on `Restarted` costs one extra press (Task 8), and the chip's clickable style takes a tone override rather than a new span kind (Task 6).
+Placeholder scan: none. Type consistency: `HostFailure`, `PaneRecord`, `SessionRef`, `Target`, `TargetState`, `Destination`, `Comment`, `Anchor`, `Span`, `AnchorComparison`, `Category`, `CommentState`, `Stamp`, `Operation`, `Store`, `Claimed`, `Settlement`, `RequestRecord`, `RequestFile`, `StoreOp`, `SendRequest`, `Accepted`, `SendKind`, `ReviewScope`, `CopyRequest`, `CopyWhat`, `CopyOut`, `SendOutcome`, `Finished`, `Refusal`, `SendLock`, `PanePicker`, `Choice`, `ReturnTo`, `CardLine`, `EditorPlace`, `EditorAnchor`, `Editor`, `Visual`, `ReviewBox`, `Offers` are each defined once and used by those names throughout; `call_host` is defined in Task 2 and moved to `dispatch` in Task 5, which the Task 5 text says; `NOTICE_NOTHING` is `comments.rs`'s and re-exported by `dispatch`. Three deliberate simplifications are recorded above: the Finish box names the pane rather than its directory (the target record carries none), a `Y` on a box opened on `Restarted` costs one extra press (Task 8), and the chip's clickable style takes a tone override rather than a new span kind (Task 6).
 
 ## Review notes
 
@@ -8404,3 +8535,27 @@ two call starts. Cards are wrapped and framed at one width (`cards::card_width`)
 editor scrolls itself into view and keeps its caret visible, a visual selection is bound to
 its `Arc<LoadedDiff>` and dropped with it, and the acceptance row writes a fresh comment
 before each gate it exercises.
+
+**Round 3 (codex, plan-complete, 2026-10-04).** Seventeen findings, all applied. Three
+were data-loss paths my earlier rounds had opened: `read_and_apply` now sets `others`, so
+a claim or settlement writes every worktree's records back (tested across two worktrees);
+`Unconfirmed` keeps the `before` stamp through the timeout, so a late definite failure
+restores the earlier correlation instead of `Pending`; and a prompt call that outlives the
+engine's wait carries the send lock with it, released after the host answers plus the
+Enter margin (tested with two viewers and a delayed late answer). `Accepted.restarted`
+became `Option<Option<SessionRef>>`, so a restart into an agent that reports no session is
+acceptable as that absence. Nonces are checked against every worktree's records in both
+files, and claims are numbered by creation time. The store opens on the blocking pool
+(`Done::StoreOpened`), the editor's rows are real rows (`Row::Editor`, rebuilt only when
+the editor opens, closes, moves or grows), the mouse is modal while editing, and Tier B
+finds `clipboard.md` through `host_paths`. Compilation and fixture repairs: the nineteen
+`SessionConfig` literals of the session tests take struct-update defaults; the test
+helper is `test_config` so locals named `config` do not shadow it; a shadowed `rows`
+local, a duplicated target extraction and an obsolete `record_request_fresh` call were
+removed; `record_request_fresh`, `remove_request`, `write_clipboard` and the
+delayed-adoption test moved to Task 3, where their dependencies are; the settlement test
+no longer re-claims a sent record; the request test expects the `-U3` range `(1, 2)`; the
+editor tests expect the fixture's first changed row, `L11`; the recording test reuses the
+first test's subcommand parser; waits that could consume each other's snapshot were
+combined; and the clipboard send is tested over the OSC limit with and without a writable
+directory.
