@@ -3,6 +3,7 @@ pub mod actions;
 pub mod base;
 pub mod branch;
 pub mod gitver;
+pub mod host;
 pub mod marks;
 pub mod nav;
 pub mod sections;

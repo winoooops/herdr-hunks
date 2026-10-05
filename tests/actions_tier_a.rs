@@ -550,3 +550,77 @@ fn update_host_failure_diagnostics_replace_controls() {
         "herdr-hunks: plugin list failed: host\u{fffd}[31m\u{fffd}failure\n"
     );
 }
+
+// The silent reply exercises the full five-second deadline.
+#[test]
+fn the_host_client_speaks_the_three_methods_over_the_socket() {
+    use herdr_hunks::engine::host::{HerdrHost, HostClient, HostFailure};
+    let dir = tempfile::tempdir().unwrap();
+    let fake = support::FakeHerdr::start(dir.path());
+    fake.set_panes(serde_json::json!([
+        { "pane_id": "w1:p2", "agent": "codex", "agent_status": "idle", "cwd": "/r",
+          "agent_session": { "kind": "id", "value": "s-1" } }
+    ]));
+    let host = HerdrHost::new(fake.socket_path.clone());
+    fake.delay_replies(Some(Duration::from_millis(20)));
+    let pane = host.pane_get("w1:p2").unwrap();
+    fake.delay_replies(None);
+    assert_eq!(
+        (pane.agent.as_deref(), pane.agent_status.as_deref()),
+        (Some("codex"), Some("idle"))
+    );
+    assert_eq!(host.pane_list().unwrap().len(), 1);
+    host.agent_prompt("w1:p2", "> hello\n").unwrap();
+    let prompts = fake.calls_named("agent.prompt");
+    assert_eq!(
+        prompts[0]["params"],
+        serde_json::json!({ "target": "w1:p2", "text": "> hello\n" })
+    );
+    assert!(prompts[0]["params"].get("wait").is_none());
+    fake.fail_prompt("agent_not_ready", "blocked");
+    assert_eq!(
+        host.agent_prompt("w1:p2", "x"),
+        Err(HostFailure::Api {
+            code: "agent_not_ready".into(),
+            message: "blocked".into()
+        })
+    );
+    fake.clear_prompt_failure();
+    fake.go_silent(true);
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        host.agent_prompt("w1:p2", "x"),
+        Err(HostFailure::After(_))
+    ));
+    assert!(
+        started.elapsed() >= herdr_hunks::herdr::client::DEADLINE,
+        "the silent host held the stream open and the deadline decided"
+    );
+    fake.go_silent(false);
+    // A reply the client cannot understand after writing is uncertain, never a success.
+    fake.reply_raw(Some(serde_json::json!({})));
+    assert!(matches!(
+        host.agent_prompt("w1:p2", "x"),
+        Err(HostFailure::After(_))
+    ));
+    fake.reply_raw(Some(serde_json::Value::Null));
+    assert!(matches!(
+        host.agent_prompt("w1:p2", "x"),
+        Err(HostFailure::After(_))
+    ));
+    fake.reply_raw(Some(serde_json::json!({ "result": { "type": "pong" } })));
+    assert!(
+        matches!(host.agent_prompt("w1:p2", "x"), Err(HostFailure::After(_))),
+        "another method's success is not this one's"
+    );
+    fake.reply_raw(None);
+    assert!(
+        matches!(host.pane_get("w9:p9"), Err(HostFailure::Api { code, .. }) if code == "pane_not_found")
+    );
+    fake.stop();
+    // The socket file is gone: NoHost, not a phase.
+    assert!(matches!(
+        host.pane_get("w1:p2"),
+        Err(HostFailure::NoHost(_))
+    ));
+}

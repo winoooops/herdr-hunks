@@ -8,6 +8,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Semaphore;
 
 use super::base::{self, MarkRecord, ResolveInputs};
+use super::host;
 use super::{
     actions, branch, gitver, marks, worktree, Action, Base, BaseSource, Command, Comparison,
     DiffState, FileKey, LoadedDiff, Mark, MarkState, PreImage, QuickBase, RepoState, Scope,
@@ -41,6 +42,10 @@ pub struct SessionConfig {
     pub diff_gate: Option<Arc<Semaphore>>,
     /// Test seam: a refresh sleeps this long before its status read; `None` in production.
     pub status_delay: Option<Duration>,
+    /// The host, `None` outside one: every pane target is then `NoHost` (spec 10.6).
+    pub host: Option<Arc<dyn host::HostClient>>,
+    /// `HERDR_SOCKET_PATH` as the shell read it; a remembered target names the socket it was picked on.
+    pub socket_path: Option<String>,
 }
 
 pub struct EngineHandle {
@@ -94,6 +99,8 @@ impl SessionConfig {
             diff_delay: None,
             diff_gate: None,
             status_delay: None,
+            host: None,
+            socket_path: None,
         }
     }
 }
@@ -1563,30 +1570,28 @@ mod tests {
         }
     }
 
+    fn test_config(dir: &std::path::Path, allow: Arc<AtomicBool>) -> SessionConfig {
+        let mut config = SessionConfig::production(dir.to_path_buf());
+        config.poll_interval = Duration::from_millis(50);
+        config.watcher = Arc::new(FlakyWatcher { allow });
+        config.git_check = ok_git();
+        config
+    }
+
     fn start(
         dir: &std::path::Path,
         allow: Arc<AtomicBool>,
     ) -> (tokio::runtime::Runtime, EngineHandle) {
+        start_from(test_config(dir, allow))
+    }
+
+    fn start_from(config: SessionConfig) -> (tokio::runtime::Runtime, EngineHandle) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .unwrap();
-        let handle = spawn(
-            rt.handle(),
-            SessionConfig {
-                scope: Scope::Worktree,
-                base_ref: None,
-                state_dir: None,
-                path: dir.to_path_buf(),
-                poll_interval: Duration::from_millis(50),
-                watcher: Arc::new(FlakyWatcher { allow }),
-                git_check: ok_git(),
-                diff_delay: None,
-                diff_gate: None,
-                status_delay: None,
-            },
-        );
+        let handle = spawn(rt.handle(), config);
         (rt, handle)
     }
 
@@ -1607,6 +1612,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("timed out waiting for: {what}; last = {last:?}");
+    }
+
+    fn wait_cond(what: &str, mut check: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if check() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timed out waiting for: {what}");
     }
 
     fn ready(s: &Snapshot) -> Option<&LoadedDiff> {
@@ -1660,6 +1676,7 @@ mod tests {
                 diff_delay: None,
                 diff_gate: None,
                 status_delay: None,
+                ..SessionConfig::production(dir.path().to_path_buf())
             },
         );
         wait_for(&h, "first ready diff", |s| ready(s).is_some());
@@ -1801,6 +1818,7 @@ mod tests {
                 diff_delay: None,
                 diff_gate: None,
                 status_delay: None,
+                ..SessionConfig::production(dir.path().to_path_buf())
             },
         );
         wait_for(&h, "first", |s| ready(s).is_some());
@@ -1842,6 +1860,7 @@ mod tests {
                 diff_delay: Some(Duration::from_millis(400)),
                 diff_gate: None,
                 status_delay: None,
+                ..SessionConfig::production(dir.path().to_path_buf())
             },
         );
         wait_for(&h, "a diff despite constant polling", |s| {
@@ -1873,6 +1892,7 @@ mod tests {
                 diff_delay: None,
                 diff_gate: Some(gate.clone()),
                 status_delay: None,
+                ..SessionConfig::production(dir.path().to_path_buf())
             },
         );
         // release the initial load, then hold the selected diff (D1).
@@ -1978,6 +1998,7 @@ mod tests {
                 diff_delay: None,
                 diff_gate: None,
                 status_delay: None,
+                ..SessionConfig::production(dir.path().to_path_buf())
             },
         );
         for _ in 0..3 {
@@ -2026,6 +2047,7 @@ mod tests {
                 diff_delay: None,
                 diff_gate: None,
                 status_delay: None,
+                ..SessionConfig::production(dir.path().to_path_buf())
             },
         );
         h.commands.send(Command::Shutdown).unwrap();
@@ -2039,7 +2061,7 @@ mod tests {
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         assert_eq!(stops.load(Ordering::SeqCst), 0);
         release.notify_one();
-        wait_until(|| (stops.load(Ordering::SeqCst) > 0).then_some(()));
+        wait_cond("watcher stopped", || stops.load(Ordering::SeqCst) > 0);
         assert_eq!(stops.load(Ordering::SeqCst), 1);
     }
 
@@ -2079,6 +2101,7 @@ mod tests {
                 diff_delay: None,
                 diff_gate: None,
                 status_delay: None,
+                ..SessionConfig::production(dir.path().to_path_buf())
             },
         );
         let s = wait_for(&h, "missing git reported", |s| s.status_error.is_some());
@@ -2109,6 +2132,7 @@ mod tests {
                 diff_delay: None,
                 diff_gate: None,
                 status_delay: None,
+                ..SessionConfig::production(dir.path().to_path_buf())
             },
         );
         wait_for(
@@ -2141,6 +2165,7 @@ mod tests {
                 diff_delay: Some(Duration::from_millis(400)),
                 diff_gate: None,
                 status_delay: None,
+                ..SessionConfig::production(dir.path().to_path_buf())
             },
         );
         wait_for(&h, "first", |s| ready(s).is_some());
@@ -2186,6 +2211,7 @@ mod tests {
                 diff_delay: Some(Duration::from_millis(300)),
                 diff_gate: None,
                 status_delay: None,
+                ..SessionConfig::production(dir.path().to_path_buf())
             },
         );
         wait_for(&h, "first", |s| ready(s).is_some());
@@ -2329,6 +2355,7 @@ mod tests {
                 scope,
                 base_ref: None,
                 state_dir,
+                ..SessionConfig::production(dir.to_path_buf())
             },
         );
         (rt, handle)
@@ -3815,6 +3842,7 @@ mod tests {
                 diff_delay: None,
                 diff_gate: None,
                 status_delay: None,
+                ..SessionConfig::production(dir.to_path_buf())
             },
         );
         (rt, handle)
@@ -3845,6 +3873,7 @@ mod tests {
                 diff_delay: None,
                 diff_gate: None,
                 status_delay: Some(status_delay),
+                ..SessionConfig::production(dir.to_path_buf())
             },
         );
         (rt, handle)
@@ -3875,6 +3904,7 @@ mod tests {
                 diff_delay: None,
                 diff_gate: Some(gate),
                 status_delay: None,
+                ..SessionConfig::production(dir.to_path_buf())
             },
         );
         (rt, handle)
@@ -4499,6 +4529,7 @@ mod tests {
                 diff_delay: Some(Duration::from_millis(400)),
                 diff_gate: None,
                 status_delay: None,
+                ..SessionConfig::production(p.to_path_buf())
             },
         );
         let s = select(&h, "u.txt", false, true);
@@ -4620,6 +4651,7 @@ mod tests {
                 diff_gate: None,
                 // Every refresh, the carrying one included, stays in flight 400 ms after its forms.
                 status_delay: Some(Duration::from_millis(400)),
+                ..SessionConfig::production(p.to_path_buf())
             },
         );
         let s = select(&h, "u.txt", false, true);

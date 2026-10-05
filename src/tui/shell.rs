@@ -250,6 +250,8 @@ pub fn run(path: PathBuf) -> i32 {
     session.scope = config.scope;
     session.base_ref = config.base.clone();
     session.state_dir = config::state_dir(lookup);
+    session.host = engine::host::from_env();
+    session.socket_path = std::env::var("HERDR_SOCKET_PATH").ok();
     let handle = engine::spawn(runtime.handle(), session);
     install_panic_hook();
     let result = run_terminal(&handle, &config, notice, &path);
