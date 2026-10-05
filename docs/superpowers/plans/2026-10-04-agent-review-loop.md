@@ -974,9 +974,10 @@ pub fn check_session(session: &SessionRef) -> bool;    // kind id|path; value pr
 /// Keyed by canonical toplevel; a record failing its shape is dropped with the reason.
 pub fn load_targets(state_dir: &Path) -> (BTreeMap<String, Target>, Option<String>);
 pub fn save_target(state_dir: &Path, toplevel: &str, target: &Target) -> std::io::Result<()>;
-/// `save_target` that writes only while `latest` still equals `generation` (checked under the lock),
-/// so a slow write for an older pick can never overwrite a newer one. `Ok(false)` means skipped.
-pub fn save_target_if(state_dir: &Path, toplevel: &str, target: &Target, generation: u64, latest: &AtomicU64) -> std::io::Result<bool>;
+/// `save_target` that writes only while `latest` still equals `ticket` (checked under the lock): every target
+/// write takes the next ticket when it is requested, so a slow older write, for another pick or for this
+/// pick before an adoption, can never overwrite a newer one. `Ok(false)` means skipped.
+pub fn save_target_if(state_dir: &Path, toplevel: &str, target: &Target, ticket: u64, latest: &AtomicU64) -> std::io::Result<bool>;
 /// The state a fresh check yields; `None` when the check could not run, so the previous state stands.
 pub fn compare(target: &Target, socket_path: Option<&str>, fresh: &Result<PaneRecord, HostFailure>) -> Option<TargetState>;
 /// `cwd` equals `toplevel` or lies under it, by path components.
@@ -991,14 +992,15 @@ pub fn destination_of(record: &PaneRecord) -> Destination;
 // src/engine/types.rs: Snapshot gains
 pub target: Option<Target>,
 pub target_state: TargetState,          // `NoHost` with no target and no host, `Unverified` otherwise (10.2's chip rule)
-pub target_seq: u64,                    // bumped once per answered SetTarget
+pub target_seq: u64,                    // bumped once per answered target write (a pick's, or a comment's)
 pub target_error: Option<String>,       // `target not remembered: <reason>` or None
+pub target_token: Option<u64>,          // the pick this answer is for; None for a write a comment or a check made
 pub panes: Option<Arc<Vec<PaneRow>>>,
 pub panes_seq: u64,                     // the token of the LoadPanes answered last
 pub panes_error: Option<String>,        // `could not list panes: <reason>`
 // Command gains
 LoadPanes(u64),
-SetTarget(Target),
+SetTarget { token: u64, target: Target },   // `token` is the TUI's number for this pick, echoed on the answer
 
 // src/engine/session.rs: SessionConfig gains
 pub opener_pane: Option<String>,        // HERDR_HUNKS_OPENER_PANE
@@ -1107,7 +1109,7 @@ mod tests {
         save_target(dir.path(), "/repo", &Target::Clipboard).unwrap();
         assert_eq!(load_targets(dir.path()).0.get("/repo"), Some(&Target::Clipboard));
         assert!(save_target(std::path::Path::new("relative"), "/repo", &Target::Clipboard).is_err());
-        // A write for an older pick is skipped under the lock; the newer pick's record stands.
+        // A write with an older ticket is skipped under the lock; the latest requested record stands.
         let latest = std::sync::atomic::AtomicU64::new(2);
         assert!(!save_target_if(dir.path(), "/repo", &target(Some("old")), 1, &latest).unwrap());
         assert_eq!(load_targets(dir.path()).0.get("/repo"), Some(&Target::Clipboard));
@@ -1382,20 +1384,20 @@ pub fn save_target(state_dir: &Path, toplevel: &str, target: &Target) -> std::io
     })?
 }
 
-/// `save_target` guarded by the selection generation: the comparison happens under the lock, so two
-/// writers for different picks land in pick order whatever order their tasks ran in.
+/// `save_target` guarded by a write ticket: the comparison happens under the lock, so of two writers
+/// the one requested last lands whatever order their tasks ran in, across picks and within one.
 pub fn save_target_if(
     state_dir: &Path,
     toplevel: &str,
     target: &Target,
-    generation: u64,
+    ticket: u64,
     latest: &std::sync::atomic::AtomicU64,
 ) -> std::io::Result<bool> {
     if !state_dir.is_absolute() {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "state directory must be absolute"));
     }
     reuse::with_lock(state_dir, || -> std::io::Result<bool> {
-        if latest.load(std::sync::atomic::Ordering::SeqCst) != generation {
+        if latest.load(std::sync::atomic::Ordering::SeqCst) != ticket {
             return Ok(false);
         }
         let (targets, _) = load_targets(state_dir);
@@ -1576,7 +1578,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         let (_rt, handle) = start_from(config);
         wait_for(&handle, "rows", |s| !s.files.is_empty());
         assert_eq!(handle.target_checks.load(Ordering::SeqCst), 0, "no target, no check");
-        handle.commands.send(Command::SetTarget(pane_target("w4:p2", "codex", Some("s1")))).unwrap();
+        handle.commands.send(Command::SetTarget { token: 0, target: pane_target("w4:p2", "codex", Some("s1")) }).unwrap();
         // One predicate for the state the assertion needs: a wait for a proxy could eat the snapshot
         // the next wait needs (the pick, its answer and its first check can arrive in two frames).
         let s = wait_for(&handle, "the pick answered and checked", |s| {
@@ -1613,11 +1615,11 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         wait_for(&handle, "rows", |s| !s.files.is_empty());
         let s = wait_for(&handle, "no target, no host", |s| s.target_state == TargetState::NoHost);
         assert!(s.target.is_none());
-        handle.commands.send(Command::SetTarget(Target::Clipboard)).unwrap();
+        handle.commands.send(Command::SetTarget { token: 0, target: Target::Clipboard }).unwrap();
         let s = wait_for(&handle, "clipboard", |s| s.target_seq == 1);
         assert_eq!((s.target.clone(), s.target_state.clone()), (Some(Target::Clipboard), TargetState::Clipboard));
         assert_eq!(s.target_error.as_deref(), Some("target not remembered: no state directory"));
-        handle.commands.send(Command::SetTarget(pane_target("w4:p2", "codex", None))).unwrap();
+        handle.commands.send(Command::SetTarget { token: 0, target: pane_target("w4:p2", "codex", None) }).unwrap();
         let s = wait_for(&handle, "pane without host", |s| s.target_seq == 2);
         assert_eq!(s.target_state, TargetState::NoHost);
     }
@@ -1681,13 +1683,13 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         config.status_delay = Some(Duration::from_millis(400));
         let (_rt, handle) = start_from(config);
         wait_for(&handle, "rows", |s| !s.files.is_empty() && !s.refreshing);
-        handle.commands.send(Command::SetTarget(pane_target("w4:p2", "codex", Some("s1")))).unwrap();
+        handle.commands.send(Command::SetTarget { token: 0, target: pane_target("w4:p2", "codex", Some("s1")) }).unwrap();
         wait_for(&handle, "live", |s| s.target_state == TargetState::Live("idle".into()));
         // The agent restarts and the reviewer picks the same pane again while a check runs.
         host.set_pane(agent_pane("w4:p2", "codex", "idle", Some("s2"), &top));
         handle.commands.send(Command::Refresh).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        handle.commands.send(Command::SetTarget(pane_target("w4:p2", "codex", Some("s2")))).unwrap();
+        handle.commands.send(Command::SetTarget { token: 0, target: pane_target("w4:p2", "codex", Some("s2")) }).unwrap();
         let s = wait_for(&handle, "re-pick answered", |s| s.target_seq == 2);
         assert_eq!(s.target_state, TargetState::Unverified);
         let s = wait_for(&handle, "its own check", |s| s.target_state != TargetState::Unverified);
@@ -1763,15 +1765,15 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         config.state_dir = Some(state.path().to_path_buf());
         config.host = Some(host.clone());
         config.socket_path = Some("/run/fake.sock".into());
-        // Both picks' writes wait at the gate; released in order, the older one runs first, finds the
-        // newer generation, and its answer must reach no one: the picker waits for its own pick's.
+        // Both picks' writes wait at the gate; released in order, the older one runs first, finds a
+        // newer ticket, and its answer must reach no one: the picker waits for its own pick's token.
         let gate = Arc::new(Semaphore::new(0));
-        config.target_write_gate = Some(gate.clone());
+        config.pick_write_gate = Some(gate.clone());
         let (_rt, handle) = start_from(config);
         wait_for(&handle, "rows", |s| !s.files.is_empty());
-        handle.commands.send(Command::SetTarget(pane_target("w4:p2", "codex", Some("s1")))).unwrap();
+        handle.commands.send(Command::SetTarget { token: 1, target: pane_target("w4:p2", "codex", Some("s1")) }).unwrap();
         wait_for(&handle, "first pick published", |s| matches!(&s.target, Some(Target::Pane { .. })));
-        handle.commands.send(Command::SetTarget(Target::Clipboard)).unwrap();
+        handle.commands.send(Command::SetTarget { token: 2, target: Target::Clipboard }).unwrap();
         wait_for(&handle, "second pick published", |s| s.target == Some(Target::Clipboard));
         gate.add_permits(1);
         wait_cond("the older write ran", || handle.target_writes_done.load(Ordering::SeqCst) == 1);
@@ -1781,7 +1783,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         }
         gate.add_permits(1);
         let s = wait_for(&handle, "the newer pick answered", |s| s.target_seq == 1);
-        assert_eq!((s.target.clone(), s.target_error.clone()), (Some(Target::Clipboard), None));
+        assert_eq!((s.target.clone(), s.target_error.clone(), s.target_token), (Some(Target::Clipboard), None, Some(2)));
         assert_eq!(target::load_targets(state.path()).0.get(&top), Some(&Target::Clipboard));
     }
 
@@ -1844,22 +1846,26 @@ In `src/engine/types.rs`, `nav::Target` is already imported (it types `LoadedDif
     pub target: Option<crate::engine::target::Target>,
     /// The last check's answer; `NoHost` with no target and no host, `Unverified` with no target and a host.
     pub target_state: TargetState,
-    /// Bumped once per answered `SetTarget`; `target_error` is that answer.
+    /// Bumped once per answered target write; `target_error` is that answer.
     pub target_seq: u64,
     pub target_error: Option<String>,
+    /// The `token` of the `SetTarget` this answer is for; `None` for a write a comment or a check brought
+    /// about. The picker that sent the pick closes on its own token and on no other answer.
+    pub target_token: Option<u64>,
     /// The pane picker's rows under the opening's token, as `refs` are for the base picker.
     pub panes: Option<Arc<Vec<PaneRow>>>,
     pub panes_seq: u64,
     pub panes_error: Option<String>,
 ```
 
-with `target: None, target_state: TargetState::Unverified, target_seq: 0, target_error: None, panes: None, panes_seq: 0, panes_error: None` in `empty`. Add to `Command`:
+with `target: None, target_state: TargetState::Unverified, target_seq: 0, target_error: None, target_token: None, panes: None, panes_seq: 0, panes_error: None` in `empty`. Add to `Command`:
 
 ```rust
     /// Answer with the agent panes and this opening's token on the snapshot (spec 10.2).
     LoadPanes(u64),
-    /// Remember and publish the target; the next refresh checks it (`target::Target`, by path: `nav::Target` is imported here).
-    SetTarget(crate::engine::target::Target),
+    /// Remember and publish the target; the next refresh checks it (`target::Target`, by path: `nav::Target` is
+    /// imported here). `token` is the TUI's number for the pick, echoed as `Snapshot.target_token` on the answer.
+    SetTarget { token: u64, target: crate::engine::target::Target },
 ```
 
 - [ ] **Step 8: The session**
@@ -1885,7 +1891,7 @@ In `src/engine/session.rs`:
     target_write_pending: bool,
 ```
 
-initialised `None, 0, Arc::new(AtomicU64::new(0)), 0, true, false` (`SetTarget` stores the new generation in both). `Job` carries `generation: u64`, the selection generation `request_status` read when it built the job, so a resolution answers under the generation it started for.
+initialised `None, 0, Arc::new(AtomicU64::new(0)), 0, true, false` (`SetTarget` stores the new generation in both). `State` also carries `write_tickets: Arc<AtomicU64>` (the latest target write requested, by anyone: a pick, an adoption, an opener preselection; `save_target_if` lands only the latest ticket's write, so within one selection too the newest record wins) and `pick_write_gate: Option<Arc<Semaphore>>` (a test's seam for a pick's write, beside Task 3's `target_write_gate` for a comment's or a check's; `SessionConfig.pick_write_gate`, `None` in production). `Job` carries `generation: u64`, the selection generation `request_status` read when it built the job, so a resolution answers under the generation it started for.
 
 3. `Job` gains `target: Option<(Target, u64)>` (the published pane target and the generation it was selected under; `None` for no target or a clipboard target), `resolve_target: Option<Option<String>>` (`Some(opener)` on the first refresh), `host: Option<Arc<dyn host::HostClient>>`, `socket_path: Option<String>`, `state_dir: Option<PathBuf>`. `Done::Status` gains:
 
@@ -1983,7 +1989,7 @@ async fn resolve_target(job: &Job, toplevel: &str, opener: Option<&str>) -> Opti
 }
 ```
 
-`target_checks.fetch_add(1)` where the check runs (pass the counter into `Job` as `checks: Arc<AtomicUsize>`). `target_writes_done` counts every finished target write, a pick's included, and `target_write_gate` holds every target write; both are declared here (`SessionConfig.target_write_gate: Option<Arc<Semaphore>>`, `None` in production; `EngineHandle.target_writes_waiting`, `target_writes_done: Arc<AtomicUsize>`), and Task 3's `write_target` uses the same three. The counter and `job.target` are filled in `request_status` from `self.snapshot.target` and `self.selection_generation`; `resolve_target` is `Some(self.config_opener.clone())` while `target_unresolved` (store `opener_pane`, `own_pane`, `host`, `socket_path` on `State` from the config at start).
+`target_checks.fetch_add(1)` where the check runs (pass the counter into `Job` as `checks: Arc<AtomicUsize>`). `target_writes_done` counts every finished target write, a pick's included; `pick_write_gate` holds a pick's write and `target_write_gate` a comment's or a check's (both `Option<Arc<Semaphore>>` on `SessionConfig`, `None` in production); the counters `EngineHandle.target_writes_waiting` and `target_writes_done: Arc<AtomicUsize>` are declared here, and Task 3's `write_target` uses them with its own gate. The counter and `job.target` are filled in `request_status` from `self.snapshot.target` and `self.selection_generation`; `resolve_target` is `Some(self.config_opener.clone())` while `target_unresolved` (store `opener_pane`, `own_pane`, `host`, `socket_path` on `State` from the config at start).
 
 5. On `Done::Status`, after the `acted` block:
 
@@ -2025,8 +2031,10 @@ A resolved pane target is published `Unverified` and the refresh after it answer
 6. The commands, beside `MarkReviewed`:
 
 ```rust
-                    Command::SetTarget(target) => {
+                    Command::SetTarget { token, target } => {
                         state.selection_generation += 1;
+                        // The number the send task and the write guard compare with, stored before anything can read it.
+                        state.latest_selection.store(state.selection_generation, Ordering::SeqCst);
                         state.target_source = Some(target::Source::Picked);
                         let mut next = state.snapshot.clone();
                         next.target = Some(target.clone());
@@ -2042,17 +2050,19 @@ A resolved pane target is published `Unverified` and the refresh after it answer
                         };
                         let dir = state.state_dir.clone();
                         let results = results_tx.clone();
-                        let (generation, latest) = (state.selection_generation, state.latest_selection.clone());
-                        let (gate, done) = (state.target_write_gate.clone(), state.target_writes_done.clone());
+                        let generation = state.selection_generation;
+                        // Every target write takes the next ticket; only the latest ticket's write lands.
+                        let (ticket, tickets) = (state.write_tickets.fetch_add(1, Ordering::SeqCst) + 1, state.write_tickets.clone());
+                        let (gate, done) = (state.pick_write_gate.clone(), state.target_writes_done.clone());
                         tokio::spawn(async move {
-                            // The test seam shared with `write_target`: a write waits here while a test lets another land.
+                            // The test seam for a pick's write: it waits here while a test lets another write land.
                             if let Some(gate) = gate {
                                 gate.acquire().await.expect("gate").forget();
                             }
                             let written = match (dir, toplevel) {
                                 (Some(dir), Some(toplevel)) => tokio::task::spawn_blocking(move || {
-                                    // Skipped, not failed, when a newer pick landed meanwhile: that pick writes its own.
-                                    target::save_target_if(&dir, &toplevel, &target, generation, &latest).map(|_| ()).map_err(|e| e.to_string())
+                                    // Skipped, not failed, when a newer write was requested meanwhile: that one carries the newest record.
+                                    target::save_target_if(&dir, &toplevel, &target, ticket, &tickets).map(|_| ()).map_err(|e| e.to_string())
                                 })
                                 .await
                                 .unwrap_or_else(|e| Err(e.to_string())),
@@ -2060,7 +2070,7 @@ A resolved pane target is published `Unverified` and the refresh after it answer
                                 (_, None) => Err("not a git repository".to_string()),
                             };
                             done.fetch_add(1, Ordering::SeqCst);
-                            let _ = results.send(Done::Target { generation, written });
+                            let _ = results.send(Done::Target { generation, token: Some(token), written });
                         });
                         // The new target is checked by the refresh this asks for.
                         state.request_status(&cwd, false, &results_tx, &refreshes);
@@ -2087,7 +2097,7 @@ A resolved pane target is published `Unverified` and the refresh after it answer
 and the two `Done` arms:
 
 ```rust
-                    Done::Target { generation, written } => {
+                    Done::Target { generation, token, written } => {
                         // An answer for an older pick is nobody's: the newer pick writes its own record and
                         // answers for itself, so neither its error nor its sequence may reach the picker.
                         if generation != state.selection_generation {
@@ -2095,6 +2105,7 @@ and the two `Done` arms:
                         }
                         state.target_seq += 1;
                         next.target_seq = state.target_seq;
+                        next.target_token = token;
                         next.target_error = written.err().map(|e| format!("target not remembered: {e}"));
                         // The file still differs from memory: the next record write (a comment, Task 3) tries again.
                         state.target_write_pending |= next.target_error.is_some();
@@ -2114,9 +2125,9 @@ and the two `Done` arms:
                     }
 ```
 
-`Done` gains `Target { generation: u64, written: Result<(), String> }` (the selection generation the write was made under, so a stale answer is told from the current pick's) and `Panes { token: u64, rows: Result<Vec<PaneRow>, host::HostFailure> }`. A `NoHost` failure from `pane_list` with a host configured is a listing failure like any other and is reported.
+`Done` gains `Target { generation: u64, token: Option<u64>, written: Result<(), String> }` (the selection generation the write was made under, so a stale answer is told from the current pick's; the pick's token, or `None` for a write a comment or a check brought about) and `Panes { token: u64, rows: Result<Vec<PaneRow>, host::HostFailure> }`. A `NoHost` failure from `pane_list` with a host configured is a listing failure like any other and is reported.
 
-7. `fingerprint` gains `s.target, s.target_state, s.target_seq, s.target_error, s.panes.as_ref().map(Arc::as_ptr), s.panes_seq, s.panes_error` (seven more `{:?}`/`{}` slots).
+7. `fingerprint` gains `s.target, s.target_state, s.target_seq, s.target_error, s.target_token, s.panes.as_ref().map(Arc::as_ptr), s.panes_seq, s.panes_error` (eight more `{:?}`/`{}` slots).
 
 8. `src/tui/shell.rs::run`: `session.opener_pane = std::env::var("HERDR_HUNKS_OPENER_PANE").ok().filter(|p| engine::target::is_pane_id(p)); session.own_pane = std::env::var("HERDR_PANE_ID").ok().filter(|p| engine::target::is_pane_id(p));`. A popup viewer has no `HERDR_PANE_ID`, which is why it is `Option`.
 
@@ -3780,7 +3791,7 @@ Write it as one arm per command that builds an `Operation` and calls a shared me
 ```rust
     /// Writes the target record when something in memory is newer than the file (an opener
     /// preselection on its first comment; an adopted session; Task 5's accepted restart), on the
-    /// blocking pool, guarded by the selection generation so an older write never lands on a newer pick.
+    /// blocking pool, under the next write ticket so an older write never lands on a newer record.
     fn write_target(&mut self, next: &Snapshot, results: &UnboundedSender<Done>) {
         if !std::mem::take(&mut self.target_write_pending) {
             return;
@@ -3789,7 +3800,8 @@ Write it as one arm per command that builds an `Operation` and calls a shared me
             return;
         };
         let results = results.clone();
-        let (toplevel, generation, latest) = (toplevel.clone(), self.selection_generation, self.latest_selection.clone());
+        let (toplevel, generation) = (toplevel.clone(), self.selection_generation);
+        let (ticket, tickets) = (self.write_tickets.fetch_add(1, Ordering::SeqCst) + 1, self.write_tickets.clone());
         let (gate, waiting, done) = (self.target_write_gate.clone(), self.target_writes_waiting.clone(), self.target_writes_done.clone());
         tokio::spawn(async move {
             // The test seam: a write waits here while a test lets a newer pick land first.
@@ -3798,18 +3810,19 @@ Write it as one arm per command that builds an `Operation` and calls a shared me
                 gate.acquire().await.expect("gate").forget();
             }
             let written = tokio::task::spawn_blocking(move || {
-                target::save_target_if(&dir, &toplevel, &target, generation, &latest).map(|_| ()).map_err(|e| e.to_string())
+                target::save_target_if(&dir, &toplevel, &target, ticket, &tickets).map(|_| ()).map_err(|e| e.to_string())
             })
             .await
             .unwrap_or_else(|e| Err(e.to_string()));
             done.fetch_add(1, Ordering::SeqCst);
-            // The same answer a pick's write gives: the notice of 10.7 when it fails, and the flag back on.
-            let _ = results.send(Done::Target { generation, written });
+            // The same answer a pick's write gives, with no token: the notice of 10.7 when it fails, and
+            // the flag back on; the picker, waiting for its own token, is not closed by it.
+            let _ = results.send(Done::Target { generation, token: None, written });
         });
     }
 ```
 
-`SessionConfig.target_write_gate: Option<Arc<Semaphore>>` (`None` in production; Task 2's `SetTarget` arm waits at the same gate, so a test can hold any target write) and two `EngineHandle` counters, `target_writes_waiting` and `target_writes_done`, are the seams; with the guard replaced by a plain `save_target`, the test fails on its last assertion every time, because the old write is held until after the new pick's own write. Every target write, a pick's or this method's, answers `Done::Target { generation, written }`: the handler (Task 2) drops an answer whose generation is not the current selection's, publishes the others under `target_seq` with `target not remembered: <reason>` on failure (10.7's notice, for a pick and for the opener's first-comment write alike), and on failure sets `target_write_pending` again, so the next comment's write tries once more; `an_opener_write_that_fails_says_so_and_the_next_comment_retries` below pins the failure and the recovery, and `a_pick_answered_after_a_newer_pick_is_dropped` in Task 2 the stale answer.
+`SessionConfig.target_write_gate: Option<Arc<Semaphore>>` (`None` in production; it holds the writes this method makes, while Task 2's `pick_write_gate` holds a pick's, so a test orders the two kinds independently) and two `EngineHandle` counters, `target_writes_waiting` and `target_writes_done`, are the seams; with the guard replaced by a plain `save_target`, the test fails on its last assertion every time, because the old write is held until after the new pick's own write. Every target write, a pick's or this method's, answers `Done::Target { generation, written }`: the handler (Task 2) drops an answer whose generation is not the current selection's, publishes the others under `target_seq` with `target not remembered: <reason>` on failure (10.7's notice, for a pick and for the opener's first-comment write alike), and on failure sets `target_write_pending` again, so the next comment's write tries once more; `an_opener_write_that_fails_says_so_and_the_next_comment_retries` below pins the failure and the recovery, and `a_pick_answered_after_a_newer_pick_is_dropped` in Task 2 the stale answer.
 
 The regression for it is this task's, because it needs the comment command and the write; it sits in `session.rs`'s tests with the three below. Its race is made, not hoped for: the adoption's write is held at a seam while the re-pick lands and writes, then released, so it is always the later writer and only the generation guard stops it (the orchestrator should see this test fail with `save_target` in place of `save_target_if`):
 
@@ -3836,12 +3849,39 @@ The regression for it is this task's, because it needs the comment command and t
         handle.commands.send(pending(2, "x")).unwrap();
         wait_for(&handle, "comment", |s| s.comment_seq == 1);
         wait_cond("the adoption's write is waiting at the gate", || handle.target_writes_waiting.load(Ordering::SeqCst) == 1);
-        handle.commands.send(Command::SetTarget(Target::Clipboard)).unwrap();
-        wait_for(&handle, "re-pick answered", |s| s.target_seq == 1 && s.target == Some(Target::Clipboard) && s.target_error.is_none());
+        handle.commands.send(Command::SetTarget { token: 1, target: Target::Clipboard }).unwrap();
+        // The pick's write is not gated (`pick_write_gate` is unset): it lands and answers first.
+        wait_for(&handle, "re-pick answered", |s| s.target_seq == 1 && s.target == Some(Target::Clipboard) && s.target_error.is_none() && s.target_token == Some(1));
         assert_eq!(target::load_targets(state.path()).0.get(&top), Some(&Target::Clipboard));
         gate.add_permits(1);
-        wait_cond("the adoption's write ran", || handle.target_writes_done.load(Ordering::SeqCst) == 1);
+        wait_cond("the adoption's write ran too", || handle.target_writes_done.load(Ordering::SeqCst) == 2);
         assert_eq!(target::load_targets(state.path()).0.get(&top), Some(&Target::Clipboard), "an older write replaced the newer pick");
+    }
+
+    #[test]
+    fn a_picks_write_that_lands_after_an_adoption_keeps_the_adopted_session() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+        let host = host::Scripted::with_panes(vec![agent_pane("w4:p2", "codex", "idle", Some("s1"), &top)]);
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.host = Some(host.clone());
+        config.socket_path = Some("/run/fake.sock".into());
+        // The pick's write waits; the check adopts the session and a comment writes it; then the pick's
+        // older write runs, within the same selection, and must not put the session-less record back.
+        let gate = Arc::new(Semaphore::new(0));
+        config.pick_write_gate = Some(gate.clone());
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "rows", |s| !s.files.is_empty());
+        handle.commands.send(Command::SetTarget { token: 1, target: pane_target("w4:p2", "codex", None) }).unwrap();
+        wait_for(&handle, "adopted in memory", |s| matches!(&s.target, Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s1"));
+        handle.commands.send(pending(2, "x")).unwrap();
+        wait_cond("the adoption's write landed", || matches!(target::load_targets(state.path()).0.get(&top), Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s1"));
+        gate.add_permits(1);
+        let s = wait_for(&handle, "the pick answered", |s| s.target_token == Some(1));
+        assert_eq!(s.target_error, None, "skipped, not failed");
+        assert!(matches!(target::load_targets(state.path()).0.get(&top), Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s1"), "the pick's older write erased the adopted session");
     }
 ```
 
@@ -6070,7 +6110,7 @@ The three `Done` arms:
     /// A session with a target and two pending comments, ready to send.
     fn ready_to_send(handle: &EngineHandle) {
         wait_for(handle, "rows", |s| !s.files.is_empty());
-        handle.commands.send(Command::SetTarget(pane_target("w4:p2", "codex", Some("s1")))).unwrap();
+        handle.commands.send(Command::SetTarget { token: 0, target: pane_target("w4:p2", "codex", Some("s1")) }).unwrap();
         wait_for(handle, "live", |s| s.target_state == TargetState::Live("idle".into()));
         handle.commands.send(pending(2, "first")).unwrap();
         handle.commands.send(pending(1, "second")).unwrap();
@@ -6264,7 +6304,7 @@ The three `Done` arms:
         wait_cond("the claim is written", || waiting.load(Ordering::SeqCst) == 1);
         assert!(comments::Store::open(Some(state.path().to_path_buf()), &top, now()).0.comments().iter().all(|c| matches!(c.state, comments::CommentState::Sending { .. })));
         // The reviewer picks another target while the send sits between its claim and its call.
-        handle.commands.send(Command::SetTarget(Target::Clipboard)).unwrap();
+        handle.commands.send(Command::SetTarget { token: 0, target: Target::Clipboard }).unwrap();
         wait_for(&handle, "re-picked", |s| s.target_seq == 2 && s.target == Some(Target::Clipboard));
         released.store(true, Ordering::SeqCst);
         let s = wait_for(&handle, "refused", |s| s.send_seq == 1);
@@ -6281,12 +6321,12 @@ The three `Done` arms:
         config.send_gate = Some(gate_until(&released, &waiting));
         let (_rt, handle) = start_from(config);
         ready_to_send(&handle);
-        handle.commands.send(Command::SetTarget(Target::Clipboard)).unwrap();
+        handle.commands.send(Command::SetTarget { token: 0, target: Target::Clipboard }).unwrap();
         wait_for(&handle, "clipboard, diff ready", |s| s.target_state == TargetState::Clipboard && matches!(s.diff, DiffState::Ready(_)));
         handle.commands.send(Command::Send(dispatch::SendRequest { kind: dispatch::SendKind::Review { scope: dispatch::ReviewScope::All }, accepted: Default::default() })).unwrap();
         wait_cond("the request is recorded", || waiting.load(Ordering::SeqCst) == 1);
         assert_eq!(comments::load_requests(state.path(), &top).0.len(), 1);
-        handle.commands.send(Command::SetTarget(pane_target("w4:p2", "codex", Some("s1")))).unwrap();
+        handle.commands.send(Command::SetTarget { token: 0, target: pane_target("w4:p2", "codex", Some("s1")) }).unwrap();
         wait_for(&handle, "re-picked", |s| s.target_seq == 3);
         released.store(true, Ordering::SeqCst);
         let s = wait_for(&handle, "refused", |s| s.send_seq == 1);
@@ -6304,7 +6344,7 @@ The three `Done` arms:
         config.send_gate = Some(gate_until(&released, &waiting));
         let (_rt, handle) = start_from(config);
         ready_to_send(&handle);
-        handle.commands.send(Command::SetTarget(Target::Clipboard)).unwrap();
+        handle.commands.send(Command::SetTarget { token: 0, target: Target::Clipboard }).unwrap();
         wait_for(&handle, "clipboard", |s| s.target_state == TargetState::Clipboard);
         handle.commands.send(feedback(dispatch::Accepted::default())).unwrap();
         wait_cond("claimed", || waiting.load(Ordering::SeqCst) == 1);
@@ -6386,7 +6426,7 @@ The three `Done` arms:
         config.nonce = Arc::new(|counter| format!("m{counter:05}"));
         let (_rt2, b) = start_from(config);
         wait_for(&b, "rows", |s| !s.files.is_empty());
-        b.commands.send(Command::SetTarget(pane_target("w4:p2", "codex", Some("s1")))).unwrap();
+        b.commands.send(Command::SetTarget { token: 0, target: pane_target("w4:p2", "codex", Some("s1")) }).unwrap();
         wait_for(&b, "live", |s| s.target_state == TargetState::Live("idle".into()));
         b.commands.send(pending(2, "from b")).unwrap();
         wait_for(&b, "pending", |s| s.comments.len() == 1);
@@ -6496,7 +6536,7 @@ The three `Done` arms:
         config.nonce = Arc::new(|counter| format!("n{counter:05}"));
         let (_rt, handle) = start_from(config);
         wait_for(&handle, "rows", |s| !s.files.is_empty());
-        handle.commands.send(Command::SetTarget(Target::Clipboard)).unwrap();
+        handle.commands.send(Command::SetTarget { token: 0, target: Target::Clipboard }).unwrap();
         wait_for(&handle, "clipboard", |s| s.target_seq == 1);
         handle.commands.send(pending(2, "first")).unwrap();
         wait_for(&handle, "pending", |s| s.comments.len() == 1);
@@ -6514,7 +6554,7 @@ The three `Done` arms:
         config.nonce = Arc::new(|counter| if counter == 2 { "n00001".to_string() } else { format!("n{counter:05}") });
         let (_rt2, bare) = start_from(config);
         wait_for(&bare, "rows, diff ready", |s| !s.files.is_empty() && matches!(s.diff, DiffState::Ready(_)));
-        bare.commands.send(Command::SetTarget(Target::Clipboard)).unwrap();
+        bare.commands.send(Command::SetTarget { token: 0, target: Target::Clipboard }).unwrap();
         bare.commands.send(pending(2, "x")).unwrap();
         wait_for(&bare, "pending", |s| s.comments.len() == 1);
         bare.commands.send(feedback(dispatch::Accepted::default())).unwrap();
@@ -6551,8 +6591,9 @@ The three `Done` arms:
         }
         let before = wait_for(&bare, "thirty pending", |s| s.comments.iter().filter(|c| c.is_pending()).count() == 30);
         let earlier = Some(before.comments[0].state.clone());
+        let answered = before.send_seq;
         bare.commands.send(feedback(dispatch::Accepted::default())).unwrap();
-        let s = wait_for(&bare, "nothing could receive", |s| s.send_seq == 2);
+        let s = wait_for(&bare, "nothing could receive", |s| s.send_seq == answered + 1);
         assert!(s.send_error.as_deref().unwrap().starts_with("nothing could receive the copy: "), "{:?}", s.send_error);
         assert_eq!(s.comments.iter().filter(|c| c.is_pending()).count(), 30);
         assert!(matches!(&s.comments[0].state, comments::CommentState::Unconfirmed { stamp, .. } if Some(stamp.nonce.as_str()) == earlier.as_ref().and_then(|e| e.stamp_nonce())));
@@ -6661,7 +6702,7 @@ Two more session tests, for the late answer and the oversized review:
         config.nonce = Arc::new(|counter| format!("m{counter:05}"));
         let (_rt2, b) = start_from(config);
         wait_for(&b, "rows", |s| !s.files.is_empty());
-        b.commands.send(Command::SetTarget(pane_target("w4:p2", "codex", Some("s1")))).unwrap();
+        b.commands.send(Command::SetTarget { token: 0, target: pane_target("w4:p2", "codex", Some("s1")) }).unwrap();
         wait_for(&b, "live", |s| s.target_state == TargetState::Live("idle".into()));
         b.commands.send(pending(2, "from b")).unwrap();
         wait_for(&b, "pending", |s| s.comments.len() == 1);
@@ -6778,6 +6819,7 @@ Action::PickPane, Action::PickPaneRow(usize)
 // src/tui/state.rs: ViewState gains
 pub panes: Option<PanePicker>,
 pub panes_token: u64,
+pub pick_token: u64,               // the token of the last SetTarget sent; its answer echoes it
 pub socket_path: Option<String>,   // HERDR_SOCKET_PATH, for the Target a pick builds
 deferred: VecDeque<String>,        // urgent warnings an answer displaced; the front speaks when nothing urgent stands
 seen_target_seq: u64,
@@ -6939,8 +6981,17 @@ mod tests {
         assert_eq!(picker.cursor, 0);
         s.panes_seq = 3;
         picker.observe(&s);
-        picker.pending = Some(s.target_seq);
+        picker.pending = Some(7);
         s.target_seq += 1;
+        s.target_token = None;   // a comment's write answered
+        picker.observe(&s);
+        assert!(!picker.done, "another write's answer is not this pick's");
+        s.target_seq += 1;
+        s.target_token = Some(3);   // an older pick's, had it not been dropped
+        picker.observe(&s);
+        assert!(!picker.done);
+        s.target_seq += 1;
+        s.target_token = Some(7);
         picker.observe(&s);
         assert!(picker.done);
     }
@@ -7184,8 +7235,9 @@ impl PanePicker {
             self.seen_panes_seq = snapshot.panes_seq;
             self.retarget(snapshot);
         }
-        if let Some(sent) = self.pending {
-            if snapshot.target_seq > sent {
+        // The answer to this pick carries its token; a comment's or a check's write, or another pick's, does not.
+        if let Some(token) = self.pending {
+            if snapshot.target_token == Some(token) {
                 self.pending = None;
                 self.done = true;
             }
@@ -7246,7 +7298,7 @@ Expected: five pass. The `choices_come_in_three_groups` test's `plain[2]` assert
 
 `KeyAction::PickPane` added; in `keys.rs`'s `navigation_aliases_require_no_modifiers_and_do_not_extend_the_sheet`, the `KEYS.len()` pin becomes 28 and `help_panel(false).rows.len()` 28 with it (one entry row per binding, still no notes); the two `help_offset` arithmetic tests in `input.rs` still hold (they use `KEYS.len()`). `RESERVED` is untouched until Task 8.
 
-2. `state.rs`: `ViewState` gains `pub panes: Option<crate::tui::panes::PanePicker>`, `pub panes_token: u64`, `pub socket_path: Option<String>`, `seen_target_seq: u64`, `deferred: VecDeque<String>`; `new` sets `None, 0, None, 0, VecDeque::new()`. In `observe`, before the mark block:
+2. `state.rs`: `ViewState` gains `pub panes: Option<crate::tui::panes::PanePicker>`, `pub panes_token: u64`, `pub pick_token: u64` (numbers every `SetTarget` this viewer sends), `pub socket_path: Option<String>`, `seen_target_seq: u64`, `deferred: VecDeque<String>`; `new` sets `None, 0, 0, None, 0, VecDeque::new()`. In `observe`, before the mark block:
 
 ```rust
         if let Some(picker) = &mut self.panes {
@@ -7323,7 +7375,9 @@ fn picker_cursor(state: &ViewState) -> usize {
     state.panes.as_ref().map(|p| p.cursor).unwrap_or(0)
 }
 
-/// `Enter` or a click: the choice becomes `SetTarget`; the picker waits for the answer.
+/// `Enter` or a click: the choice becomes `SetTarget` under a fresh token; the picker waits for the
+/// answer that echoes it, and for no other target write's (`picker` borrows only `state.panes`, so
+/// the counter is free to touch).
 fn pick_pane(state: &mut ViewState, snapshot: &Snapshot, index: usize) -> Outcome {
     let socket = state.socket_path.clone().unwrap_or_default();
     let Some(picker) = state.panes.as_mut() else { return Outcome::Inert };
@@ -7333,8 +7387,9 @@ fn pick_pane(state: &mut ViewState, snapshot: &Snapshot, index: usize) -> Outcom
     let choices = picker.choices(snapshot);
     let Some(choice) = choices.get(index) else { return Outcome::Inert };
     picker.cursor = index;
-    picker.pending = Some(snapshot.target_seq);
-    Outcome::Engine(Command::SetTarget(choice.target(&socket)))
+    state.pick_token += 1;
+    picker.pending = Some(state.pick_token);
+    Outcome::Engine(Command::SetTarget { token: state.pick_token, target: choice.target(&socket) })
 }
 ```
 
@@ -7391,10 +7446,11 @@ Every existing test keeps passing: no existing call passes one of the five words
         snap.panes_seq = 1;
         st.observe(&snap);
         let outcome = handle_key(&mut st, &snap, key("Enter"), 120);
-        assert!(matches!(outcome, Outcome::Engine(Command::SetTarget(crate::engine::Target::Pane { pane, socket, .. })) if pane == "w1:p2" && socket == "/run/h.sock"));
-        // A second Enter while the pick is pending does nothing; the answer closes the picker.
+        assert!(matches!(outcome, Outcome::Engine(Command::SetTarget { token: 1, target: crate::engine::Target::Pane { pane, socket, .. } }) if pane == "w1:p2" && socket == "/run/h.sock"));
+        // A second Enter while the pick is pending does nothing; the answer with this pick's token closes the picker.
         assert_eq!(handle_key(&mut st, &snap, key("Enter"), 120), Outcome::Inert);
         snap.target_seq = 1;
+        snap.target_token = Some(1);
         st.observe(&snap);
         assert!(st.panes.is_none());
         // Esc keeps the target as it is.
@@ -8400,10 +8456,11 @@ The tests that follow start from `review_setup` where they need a listed file, l
         snap.panes = Some(std::sync::Arc::new(Vec::new()));
         snap.panes_seq = 2;
         st.observe(&snap);
-        assert!(matches!(handle_key(&mut st, &snap, key("Enter"), 120), Outcome::Engine(Command::SetTarget(crate::engine::Target::Clipboard))));
+        assert!(matches!(handle_key(&mut st, &snap, key("Enter"), 120), Outcome::Engine(Command::SetTarget { target: crate::engine::Target::Clipboard, .. })));
         snap.target = Some(crate::engine::Target::Clipboard);
         snap.target_state = crate::engine::TargetState::Clipboard;
         snap.target_seq = 1;
+        snap.target_token = Some(1);
         st.observe(&snap);
         assert!(st.panes.is_none());
         let editor = st.editor.as_ref().expect("the editor opened on the kept anchor");
@@ -9438,10 +9495,11 @@ and a unit test that a `Vec<u8>` receives exactly the sequence.
         st.observe(&snap);
         st.panes.as_mut().unwrap().input.clear();
         st.panes.as_mut().unwrap().retarget(&snap);
-        assert!(matches!(handle_key(&mut st, &snap, key("Enter"), 120), Outcome::Engine(Command::SetTarget(crate::engine::Target::Clipboard))));
+        assert!(matches!(handle_key(&mut st, &snap, key("Enter"), 120), Outcome::Engine(Command::SetTarget { target: crate::engine::Target::Clipboard, .. })));
         snap.target = Some(crate::engine::Target::Clipboard);
         snap.target_state = crate::engine::TargetState::Clipboard;
         snap.target_seq = 1;
+        snap.target_token = Some(1);
         st.observe(&snap);
         assert!(st.panes.is_none());
         let b = st.review_box.as_ref().expect("the box reopened");
@@ -9519,10 +9577,11 @@ and a unit test that a `Vec<u8>` receives exactly the sequence.
         st.observe(&snap);
         st.panes.as_mut().unwrap().input.clear();
         st.panes.as_mut().unwrap().retarget(&snap);
-        assert!(matches!(handle_key(&mut st, &snap, key("Enter"), 120), Outcome::Engine(Command::SetTarget(crate::engine::Target::Clipboard))));
+        assert!(matches!(handle_key(&mut st, &snap, key("Enter"), 120), Outcome::Engine(Command::SetTarget { target: crate::engine::Target::Clipboard, .. })));
         snap.target = Some(crate::engine::Target::Clipboard);
         snap.target_state = crate::engine::TargetState::Clipboard;
         snap.target_seq = 1;
+        snap.target_token = Some(1);
         st.observe(&snap);
         assert!(matches!(&st.review_box.as_ref().expect("the box reopened").scope, dispatch::ReviewScope::File(k) if k.path == "a.rs"), "the pick kept the scope");
         snap.target = Some(pane_target());
@@ -9674,10 +9733,10 @@ fn the_review_loop_talks_to_the_host_alone_and_writes_only_its_files() {
     handle.commands.send(Command::LoadPanes(1)).unwrap();
     let s = recv("panes", &|s| s.panes_seq == 1);
     assert_eq!(s.panes.as_ref().unwrap().len(), 1, "the shell pane is not a row");
-    handle.commands.send(Command::SetTarget(Target::Pane {
+    handle.commands.send(Command::SetTarget { token: 0, target: Target::Pane {
         pane: "w1:p2".into(), socket: fake.socket_path.to_string_lossy().into_owned(), agent: "codex".into(),
         session: Some(SessionRef { kind: "id".into(), value: "s-1".into() }), title: "codex".into(),
-    })).unwrap();
+    } }).unwrap();
     recv("live", &|s| s.target_state == TargetState::Live("idle".into()));
     handle.commands.send(Command::AddComment {
         token: 1,
@@ -10157,3 +10216,15 @@ same comparison kind, else to the end (a refresh that replaces a.rs with b.rs un
 draft is tested, and the save still names a.rs); and a request or its copy without a state
 directory takes its nonce through the same collision loop as everything else (`fresh_nonce`
 over `nonces_of`, tested with a maker that repeats a stamped nonce).
+
+**Round 13 (codex, plan-complete, 2026-10-05).** Five findings, all applied. Three were HIGH:
+the `SetTarget` arm never stored the new generation in `latest_selection` (now the line after
+the increment); the delayed-adoption test held the re-pick's write at the gate it was waiting
+on (a pick's write has its own seam, `pick_write_gate`, and `target_writes_done` counts both
+writes); and the clipboard regression waited for a sequence its earlier sends had passed (it
+waits for the successor of the one it saw). Then: every target write takes a ticket when it is
+requested and `save_target_if` lands only the latest ticket's, so a pick's slow write cannot put
+a session-less record over an adoption's within the same selection (tested with the pick held
+until the adoption's write landed); and `SetTarget` carries the picker's token, echoed as
+`Snapshot.target_token` by the answer, so the picker closes on its own answer and not on a
+comment's write or an older pick's (the panes test observes all three).
