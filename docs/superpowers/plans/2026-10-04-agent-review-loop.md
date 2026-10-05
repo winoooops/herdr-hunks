@@ -5421,8 +5421,12 @@ async fn send_inner(
     if ctx.latest_generation.load(Ordering::SeqCst) != ctx.generation {
         bail!(store, again());
     }
+    // What the record learns from this check: the session an accepted restart moved to, or (10.2's
+    // adoption rule, the same as a refresh's check) the first session a session-less target sees, so a
+    // later restart is reported as one and not adopted in silence.
     let adopt = match (&state, &record) {
         (Some(TargetState::Restarted(_)), Some(r)) => Some(r.agent_session.clone()),
+        (Some(TargetState::Live(_)), Some(r)) => target::adopted_session(&target, r).map(Some),
         _ => None,
     };
     let to = match (&target, &record) {
@@ -6222,6 +6226,29 @@ The three `Done` arms:
         assert!(matches!(&s.target, Some(Target::Pane { session: None, .. })), "the record adopted the absence");
         wait_cond("absence remembered", || matches!(target::load_targets(state.path()).0.get(&top), Some(Target::Pane { session: None, .. })));
         wait_for(&handle, "live without a session", |s| s.target_state == TargetState::Live("idle".into()));
+    }
+
+    #[test]
+    fn a_send_time_check_adopts_the_session_a_sessionless_target_first_sees() {
+        let (dir, state, top, host) = sending_fixture();
+        let mut config = sending_config(dir.path(), state.path(), host.clone());
+        // No refresh adopts anything: the send's own check is the only one that runs.
+        config.poll_interval = Duration::from_secs(3600);
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "rows", |s| !s.files.is_empty() && !s.refreshing);
+        handle.commands.send(Command::SetTarget { token: 1, target: pane_target("w4:p2", "codex", None) }).unwrap();
+        wait_for(&handle, "picked", |s| s.target_token == Some(1));
+        handle.commands.send(pending(2, "first")).unwrap();
+        wait_for(&handle, "pending", |s| s.comments.len() == 1);
+        handle.commands.send(feedback(dispatch::Accepted::default())).unwrap();
+        let s = wait_for(&handle, "sent", |s| s.send_seq == 1);
+        assert!(s.send_error.is_none(), "{:?}", s.send_error);
+        assert!(matches!(&s.target, Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s1"), "the send's check taught the record its session");
+        wait_cond("and the record was written with it", || matches!(target::load_targets(state.path()).0.get(&top), Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s1"));
+        // The agent restarts: the next check reports a restart against s1 rather than adopting s2.
+        host.set_pane(agent_pane("w4:p2", "codex", "idle", Some("s2"), &top));
+        handle.commands.send(Command::Refresh).unwrap();
+        wait_for(&handle, "restarted", |s| s.target_state == TargetState::Restarted("idle".into()));
     }
 
     #[test]
@@ -8384,7 +8411,7 @@ pub fn step_on_side(diff: &LoadedDiff, cursor: usize, side: Side, delta: isize) 
 }
 ```
 
-The orphan cursor: in `move_cursor`'s `LineDown`, when the cursor is the last target of the unified order (or `targets.len() - 1` in split) and `rows.orphan_tops` is non-empty, set `state.orphan = Some(0)` and keep the cursor; with **no targets at all** (an empty list, or a diff that is not `Ready`, with orphans drawn by `orphans_only`), `LineDown` from nothing sets `orphan = Some(0)` too, which is the entry path into an orphan-only view; `LineDown` on orphan `n` moves to `n + 1` while one exists; `LineUp` on orphan 0 clears `orphan` (and leaves the cursor where it was, or nowhere); `LineUp` on `n` moves to `n - 1`; every other movement key clears `orphan`. `keep_cursor_visible` scrolls to `orphan_tops[n].0` when `orphan` is set. `move_cursor`'s early return on `(DiffState::Ready, Some(cursor))` must therefore give way to the orphan rules before it returns `Inert`.
+The orphan cursor: in `move_cursor`'s `LineDown`, when the cursor is the last target of the unified order (or `targets.len() - 1` in split) and `rows.orphan_tops` is non-empty, set `state.orphan = Some(0)` and keep the cursor; with **no targets at all** (an empty list, or a diff that is not `Ready`, with orphans drawn by `orphans_only`), `LineDown` from nothing sets `orphan = Some(0)` too, which is the entry path into an orphan-only view; `LineDown` on orphan `n` moves to `n + 1` while one exists; `LineUp` on orphan 0 clears `orphan` (and leaves the cursor where it was, or nowhere); `LineUp` on `n` moves to `n - 1`; every other movement key clears `orphan`. `keep_cursor_visible` scrolls to `orphan_tops[n].0` when `orphan` is set. `move_cursor`'s early return on `(DiffState::Ready, Some(cursor))` must therefore give way to the orphan rules before it returns `Inert`. The diff cursor is kept but hidden while `orphan` is set, so the hunk actions must not act on it: `open_box` (0.0.4's `s`, `d`, `D`) begins with `if state.orphan.is_some() { state.notify(NOTICE_NO_HUNK); return Outcome::Redraw; }`, the notice a key with no hunk under it gives anyway; `j_past_the_last_line_lands_on_an_orphan_card_where_u_and_x_act` presses `s` and `d` on the orphan and asserts the notice and no `confirm` box.
 
 4. `view.rs`: `body_line`'s two card arms are Step 4's; here they gain the cursor: an orphan card under the orphan cursor is drawn in reverse video as a cursor row is. A visual selection is drawn: every row whose target lies on the selection's side between its first and last line takes the cursor's reverse video on its text span (`render` computes the selected target set from `review::selection` once per frame and passes `selected: bool` to `body_line` beside `cursor`), so what `i` or `y` will act on is visible; a view test, `a_visual_selection_is_drawn_in_reverse_over_its_lines`, selects two lines with `v`, `j` and asserts the reverse flag on exactly those rows' text spans and on no other. `Action` gains `EditorCategory(Category)` (`key_action()` → `None`), handled in `handle_mouse`'s click arm by setting the open editor's category. The editor is modal for the mouse as the y/n box is: while `state.editor.is_some()`, `handle_mouse` handles `EditorCategory` clicks and the wheel (scrolling the body) and nothing else, so a click on the toolbar, the files panel or a diff row cannot open a picker, a box or another action under an open editor; a test, `clicks_under_an_open_editor_are_inert_except_the_category_words`, presses a toolbar hit and a file hit while editing and asserts `Outcome::Inert`, then clicks a category word and asserts the category changed. When the diff is not `Ready` but `rows::orphans` is non-empty or the editor is open, `render` draws `state.rows` (built by `orphans_only`) instead of `state_message`'s centred text, so an empty list with comments left behind shows the orphan section, not `working tree clean`, and a draft is never hidden behind that message. The editor's rows are real rows, so one coordinate system serves scrolling, hits and drawing: `Row::Editor { line: usize }`, one per line of `editor.lines(card_width)`, spliced by `rows::build` (and `orphans_only`) after the row the editor sits under, which `build` receives as `editor: Option<EditorPlace>` with `EditorPlace { after: EditorAnchor, lines: usize }` and `enum EditorAnchor { Anchor(Anchor), Orphan(String) /* the card's id */, End }`: the anchor's row through `attach_row` for an anchor in the loaded diff — only when `anchor.key == diff.key` and the anchor's comparison kind is the diff's, the rule `in_place` applies to cards, so a draft never sits under another file's line of the same number when a refresh replaces the diff (`a_draft_keeps_its_file_when_another_diff_takes_the_screen`) — the last `Row::Card` row carrying the id for an orphan being edited (the editor replaces the card visually), the last body row when the anchor's line is not in the diff or the diff is another file's. The rows carry no text; `view::body_line` draws `Row::Editor { line }` from `state.editor.lines(card_width)[line]`, `frame_top(editor.title(), …)` for the first, `frame_bottom(if editor.pending.is_some() { "saving…" } else { EDITOR_FOOTER }, …)` for the last, so typing never rebuilds the rows: `reconcile`'s key gains `(editor anchor, line count)` and rebuilds only when the editor opens, closes, moves or grows a line, which is rare and cheap. The title line pushes one hit per category word, `Action::EditorCategory(Category)`, and a click sets `editor.category` (spec 10.3's clickable words); the text rows push no hit. `view::body_is_drawn` stays true while the editor is open (it is a card, not a modal).
 
@@ -8722,6 +8749,13 @@ The tests that follow start from `review_setup` where they need a listed file, l
         assert_eq!(st.editor.as_ref().map(|e| e.text.as_str()), Some("lost"));
         handle_key(&mut st, &snap, key("Esc"), 120);
         assert!(matches!(handle_key(&mut st, &snap, key("x"), 120), Outcome::Engine(Command::DeleteComment { seen }) if seen.id == gone.id));
+        // The hidden diff cursor is not what the reviewer is looking at: no hunk action from an orphan.
+        for action in ["s", "d"] {
+            assert_eq!(handle_key(&mut st, &snap, key(action), 120), Outcome::Redraw, "{action}");
+            assert!(st.confirm.is_none(), "{action} opened a box for a hunk under a hidden cursor");
+            assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some(crate::engine::actions::NOTICE_NO_HUNK));
+            st.notice = None;
+        }
         handle_key(&mut st, &snap, key("k"), 120);
         assert_eq!(st.orphan, None);
         let _ = last;
@@ -9809,7 +9843,9 @@ In `tests/e2e_real_herdr.rs`, after the hunk-action block (`staged hunk 1/1 of a
         iso.send_enter(viewer_id);
         iso.herdr(&["pane", "wait-output", viewer_id, "--match", "→ clipboard", "--source", "visible", "--timeout", "15000"]);
         iso.herdr(&["pane", "send-text", viewer_id, "i"]);
-        iso.herdr(&["pane", "wait-output", viewer_id, "--match", "comment on R", "--source", "visible", "--timeout", "15000"]);
+        // The cursor is on the first changed line, a deletion or an addition as the fixture's hunk block left
+        // it: the title's prefix is what to wait for, not the side.
+        iso.herdr(&["pane", "wait-output", viewer_id, "--match", "comment on ", "--source", "visible", "--timeout", "15000"]);
         iso.herdr(&["pane", "send-text", viewer_id, "tier b"]);
         iso.send_enter(viewer_id);
         iso.herdr(&["pane", "wait-output", viewer_id, "--match", "Change · pending", "--source", "visible", "--timeout", "15000"]);
@@ -10228,3 +10264,13 @@ a session-less record over an adoption's within the same selection (tested with 
 until the adoption's write landed); and `SetTarget` carries the picker's token, echoed as
 `Snapshot.target_token` by the answer, so the picker closes on its own answer and not on a
 comment's write or an older pick's (the panes test observes all three).
+
+**Round 14 (codex, plan-complete, 2026-10-05).** Three findings, all applied, none structural:
+the Tier B step waited for `comment on R` where the fixture's cursor may sit on a deletion (it
+waits for the title's prefix); a send's own check adopts the first session a session-less
+target sees, as a refresh's check does, so a later restart is reported rather than adopted in
+silence (tested with polling held); and the hunk actions are inert while the orphan cursor is
+set, since the diff cursor they would act on is hidden (`s` and `d` tested on an orphan). The
+review stopped here: fourteen rounds, 22 → 17 → 17 → 13 → 14 → 11 → 12 → 10 → 7 → 5 → 6 → 6 →
+5 → 3 findings, the last three rounds mostly follow-ups to earlier fixes and the last one
+without a structural item.
