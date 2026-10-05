@@ -10275,4 +10275,60 @@ review stopped here: fourteen rounds, 22 → 17 → 17 → 13 → 14 → 11 → 
 5 → 3 findings, the last three rounds mostly follow-ups to earlier fixes and the last one
 without a structural item.
 
+## Execution notes
+
+Appended by the orchestrator as the tasks were executed (2026-10-05), one codex coder per
+task in a herdr pane (a fresh conversation each time), every gate run outside its sandbox,
+every commit made by the orchestrator, every fix falsified by hand before it counted. The
+per-task reports and audits are in `.lifeline-iterate/rl-20261005-080940/` (local).
+
+- **Task 1** (`cba8d1f`). As planned. The trickle test asserts the elapsed time before unwrapping
+  the error, since the old `read_line` accepted the complete JSON at EOF after 44 s; `wait_cond`
+  was pulled forward from Task 2; sixteen `SessionConfig` literals moved onto `..production(..)`,
+  not the nineteen the plan counted.
+- **Task 2** (`3fed86a`). As planned; the session's state directory is `inputs.state_dir`. The
+  two-picks test waits on `target_writes_waiting` before releasing each permit, so its order is
+  made rather than hoped for.
+- **Task 3** (`bccb8ed`). Four gaps in the sample code found and tested by the coder: the no-state
+  warning shown once rather than after every emptying of the array; a journal-only edit or delete
+  compares the whole seen record; a comments entry that is no list is reported with its neighbours
+  kept; `remove_request` refuses a relative directory. `Done::StoreRefreshed` carries the refresh.
+  One clippy allowance on `tui::input::Outcome`, enlarged by `EditComment { seen: Comment }`.
+- **Task 4** (`6718f5a`). `strip_controls` removes C0 and DEL as the pin's TypeScript does, not
+  `char::is_control()`, which would also have removed C1 (U+0085 is tested surviving). The pinned
+  prompt file has 25 newline-terminated lines, not 24.
+- **Task 5** (`7fbbff2`). Every one of the 22 new tests falsified at runtime under a named mutation.
+  The session-adoption fixture was found vacuous (the pick's own refresh had adopted the session)
+  and tightened; the shared-lock test waits for an observed host call instead of a sleep; `SendLock`
+  refuses a relative path; an immediate refusal resets `send_refusal` to `Other`.
+- **Task 6** (`9b58273`). The chip the spec places last but one takes fifteen cells, so three
+  existing toolbar tests render wider (50 -> 65, 140 -> 160) with every assertion intact. Four
+  picker boundaries found and tested: a stale `panes_error` across openings, a filter with no match
+  not claiming the host is empty, `~` abbreviation by path components, no hit for a clipped choice.
+- **Task 7** (`d89b29a`). Thirty-seven tests, eleven further regressions by the coder: `ctrl+d` and
+  `ctrl+u` scroll a tall editor; the gutter yields at the minimum width; text is sanitized per hard
+  line before wrapping; an edited orphan's card is replaced by the editor; side keys collapse a
+  selection only on a side change; the unbound-key probe moved from `x` to `/`; two help tests size
+  the terminal from `KEYS.len()`.
+- **Task 8** (`697316f`). `ReviewBox::fits` takes the snapshot; two footer labels shorten at forty
+  columns; two more help tests size themselves from `dialog::line_count`; an empty Request box is
+  not turned into a picker when the target goes. The second line naming the pane's directory
+  (spec 10.4's table) is not drawn: the record carries no directory, as the plan recorded.
+- **Task 9** (`e88822e`). The headless Tier B split is about fifty columns, where the toolbar keeps
+  the steppers and the target chip and drops the scope chip as spec 10.2 orders; the `vs main`
+  wait after `b` became a wait for the stepper's `a.txt 1/2`, the two branch rows where the
+  worktree lists one (`pane zoom` does not resize the headless pty). Tier B green on both hosts.
+
+**Branch review (codex, `codex exec review --base main`), five rounds.** Round 1: a comment whose
+hunk left the diff while its row stayed listed was reachable nowhere (now an orphan), and page keys
+did nothing over orphans (`a37675e`). Round 2: with bracketed paste neither enabled nor handled, a
+multiline paste into the editor saved its first line and fed the rest to the body's shortcuts, where
+a pasted `d` and `y` discarded a change (bracketed paste on; a paste is text in the editor and the
+pickers and inert everywhere else); an older copy finishing after a newer one overwrote the
+clipboard (a copy generation, checked under the lock) (`356c5a3`). Round 3: a paste into the base
+picker had gone inert; a short pane picker hid the clipboard row behind its wrapped note
+(`62a6828`). Round 4: a non-blocking connect that met a full backlog returned EAGAIN, mistaken for
+a pending connect; a mouse file selection left the orphan cursor set (`7159149`). Round 5: no
+findings.
+
 <!-- codex-reviewed: 2026-10-05T11:00:21Z -->
