@@ -8,6 +8,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Semaphore;
 
 use super::base::{self, MarkRecord, ResolveInputs};
+use super::comments;
 use super::host::{self, SessionRef};
 use super::target::{self, PaneRow, Target, TargetState};
 use super::{
@@ -225,6 +226,10 @@ struct Loaded {
     marked: Option<Marked>,
 }
 
+enum StoreOp {
+    Comment(comments::Operation, Option<u64>),
+}
+
 struct State {
     snapshot: Snapshot,
     branch: Option<String>,
@@ -270,6 +275,12 @@ struct State {
     action_seq: u64,
     /// How the published target was chosen; an opener preselection is written on the first comment.
     target_source: Option<target::Source>,
+    store: Option<comments::Store>,
+    store_opened: bool,
+    store_opening: bool,
+    store_queue: VecDeque<StoreOp>,
+    comment_seq: u64,
+    target_write_gate: Option<Arc<Semaphore>>,
     /// Advanced by every pick; older checks and sends are superseded.
     selection_generation: u64,
     latest_selection: Arc<AtomicU64>,
@@ -287,6 +298,13 @@ struct State {
     own_pane: Option<String>,
     host: Option<Arc<dyn host::HostClient>>,
     socket_path: Option<String>,
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn comparison_of(snapshot: &Snapshot) -> Comparison {
@@ -336,6 +354,13 @@ fn markable(
 }
 
 enum Done {
+    StoreOpened(comments::Store, Vec<String>),
+    StoreRefreshed(comments::Store, Vec<String>),
+    Comment {
+        token: Option<u64>,
+        store: Option<comments::Store>,
+        outcome: Result<Option<String>, String>,
+    },
     Target {
         generation: u64,
         token: Option<u64>,
@@ -733,6 +758,128 @@ async fn run_job(job: Job) -> Done {
 }
 
 impl State {
+    /// The store has one owner; commands wait while it opens or runs on the pool.
+    fn transact(
+        &mut self,
+        op: comments::Operation,
+        token: Option<u64>,
+        results: &UnboundedSender<Done>,
+    ) {
+        if !self.store_opened && !self.store_opening {
+            let _ = results.send(Done::Comment {
+                token,
+                store: None,
+                outcome: Err("not a git repository".into()),
+            });
+            return;
+        }
+        self.store_queue.push_back(StoreOp::Comment(op, token));
+        self.run_store_queue_comments(results);
+    }
+
+    fn run_store_queue_comments(&mut self, results: &UnboundedSender<Done>) {
+        let Some(store) = self.store.take() else {
+            return;
+        };
+        let Some(StoreOp::Comment(op, token)) = self.store_queue.pop_front() else {
+            self.store = Some(store);
+            return;
+        };
+        let mut store = store;
+        let results = results.clone();
+        tokio::spawn(async move {
+            let (store, outcome) = tokio::task::spawn_blocking(move || {
+                let outcome = store.transact(op, now());
+                (store, outcome)
+            })
+            .await
+            .expect("transaction task");
+            let _ = results.send(Done::Comment {
+                token,
+                store: Some(store),
+                outcome,
+            });
+        });
+    }
+
+    fn write_target(&mut self, next: &Snapshot, results: &UnboundedSender<Done>) {
+        if !std::mem::take(&mut self.target_write_pending) {
+            return;
+        }
+        let (Some(target), Some(dir), RepoState::Repo { toplevel, .. }) = (
+            next.target.clone(),
+            self.inputs.state_dir.clone(),
+            &next.repo,
+        ) else {
+            return;
+        };
+        let results = results.clone();
+        let (toplevel, generation) = (toplevel.clone(), self.selection_generation);
+        let (ticket, tickets) = (
+            self.write_tickets.fetch_add(1, Ordering::SeqCst) + 1,
+            self.write_tickets.clone(),
+        );
+        let (gate, waiting, done) = (
+            self.target_write_gate.clone(),
+            self.target_writes_waiting.clone(),
+            self.target_writes_done.clone(),
+        );
+        tokio::spawn(async move {
+            if let Some(gate) = gate {
+                waiting.fetch_add(1, Ordering::SeqCst);
+                gate.acquire().await.expect("gate").forget();
+                waiting.fetch_sub(1, Ordering::SeqCst);
+            }
+            let written = tokio::task::spawn_blocking(move || {
+                // Only the latest requested write may land, even within one selection.
+                target::save_target_if(&dir, &toplevel, &target, ticket, &tickets)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+            done.fetch_add(1, Ordering::SeqCst);
+            let _ = results.send(Done::Target {
+                generation,
+                token: None,
+                written,
+            });
+        });
+    }
+
+    fn refresh_comments(&mut self, repo: &RepoState, results: &UnboundedSender<Done>) {
+        let RepoState::Repo { toplevel, .. } = repo else {
+            return;
+        };
+        if !self.store_opened && !self.store_opening {
+            self.store_opening = true;
+            let (dir, toplevel, results) = (
+                self.inputs.state_dir.clone(),
+                toplevel.clone(),
+                results.clone(),
+            );
+            tokio::spawn(async move {
+                let (store, problems) = tokio::task::spawn_blocking(move || {
+                    comments::Store::open(dir, &toplevel, now())
+                })
+                .await
+                .expect("store open task");
+                let _ = results.send(Done::StoreOpened(store, problems));
+            });
+        } else if let Some(mut store) = self.store.take() {
+            let results = results.clone();
+            tokio::spawn(async move {
+                let (store, problems) = tokio::task::spawn_blocking(move || {
+                    let problems = store.refresh(now());
+                    (store, problems)
+                })
+                .await
+                .expect("store refresh task");
+                let _ = results.send(Done::StoreRefreshed(store, problems));
+            });
+        }
+    }
+
     /// One refresh: status, head when asked, and the rows of the current or requested comparison.
     fn request_status(
         &mut self,
@@ -951,7 +1098,7 @@ fn fingerprint(s: &Snapshot) -> String {
         DiffState::Ready(d) => format!("ready:{:p}", Arc::as_ptr(d)),
     };
     format!(
-        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}",
+        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:p}|{}|{:?}|{}|{:?}",
         s.repo,
         serde_json::to_string(&s.files).unwrap_or_default(),
         s.selected,
@@ -987,6 +1134,11 @@ fn fingerprint(s: &Snapshot) -> String {
         s.panes.as_ref().map(Arc::as_ptr),
         s.panes_seq,
         s.panes_error,
+        Arc::as_ptr(&s.comments),
+        s.comment_seq,
+        s.comment_error,
+        s.comment_refused,
+        s.comment_token,
     )
 }
 
@@ -1125,6 +1277,12 @@ async fn run(
         fresh_arc_pending: false,
         action_seq: 0,
         target_source: None,
+        store: None,
+        store_opened: false,
+        store_opening: false,
+        store_queue: VecDeque::new(),
+        comment_seq: 0,
+        target_write_gate: config.target_write_gate.clone(),
         selection_generation: 0,
         latest_selection: Arc::new(AtomicU64::new(0)),
         target_seq: 0,
@@ -1252,6 +1410,30 @@ async fn run(
                             publish(&mut state, next, &snapshots);
                             state.request_status(&cwd, false, &results_tx, &refreshes);
                         }
+                    }
+                    Command::AddComment { token, anchor, category, text } => {
+                        match comments::check_text(&text) {
+                            Ok(text) => state.transact(comments::Operation::Add(comments::Comment {
+                                id: comments::new_id(), anchor, category, text, created_at: now(),
+                                state: comments::CommentState::Pending,
+                            }), Some(token), &results_tx),
+                            Err(error) => {
+                                let _ = results_tx.send(Done::Comment { token: Some(token), store: None, outcome: Err(error) });
+                            }
+                        }
+                    }
+                    Command::EditComment { token, seen, category, text } => {
+                        match comments::check_text(&text) {
+                            Ok(text) => state.transact(comments::Operation::Edit {
+                                id: seen.id.clone(), category, text, seen,
+                            }, Some(token), &results_tx),
+                            Err(error) => {
+                                let _ = results_tx.send(Done::Comment { token: Some(token), store: None, outcome: Err(error) });
+                            }
+                        }
+                    }
+                    Command::DeleteComment { seen } => {
+                        state.transact(comments::Operation::Delete { id: seen.id.clone(), seen }, None, &results_tx);
                     }
                     Command::SetTarget { token, target } => {
                         state.selection_generation += 1;
@@ -1441,6 +1623,53 @@ async fn run(
                             }
                         }
                         publish(&mut state, next, &snapshots);
+                    }
+                    Done::StoreOpened(store, problems) | Done::StoreRefreshed(store, problems) => {
+                        state.store_opened = true;
+                        state.store_opening = false;
+                        if next.comments.as_slice() != store.comments() {
+                            next.comments = Arc::new(store.comments().to_vec());
+                        }
+                        state.store = Some(store);
+                        for problem in problems {
+                            if let Some(dir) = &state.inputs.state_dir {
+                                base::note_problem(dir, &problem);
+                            }
+                            if problem.starts_with("a comment changed under you; ") {
+                                state.comment_seq += 1;
+                                next.comment_seq = state.comment_seq;
+                                next.comment_error = Some(problem);
+                                next.comment_refused = false;
+                                next.comment_token = None;
+                            }
+                        }
+                        publish(&mut state, next, &snapshots);
+                        state.run_store_queue_comments(&results_tx);
+                    }
+                    Done::Comment { token, store, outcome } => {
+                        if let Some(store) = store {
+                            if next.comments.as_slice() != store.comments() {
+                                next.comments = Arc::new(store.comments().to_vec());
+                            }
+                            state.store = Some(store);
+                        }
+                        state.comment_seq += 1;
+                        next.comment_seq = state.comment_seq;
+                        next.comment_token = token;
+                        next.comment_refused = matches!(&outcome, Err(e) if !e.starts_with(comments::NOTICE_NOT_REMEMBERED));
+                        next.comment_error = match outcome {
+                            Ok(notice) => notice,
+                            Err(e) => Some(e),
+                        };
+                        if next.comment_error.as_deref().is_none_or(|e| !e.starts_with(comments::NOTICE_NOT_REMEMBERED)) {
+                            if state.target_source == Some(target::Source::Opener) {
+                                state.target_write_pending = true;
+                                state.target_source = Some(target::Source::Remembered);
+                            }
+                            state.write_target(&next, &results_tx);
+                        }
+                        publish(&mut state, next, &snapshots);
+                        state.run_store_queue_comments(&results_tx);
                     }
                     Done::Target { generation, token, written } => {
                         // A newer pick owns its answer; an older answer reaches no picker.
@@ -1663,6 +1892,7 @@ async fn run(
                                 }
                             }
                         }
+                        state.refresh_comments(&next.repo, &results_tx);
                         if matches!(change, Some(Change::Mark(_))) && !mark_answered {
                             state.mark_seq += 1;
                             next.mark_seq = state.mark_seq;
@@ -1981,6 +2211,354 @@ mod tests {
             }),
             title: String::new(),
         }
+    }
+
+    #[test]
+    fn a_delayed_adoption_write_never_overwrites_a_newer_pick() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        target::save_target(state.path(), &top, &pane_target("w4:p2", "codex", None)).unwrap();
+        let host = host::Scripted::with_panes(vec![agent_pane(
+            "w4:p2",
+            "codex",
+            "idle",
+            Some("s1"),
+            &top,
+        )]);
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.host = Some(host.clone());
+        config.socket_path = Some("/run/fake.sock".into());
+        let gate = Arc::new(Semaphore::new(0));
+        config.target_write_gate = Some(gate.clone());
+        let (_rt, handle) = start_from(config);
+        wait_for(
+            &handle,
+            "adopted in memory",
+            |s| matches!(&s.target, Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s1"),
+        );
+        handle.commands.send(pending(2, "x")).unwrap();
+        wait_for(&handle, "comment", |s| s.comment_seq == 1);
+        wait_cond("the adoption's write is waiting at the gate", || {
+            handle.target_writes_waiting.load(Ordering::SeqCst) == 1
+        });
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 1,
+                target: Target::Clipboard,
+            })
+            .unwrap();
+        wait_for(&handle, "re-pick answered", |s| {
+            s.target_seq == 1
+                && s.target == Some(Target::Clipboard)
+                && s.target_error.is_none()
+                && s.target_token == Some(1)
+        });
+        assert_eq!(
+            target::load_targets(state.path()).0.get(&top),
+            Some(&Target::Clipboard)
+        );
+        gate.add_permits(1);
+        wait_cond("the adoption's write ran too", || {
+            handle.target_writes_done.load(Ordering::SeqCst) == 2
+        });
+        assert_eq!(
+            target::load_targets(state.path()).0.get(&top),
+            Some(&Target::Clipboard),
+            "an older write replaced the newer pick"
+        );
+    }
+
+    #[test]
+    fn a_picks_write_that_lands_after_an_adoption_keeps_the_adopted_session() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let host = host::Scripted::with_panes(vec![agent_pane(
+            "w4:p2",
+            "codex",
+            "idle",
+            Some("s1"),
+            &top,
+        )]);
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.host = Some(host.clone());
+        config.socket_path = Some("/run/fake.sock".into());
+        let gate = Arc::new(Semaphore::new(0));
+        config.pick_write_gate = Some(gate.clone());
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "rows", |s| !s.files.is_empty());
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 1,
+                target: pane_target("w4:p2", "codex", None),
+            })
+            .unwrap();
+        wait_for(
+            &handle,
+            "adopted in memory",
+            |s| matches!(&s.target, Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s1"),
+        );
+        handle.commands.send(pending(2, "x")).unwrap();
+        wait_cond(
+            "the adoption's write landed",
+            || matches!(target::load_targets(state.path()).0.get(&top), Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s1"),
+        );
+        gate.add_permits(1);
+        let s = wait_for(&handle, "the pick answered", |s| s.target_token == Some(1));
+        assert_eq!(s.target_error, None, "skipped, not failed");
+        assert!(
+            matches!(target::load_targets(state.path()).0.get(&top), Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s1"),
+            "the pick's older write erased the adopted session"
+        );
+    }
+
+    fn pending(anchor_line: u32, text: &str) -> Command {
+        Command::AddComment {
+            token: 0,
+            anchor: comments::Anchor {
+                key: FileKey {
+                    path: "a.txt".into(),
+                    staged: false,
+                    untracked: false,
+                },
+                side: crate::engine::nav::Side::Additions,
+                line: anchor_line,
+                span: comments::Span::Line,
+                comparison: comments::AnchorComparison::Worktree,
+            },
+            category: comments::Category::Bug,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn comments_are_added_edited_deleted_and_shared_between_two_sessions() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        let (_rt, a) = start_from(config);
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        let (_rt2, b) = start_from(config);
+        wait_for(&a, "rows", |s| !s.files.is_empty());
+        wait_for(&b, "rows", |s| !s.files.is_empty());
+        a.commands.send(pending(2, "floor division")).unwrap();
+        let s = wait_for(&a, "added", |s| s.comment_seq == 1);
+        assert!(s.comment_error.is_none());
+        assert_eq!(s.comments.len(), 1);
+        let s = wait_for(&b, "b sees it", |s| s.comments.len() == 1);
+        assert_eq!(s.comments[0].text, "floor division");
+        let seen = s.comments[0].clone();
+        b.commands
+            .send(Command::EditComment {
+                token: 7,
+                seen: seen.clone(),
+                category: comments::Category::Question,
+                text: "why floor?".into(),
+            })
+            .unwrap();
+        wait_for(&b, "edited", |s| {
+            s.comment_seq == 1 && s.comment_error.is_none()
+        });
+        let s = wait_for(&a, "a sees the edit", |s| {
+            s.comments.first().is_some_and(|c| c.text == "why floor?")
+        });
+        a.commands
+            .send(Command::EditComment {
+                token: 8,
+                seen: seen.clone(),
+                category: comments::Category::Bug,
+                text: "mine".into(),
+            })
+            .unwrap();
+        let s2 = wait_for(&a, "stale edit refused", |s| s.comment_seq == 2);
+        assert_eq!(s2.comment_error.as_deref(), Some("No comment selected."));
+        assert_eq!(s2.comments[0].text, "why floor?");
+        let edited = s.comments[0].clone();
+        a.commands
+            .send(Command::DeleteComment { seen: edited })
+            .unwrap();
+        wait_for(&a, "deleted", |s| {
+            s.comment_seq == 3 && s.comments.is_empty()
+        });
+        wait_for(&b, "b sees the deletion", |s| s.comments.is_empty());
+        b.commands
+            .send(Command::EditComment {
+                token: 9,
+                seen,
+                category: comments::Category::Bug,
+                text: "x".into(),
+            })
+            .unwrap();
+        let s = wait_for(&b, "stale edit answered", |s| s.comment_seq == 2);
+        assert_eq!(s.comment_error.as_deref(), Some("No comment selected."));
+        a.commands
+            .send(pending(2, &"x".repeat(comments::MAX_CHARS + 1)))
+            .unwrap();
+        let s = wait_for(&a, "limit", |s| s.comment_seq == 4);
+        assert_eq!(s.comment_error.as_deref(), Some(comments::NOTICE_LIMIT));
+    }
+
+    #[test]
+    fn an_opener_write_that_fails_says_so_and_the_next_comment_retries() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let host = host::Scripted::with_panes(vec![agent_pane(
+            "w4:p1",
+            "claude",
+            "idle",
+            Some("c1"),
+            &top,
+        )]);
+        std::fs::create_dir(state.path().join("targets.json")).unwrap();
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.host = Some(host.clone());
+        config.socket_path = Some("/run/fake.sock".into());
+        config.opener_pane = Some("w4:p1".into());
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "opener preselected", |s| s.target.is_some());
+        handle.commands.send(pending(2, "x")).unwrap();
+        let s = wait_for(&handle, "the write answered", |s| s.target_seq == 1);
+        assert!(
+            s.target_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("target not remembered: ")),
+            "{:?}",
+            s.target_error
+        );
+        assert!(
+            matches!(&s.target, Some(Target::Pane { pane, .. }) if pane == "w4:p1"),
+            "the target stays in memory"
+        );
+        std::fs::remove_dir(state.path().join("targets.json")).unwrap();
+        handle.commands.send(pending(1, "y")).unwrap();
+        let s = wait_for(&handle, "written", |s| s.target_seq == 2);
+        assert_eq!(s.target_error, None);
+        assert!(
+            matches!(target::load_targets(state.path()).0.get(&top), Some(Target::Pane { pane, .. }) if pane == "w4:p1")
+        );
+    }
+
+    #[test]
+    fn a_comment_sent_while_the_store_opens_is_kept_and_lands() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(state.path().join("split-panes.lock"))
+            .unwrap();
+        use std::os::unix::io::AsRawFd;
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "rows", |s| !s.files.is_empty());
+        handle.commands.send(pending(2, "early")).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            handle.snapshots.try_iter().all(|s| s.comment_seq == 0),
+            "answered before the store was open"
+        );
+        drop(lock);
+        let s = wait_for(&handle, "landed", |s| s.comment_seq == 1);
+        assert!(s.comment_error.is_none(), "{:?}", s.comment_error);
+        assert_eq!(s.comments[0].text, "early");
+    }
+
+    #[test]
+    fn comments_hold_for_the_session_without_a_state_directory() {
+        let dir = fixture();
+        let (_rt, handle) = start(dir.path(), Arc::new(AtomicBool::new(true)));
+        wait_for(&handle, "rows", |s| !s.files.is_empty());
+        handle.commands.send(pending(2, "one")).unwrap();
+        let s = wait_for(&handle, "first", |s| s.comment_seq == 1);
+        assert_eq!(
+            s.comment_error.as_deref(),
+            Some("comments not remembered: no state directory")
+        );
+        handle.commands.send(pending(2, "two")).unwrap();
+        let s = wait_for(&handle, "second", |s| s.comment_seq == 2);
+        assert!(s.comment_error.is_none(), "the notice shows once");
+        assert_eq!(s.comments.len(), 2);
+    }
+
+    #[test]
+    fn a_sending_record_older_than_a_minute_is_published_unconfirmed_by_a_refresh() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut stale = comments::Comment {
+            id: comments::new_id(),
+            anchor: comments::Anchor {
+                key: FileKey {
+                    path: "a.txt".into(),
+                    staged: false,
+                    untracked: false,
+                },
+                side: crate::engine::nav::Side::Additions,
+                line: 2,
+                span: comments::Span::Line,
+                comparison: comments::AnchorComparison::Worktree,
+            },
+            category: comments::Category::Bug,
+            text: "stale".into(),
+            created_at: 1,
+            state: comments::CommentState::Pending,
+        };
+        stale.state = comments::CommentState::Sending {
+            stamp: comments::Stamp {
+                at: now() - 61,
+                nonce: "abcdef".into(),
+                item: 1,
+                to: target::Destination::clipboard(),
+            },
+            before: Vec::new(),
+        };
+        std::fs::write(
+            state.path().join("comments.json"),
+            serde_json::json!({ top.as_str(): [stale] }).to_string(),
+        )
+        .unwrap();
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        let (_rt, handle) = start_from(config);
+        let s = wait_for(&handle, "unconfirmed", |s| {
+            matches!(
+                s.comments.first().map(|c| &c.state),
+                Some(comments::CommentState::Unconfirmed { .. })
+            )
+        });
+        assert_eq!(s.comments[0].stamp().unwrap().nonce, "abcdef");
     }
 
     #[test]

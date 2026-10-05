@@ -2,6 +2,7 @@
 pub mod actions;
 pub mod base;
 pub mod branch;
+pub mod comments;
 pub mod gitver;
 pub mod host;
 pub mod marks;

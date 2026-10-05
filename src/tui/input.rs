@@ -12,6 +12,7 @@ use crate::tui::view::{self, Action, Rendered};
 use crate::tui::{dialog, format};
 
 #[derive(Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // Commands carry the comment the editor saw.
 pub enum Outcome {
     Quit,
     Redraw,

@@ -2,6 +2,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::engine::comments::{Anchor, Category, Comment};
 use crate::engine::nav::{targets_for_diff, unified_order, Target};
 use crate::engine::target::{PaneRow, TargetState};
 use crate::git::{ChangedFile, ChangedFileStatus, FileDiff, GetGitDiffResponse};
@@ -13,7 +14,7 @@ pub const NO_BASE_NOTICE: &str = "no base branch: set [base] ref or press B";
 
 /// vimeflow's file identity: a partially staged path is two rows. In branch
 /// scope a path deleted on the branch and recreated untracked is two rows too.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FileKey {
     pub path: String,
     pub staged: bool,
@@ -323,6 +324,15 @@ pub struct Snapshot {
     pub panes: Option<Arc<Vec<PaneRow>>>,
     pub panes_seq: u64,
     pub panes_error: Option<String>,
+    /// This worktree's comments in every state (spec 10.3).
+    pub comments: Arc<Vec<Comment>>,
+    /// Advanced once per comment answer or refresh notice.
+    pub comment_seq: u64,
+    pub comment_error: Option<String>,
+    /// False for accepted operations, including journaled ones.
+    pub comment_refused: bool,
+    /// The add or edit token; absent for deletions and refresh notices.
+    pub comment_token: Option<u64>,
 }
 
 impl Snapshot {
@@ -366,6 +376,11 @@ impl Snapshot {
             panes: None,
             panes_seq: 0,
             panes_error: None,
+            comments: Arc::new(Vec::new()),
+            comment_seq: 0,
+            comment_error: None,
+            comment_refused: false,
+            comment_token: None,
         }
     }
 }
@@ -392,6 +407,23 @@ pub enum Command {
     SetTarget {
         token: u64,
         target: crate::engine::target::Target,
+    },
+    /// Add a comment and echo the editor's save token.
+    AddComment {
+        token: u64,
+        anchor: Anchor,
+        category: Category,
+        text: String,
+    },
+    /// Change only the record the editor saw.
+    EditComment {
+        token: u64,
+        seen: Comment,
+        category: Category,
+        text: String,
+    },
+    DeleteComment {
+        seen: Comment,
     },
     Shutdown,
 }
