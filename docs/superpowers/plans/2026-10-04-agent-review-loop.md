@@ -19,7 +19,7 @@
 - Comments, the target, the boxes and the picker work in both scopes. Branch-scope anchors carry the merge-base they were made against and never move.
 - State files: `targets.json`, `comments.json`, `requests.json`, `clipboard.md` and `send.lock` join `bases.json`, `marks.json` and `split-panes.lock` in the state directory, written only under an absolute state directory through a temporary file and a rename, under `reuse::with_lock` (the state lock) or `send.lock` (the send lock), never relative to the repository.
 - Colours are the terminal's named ANSI colours only (`Role`/`Semantic` of `tui::style`); the "dim" of spec 10.2 and 10.3 is `Role::Label`.
-- Behaviour without a target or a comment is 0.0.4's: every existing test keeps passing without being weakened, except where this plan names the test and the reason (the key count, the reserved set, the state-directory file list of the read-only test).
+- Behaviour without a target or a comment is 0.0.4's: every existing test keeps passing without being weakened, except where this plan names the test and the reason (the key count, the reserved set, the state-directory file list of the read-only test, and the toolbar chip count and style in `toolbar_chips_are_padded_reversed_accent_bold_and_plain_text_is_not`, Task 6).
 - Commits are conventional with a lowercase subject; inline comments are one short line and never reference a task or PR. The orchestrator makes every commit; the implementer leaves the tree uncommitted.
 - `cargo test` needs a writable `HOME` outside any git repository: `CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" HOME="$(mktemp -d)" cargo test --locked -- --test-threads=1`.
 - The version becomes `0.0.5` in Task 9 only; no other task touches `Cargo.toml`, `Cargo.lock` or `herdr-plugin.toml`.
@@ -2131,9 +2131,10 @@ pub struct Anchor { pub key: FileKey /* path, staged, untracked */, pub side: Si
 pub struct Stamp { pub at: u64, pub nonce: String, pub item: u32, pub to: Destination }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] #[serde(tag = "state", rename_all = "lowercase")]
-pub enum CommentState { Pending, Sending { #[serde(flatten)] stamp: Stamp, before: Option<Stamp> },
-                        Unconfirmed { #[serde(flatten)] stamp: Stamp, before: Option<Stamp> }, Sent(Stamp) }
-// `before` on Sending and Unconfirmed is the earlier Unconfirmed stamp a retry replaced: it survives the timeout, so a
+pub enum CommentState { Pending, Sending { #[serde(flatten)] stamp: Stamp, before: Vec<Stamp> },
+                        Unconfirmed { #[serde(flatten)] stamp: Stamp, before: Vec<Stamp> }, Sent(Stamp) }
+// `before` on Sending and Unconfirmed is every earlier uncertain stamp the retries replaced, newest first (a chain, so
+// that a third attempt's failure and the second's late failure restore the first, never `Pending`); it survives the timeout, so a
 // late definite failure restores it rather than Pending. The newtype variant Sent merges the stamp's fields beside the tag.
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2193,7 +2194,7 @@ EditComment { token: u64, seen: Comment, category: Category, text: String },
 DeleteComment { seen: Comment },
 ```
 
-On the serde shapes: `FileKey` and `nav::Side` gain `Serialize`/`Deserialize` derives (`Side` as `"additions"`/`"deletions"`); `Destination` is Task 2's. A `Sending` record serialises as `{"state":"sending","at":…,"nonce":…,"item":…,"to":{…},"before":{…}|null}`; `Unconfirmed` and `Sent` flatten their stamp the same way. The file is `{"<toplevel>": [ <comment>, … ]}`, one array per worktree, as `marks.json` is one record per worktree.
+On the serde shapes: `FileKey` and `nav::Side` gain `Serialize`/`Deserialize` derives (`Side` as `"additions"`/`"deletions"`); `Destination` is Task 2's. A `Sending` record serialises as `{"state":"sending","at":…,"nonce":…,"item":…,"to":{…},"before":[{…},…]}` (`before` omitted when empty, read as empty when absent); `Unconfirmed` and `Sent` flatten their stamp the same way. The file is `{"<toplevel>": [ <comment>, … ]}`, one array per worktree, as `marks.json` is one record per worktree.
 
 - [ ] **Step 1: Tests first**
 
@@ -2259,7 +2260,7 @@ mod tests {
         // An unconfirmed record is still the reviewer's to edit or delete; an edit makes it pending
         // again, so a late success for the old nonce cannot mark text the host never saw as sent.
         let mut unconfirmed = comment("u1", "maybe", 9);
-        unconfirmed.state = CommentState::Unconfirmed { before: None, stamp: stamp("abc123") };
+        unconfirmed.state = CommentState::Unconfirmed { before: Vec::new(), stamp: stamp("abc123") };
         a.transact(Operation::Add(unconfirmed.clone()), 9).unwrap();
         a.transact(Operation::Edit { id: "u1".into(), category: Category::Bug, text: "maybe not".into(), seen: unconfirmed.clone() }, 10).unwrap();
         let edited = a.comments().iter().find(|c| c.id == "u1").unwrap().clone();
@@ -2282,7 +2283,7 @@ mod tests {
         assert_eq!(b.transact(Operation::Add(comment("b50", "t", 50)), 10).unwrap_err(), NOTICE_CAP);
         // Fifty claimed as Sending still count.
         for c in a.comments_mut_for_tests() {
-            c.state = CommentState::Sending { stamp: stamp("aaaaaa"), before: None };
+            c.state = CommentState::Sending { stamp: stamp("aaaaaa"), before: Vec::new() };
         }
         a.write_for_tests();
         b.refresh(11);
@@ -2362,9 +2363,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = open(dir.path());
         let mut young = comment("young", "y", 1);
-        young.state = CommentState::Sending { stamp: Stamp { at: 1_010, ..stamp("aaaaaa") }, before: None };
+        young.state = CommentState::Sending { stamp: Stamp { at: 1_010, ..stamp("aaaaaa") }, before: Vec::new() };
         let mut old = comment("old", "o", 1);
-        old.state = CommentState::Sending { stamp: Stamp { at: 950, ..stamp("bbbbbb") }, before: Some(stamp("cccccc")) };
+        old.state = CommentState::Sending { stamp: Stamp { at: 950, ..stamp("bbbbbb") }, before: vec![stamp("cccccc")] };
         // Neither is sixty seconds old at 1_000, so the adds write them as they are.
         store.transact(Operation::Add(young), 1_000).unwrap();
         store.transact(Operation::Add(old), 1_000).unwrap();
@@ -2390,7 +2391,7 @@ mod tests {
         store.transact(Operation::Add(comment("fine", "kept", 1)), 1_000).unwrap();
         let mut stale = comment("stale", "x", 2);
         // Claimed fifty seconds ago: not expired when added, expired when reopened a minute later.
-        stale.state = CommentState::Sending { stamp: Stamp { at: 950, ..stamp("aaaaaa") }, before: None };
+        stale.state = CommentState::Sending { stamp: Stamp { at: 950, ..stamp("aaaaaa") }, before: Vec::new() };
         store.transact(Operation::Add(stale), 1_000).unwrap();
         assert!(matches!(store.comments()[1].state, CommentState::Sending { .. }));
         // Opened later, the expiry must be written; when it cannot be, the records are still shown.
@@ -2572,6 +2573,38 @@ mod tests {
     }
 
     #[test]
+    fn retries_keep_every_uncertain_stamp_and_a_late_word_settles_the_right_one() {
+        // A was uncertain; retry B times out; retry C fails; then B's late failure arrives, then A's late success.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        let mut a = comment("c", "x", 1);
+        a.state = CommentState::Unconfirmed { stamp: stamp("aaaaaa"), before: Vec::new() };
+        store.transact(Operation::Add(a), 1_000).unwrap();
+        let to = Destination::clipboard();
+        let ok = || Ok(());
+        let mut counter = 0;
+        let make_b = |_: u64| "bbbbbb".to_string();
+        store.claim(1_001, &to, &make_b, &mut counter, &ok, |_, _| Ok("b".into())).unwrap();
+        assert!(matches!(&store.comments()[0].state, CommentState::Sending { stamp, before } if stamp.nonce == "bbbbbb" && before.iter().map(|b| b.nonce.as_str()).collect::<Vec<_>>() == ["aaaaaa"]));
+        store.settle(1_002, "bbbbbb", Settlement::Unconfirmed).unwrap();
+        let make_c = |_: u64| "cccccc".to_string();
+        store.claim(1_003, &to, &make_c, &mut counter, &ok, |_, _| Ok("c".into())).unwrap();
+        assert!(matches!(&store.comments()[0].state, CommentState::Sending { stamp, before } if stamp.nonce == "cccccc" && before.iter().map(|b| b.nonce.as_str()).collect::<Vec<_>>() == ["bbbbbb", "aaaaaa"]), "the whole chain is kept");
+        store.settle(1_004, "cccccc", Settlement::Failed).unwrap();
+        assert!(matches!(&store.comments()[0].state, CommentState::Unconfirmed { stamp, before } if stamp.nonce == "bbbbbb" && before.len() == 1), "C's failure restores B, with A behind it");
+        store.settle(1_005, "bbbbbb", Settlement::Failed).unwrap();
+        assert!(matches!(&store.comments()[0].state, CommentState::Unconfirmed { stamp, before } if stamp.nonce == "aaaaaa" && before.is_empty()), "B's late failure restores A, not Pending: A may have arrived");
+        store.settle(1_006, "aaaaaa", Settlement::Sent).unwrap();
+        assert!(matches!(&store.comments()[0].state, CommentState::Sent(st) if st.nonce == "aaaaaa"));
+        // A late success for an attempt deeper in the chain settles the record as sent under that attempt.
+        let mut d = comment("d", "y", 2);
+        d.state = CommentState::Unconfirmed { stamp: stamp("eeeeee"), before: vec![stamp("dddddd")] };
+        store.transact(Operation::Add(d), 1_007).unwrap();
+        store.settle(1_008, "dddddd", Settlement::Sent).unwrap();
+        assert!(matches!(&store.comments()[1].state, CommentState::Sent(st) if st.nonce == "dddddd"));
+    }
+
+    #[test]
     fn requests_are_recorded_and_nonces_in_use_are_known() {
         let dir = tempfile::tempdir().unwrap();
         let record = RequestRecord {
@@ -2671,13 +2704,19 @@ mod tests {
         let mut c = comment("0123456789abcdef0123456789abcdef", "a\nb", 7);
         c.state = CommentState::Sending {
             stamp: Stamp { at: 9, nonce: "abc123".into(), item: 2, to: Destination::Pane { pane: "w4:p2".into(), agent: "codex".into(), session: Some(crate::engine::host::SessionRef { kind: "id".into(), value: "s".into() }) } },
-            before: Some(Stamp { at: 3, nonce: "zzz999".into(), item: 1, to: Destination::clipboard() }),
+            before: vec![Stamp { at: 3, nonce: "zzz999".into(), item: 1, to: Destination::clipboard() }],
         };
         let json = serde_json::to_value(&c).unwrap();
         assert_eq!(json["state"], "sending");
         assert_eq!(json["nonce"], "abc123");
         assert_eq!(json["to"]["pane"], "w4:p2");
-        assert_eq!(json["before"]["to"]["clipboard"], true);
+        assert_eq!(json["before"][0]["to"]["clipboard"], true);
+        let mut plain = comment("0123456789abcdef0123456789abcdef", "x", 1);
+        plain.state = CommentState::Unconfirmed { stamp: stamp("abc123"), before: Vec::new() };
+        let value = serde_json::to_value(&plain).unwrap();
+        assert!(value.get("before").is_none(), "an empty chain is not written");
+        let back: Comment = serde_json::from_value(value).unwrap();
+        assert!(matches!(back.state, CommentState::Unconfirmed { before, .. } if before.is_empty()), "and reads back as empty");
         assert_eq!(json["anchor"]["side"], "additions");
         assert_eq!(json["anchor"]["span"], "line");
         assert_eq!(json["category"], "bug");
@@ -2815,17 +2854,20 @@ pub enum CommentState {
     Sending {
         #[serde(flatten)]
         stamp: Stamp,
-        /// The `Unconfirmed` stamp this claim replaced, restored if the send definitely fails.
-        #[serde(default)]
-        before: Option<Stamp>,
+        /// The uncertain stamps this claim replaced, newest first: the `Unconfirmed` one it found and
+        /// that one's own `before`. A definite failure restores the first of them, with the rest; a
+        /// chain, because a third attempt's failure and the second's late failure must land on the
+        /// first, which may have arrived, and never on `Pending`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        before: Vec<Stamp>,
     },
-    /// Kept through the timeout that made it: a late definite failure restores `before`, because
-    /// that failure says nothing about the earlier send that may have arrived.
+    /// Kept through the timeout that made it: a late definite failure restores `before`'s first,
+    /// because that failure says nothing about the earlier sends that may have arrived.
     Unconfirmed {
         #[serde(flatten)]
         stamp: Stamp,
-        #[serde(default)]
-        before: Option<Stamp>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        before: Vec<Stamp>,
     },
     // A newtype variant of an internally tagged enum serialises its struct's fields beside the tag.
     Sent(Stamp),
@@ -2964,7 +3006,7 @@ pub fn check_record(comment: &Comment) -> bool {
     let state_ok = match &comment.state {
         CommentState::Pending => true,
         CommentState::Sending { stamp, before } | CommentState::Unconfirmed { stamp, before } => {
-            stamp_ok(stamp) && before.as_ref().is_none_or(stamp_ok)
+            stamp_ok(stamp) && before.iter().all(stamp_ok)
         }
         CommentState::Sent(s) => stamp_ok(s),
     };
@@ -3552,9 +3594,9 @@ pub fn remove_request(state_dir: &Path, toplevel: &str, nonce: &str) -> std::io:
 pub fn nonces_in_use(state_dir: &Path, own: &[Comment]) -> std::io::Result<BTreeSet<String>> {
     fn nonces_of(comments: &[Comment]) -> impl Iterator<Item = String> + '_ {
         comments.iter().flat_map(|c| {
-            let before = match &c.state {
-                CommentState::Sending { before: Some(b), .. } | CommentState::Unconfirmed { before: Some(b), .. } => Some(b.nonce.clone()),
-                _ => None,
+            let before: Vec<String> = match &c.state {
+                CommentState::Sending { before, .. } | CommentState::Unconfirmed { before, .. } => before.iter().map(|b| b.nonce.clone()).collect(),
+                _ => Vec::new(),
             };
             c.stamp().map(|s| s.nonce.clone()).into_iter().chain(before)
         })
@@ -3895,7 +3937,7 @@ The refresh: `run_job` cannot carry the store (it lives on `State`), so on every
         };
         stale.state = comments::CommentState::Sending {
             stamp: comments::Stamp { at: now() - 61, nonce: "abcdef".into(), item: 1, to: target::Destination::clipboard() },
-            before: None,
+            before: Vec::new(),
         };
         std::fs::write(state.path().join("comments.json"), serde_json::json!({ top.as_str(): [stale] }).to_string()).unwrap();
         let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
@@ -4450,11 +4492,11 @@ Add to `comments.rs`'s tests:
         let mut store = open(dir.path());
         store.transact(Operation::Add(comment("p1", "first", 1)), 1_010).unwrap();
         let mut unconfirmed = comment("u1", "second", 2);
-        unconfirmed.state = CommentState::Unconfirmed { before: None, stamp: stamp("oldone") };
+        unconfirmed.state = CommentState::Unconfirmed { before: Vec::new(), stamp: stamp("oldone") };
         store.transact(Operation::Add(unconfirmed), 1_010).unwrap();
         let mut theirs = comment("s1", "third", 3);
         // Claimed by another viewer a second ago: still theirs, not expired.
-        theirs.state = CommentState::Sending { stamp: Stamp { at: 1_010, ..stamp("theirs") }, before: None };
+        theirs.state = CommentState::Sending { stamp: Stamp { at: 1_010, ..stamp("theirs") }, before: Vec::new() };
         store.transact(Operation::Add(theirs), 1_010).unwrap();
         store.transact(Operation::Add(comment("p2", "fourth", 4)), 1_010).unwrap();
         // An older comment that landed late in the array (a journal replay) is numbered by its creation time.
@@ -4485,7 +4527,7 @@ Add to `comments.rs`'s tests:
                     assert_eq!((stamp.nonce.as_str(), &stamp.to), ("n00001", &to));
                     let expected_item = ["p0", "p1", "u1", "p2", first.as_str(), second.as_str()].iter().position(|id| *id == c.id).unwrap() as u32 + 1;
                     assert_eq!(stamp.item, expected_item);
-                    assert_eq!(before.is_some(), c.id == "u1", "only the unconfirmed one remembers its earlier stamp");
+                    assert_eq!(!before.is_empty(), c.id == "u1", "only the unconfirmed one remembers its earlier stamp");
                 }
                 other => panic!("{other:?}"),
             }
@@ -4533,7 +4575,7 @@ Add to `comments.rs`'s tests:
         let mut store = open(dir.path());
         store.transact(Operation::Add(comment("p1", "a", 1)), 10).unwrap();
         let mut unconfirmed = comment("u1", "b", 2);
-        unconfirmed.state = CommentState::Unconfirmed { before: None, stamp: stamp("oldone") };
+        unconfirmed.state = CommentState::Unconfirmed { before: Vec::new(), stamp: stamp("oldone") };
         store.transact(Operation::Add(unconfirmed), 10).unwrap();
         let to = Destination::clipboard();
         let fixed = |name: &'static str| move |_: u64| name.to_string();
@@ -4562,7 +4604,7 @@ Add to `comments.rs`'s tests:
         // An unconfirmed record that was edited is pending again under its new text; a late success
         // for its old nonce finds no record and settles nothing.
         let mut unsure = comment("e1", "old text", 17);
-        unsure.state = CommentState::Unconfirmed { stamp: stamp("ggg777"), before: None };
+        unsure.state = CommentState::Unconfirmed { stamp: stamp("ggg777"), before: Vec::new() };
         store.transact(Operation::Add(unsure.clone()), 1_017).unwrap();
         store.transact(Operation::Edit { id: "e1".into(), category: Category::Bug, text: "new text".into(), seen: unsure }, 1_017).unwrap();
         store.settle(1_017, "ggg777", Settlement::Sent).unwrap();
@@ -4578,7 +4620,7 @@ Add to `comments.rs`'s tests:
         let mut full = open(dir.path());
         for i in 0..50 {
             let mut c = comment(&format!("x{i}"), "t", 20);
-            c.state = CommentState::Sending { stamp: Stamp { at: 1_020, ..stamp("eee555") }, before: None };
+            c.state = CommentState::Sending { stamp: Stamp { at: 1_020, ..stamp("eee555") }, before: Vec::new() };
             full.comments_mut_for_tests().push(c);
         }
         full.write_for_tests();
@@ -4660,10 +4702,11 @@ Then the methods, after `refresh`:
             let mut claimed = Vec::new();
             for comment in &mut working {
                 if let Some((_, item)) = ids.iter().find(|(id, _)| id == &comment.id) {
-                    // The stamp a retry replaces is the one that may have arrived: the latest unconfirmed one.
+                    // The stamps a retry replaces are the ones that may have arrived: the unconfirmed one
+                    // it found, then that one's own chain, newest first.
                     let before = match &comment.state {
-                        CommentState::Unconfirmed { stamp, .. } => Some(stamp.clone()),
-                        _ => None,
+                        CommentState::Unconfirmed { stamp, before } => std::iter::once(stamp.clone()).chain(before.iter().cloned()).collect(),
+                        _ => Vec::new(),
                     };
                     comment.state = CommentState::Sending {
                         stamp: Stamp { at: now, nonce: nonce.clone(), item: *item, to: to.clone() },
@@ -4701,6 +4744,16 @@ Then the methods, after `refresh`:
             let mut working = store.comments.clone();
             let mut changed = false;
             for comment in &mut working {
+                // A late success for an earlier attempt in the chain: that text reached the agent.
+                if outcome == Settlement::Sent {
+                    if let CommentState::Unconfirmed { before, .. } = &comment.state {
+                        if let Some(earlier) = before.iter().find(|b| b.nonce == nonce) {
+                            comment.state = CommentState::Sent(earlier.clone());
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
                 let (stamp, before) = match &comment.state {
                     CommentState::Sending { stamp, before } if stamp.nonce == nonce => (stamp.clone(), before.clone()),
                     // A late answer: the timeout marked it unconfirmed and kept `before`; the host's word is final.
@@ -4710,9 +4763,10 @@ Then the methods, after `refresh`:
                 comment.state = match outcome {
                     Settlement::Sent => CommentState::Sent(stamp),
                     Settlement::Unconfirmed => CommentState::Unconfirmed { stamp, before },
-                    // Nothing arrived this time; the earlier send may have: back to its stamp, or to pending.
-                    Settlement::Failed => match before {
-                        Some(earlier) => CommentState::Unconfirmed { stamp: earlier, before: None },
+                    // Nothing arrived this time; the earlier sends may have: back to the newest of them,
+                    // with the rest of the chain, or to pending when there were none.
+                    Settlement::Failed => match before.split_first() {
+                        Some((earlier, rest)) => CommentState::Unconfirmed { stamp: earlier.clone(), before: rest.to_vec() },
                         None => CommentState::Pending,
                     },
                 };
@@ -6456,16 +6510,17 @@ Two more session tests, for the late answer and the oversized review:
         assert!(s.comments.iter().all(|c| c.is_pending()), "nothing was stamped");
         assert_eq!(host.prompts.lock().unwrap().len(), 0, "the host was not called");
         // An oversized request leaves requests.json untouched: the bound runs inside the reservation. The
-        // request text names each file twice, so a hundred untracked files twelve directories deep, on a
-        // path of some 2,900 characters, put it past 512 KiB (one name is capped at 255 bytes, a path at 4,096).
+        // request text names each file twice, so 350 untracked files three directories deep, on a path of
+        // some 750 characters, put it past 512 KiB. One name is capped at 255 bytes everywhere and a path
+        // at 1,024 on the Darwin targets (4,096 on Linux); this stays under both.
         let before = std::fs::read_to_string(state.path().join("requests.json")).ok();
-        let deep = (0..12).fold(dir.path().to_path_buf(), |p, i| p.join(format!("{i}{}", "d".repeat(239))));
+        let deep = (0..3).fold(dir.path().to_path_buf(), |p, i| p.join(format!("{i}{}", "d".repeat(229))));
         std::fs::create_dir_all(&deep).unwrap();
-        for i in 0..100 {
-            std::fs::write(deep.join(format!("{i}.txt")), "x\n").unwrap();
+        for i in 0..350 {
+            std::fs::write(deep.join(format!("{i:03}.txt")), "x\n").unwrap();
         }
         handle.commands.send(Command::Refresh).unwrap();
-        wait_for(&handle, "a hundred rows", |s| s.files.len() >= 100);
+        wait_for(&handle, "the rows", |s| s.files.len() >= 350);
         handle.commands.send(Command::Send(dispatch::SendRequest { kind: dispatch::SendKind::Review { scope: dispatch::ReviewScope::All }, accepted: Default::default() })).unwrap();
         let s = wait_for(&handle, "request refused", |s| s.send_seq == 2);
         assert!(s.send_error.as_deref().unwrap().starts_with("review too large"), "{:?}", s.send_error);
@@ -6541,6 +6596,7 @@ Action::PickPane, Action::PickPaneRow(usize)
 pub panes: Option<PanePicker>,
 pub panes_token: u64,
 pub socket_path: Option<String>,   // HERDR_SOCKET_PATH, for the Target a pick builds
+deferred: VecDeque<String>,        // urgent warnings an answer displaced; the front speaks when nothing urgent stands
 seen_target_seq: u64,
 ```
 
@@ -7007,7 +7063,7 @@ Expected: five pass. The `choices_come_in_three_groups` test's `plain[2]` assert
 
 `KeyAction::PickPane` added; in `keys.rs`'s `navigation_aliases_require_no_modifiers_and_do_not_extend_the_sheet`, the `KEYS.len()` pin becomes 28 and `help_panel(false).rows.len()` 28 with it (one entry row per binding, still no notes); the two `help_offset` arithmetic tests in `input.rs` still hold (they use `KEYS.len()`). `RESERVED` is untouched until Task 8.
 
-2. `state.rs`: `ViewState` gains `pub panes: Option<crate::tui::panes::PanePicker>`, `pub panes_token: u64`, `pub socket_path: Option<String>`, `seen_target_seq: u64`; `new` sets `None, 0, None, 0`. In `observe`, before the mark block:
+2. `state.rs`: `ViewState` gains `pub panes: Option<crate::tui::panes::PanePicker>`, `pub panes_token: u64`, `pub socket_path: Option<String>`, `seen_target_seq: u64`, `deferred: VecDeque<String>`; `new` sets `None, 0, None, 0, VecDeque::new()`. In `observe`, before the mark block:
 
 ```rust
         if let Some(picker) = &mut self.panes {
@@ -7024,7 +7080,24 @@ Expected: five pass. The `choices_come_in_three_groups` test's `plain[2]` assert
         }
 ```
 
-A notice set here follows invariant 3 as the mark answer does: it is the answer to the key just pressed and shows at once; the displaced-warning bookkeeping of the mark block applies, so factor that `if let Some(displaced)` block into a method `fn displace_urgent(&mut self)` and call it from all three places (mark, action, target).
+A notice set here follows invariant 3 as the mark answer does: it is the answer to the key just pressed and shows at once; the displaced-warning bookkeeping of the mark block applies, so factor that `if let Some(displaced)` block into a method and call it from all three places (mark, action, target), and give the `Other` kind a way back, which 0.0.4 had no need of (its only urgent `Other` warnings were answers themselves) and which Tasks 7 and 8 need, since comment, send and copy answers arrive on their own and two of them can arrive before either is read:
+
+```rust
+    /// The answer to a key shows at once; what it displaces comes back once the answer is read: a
+    /// classification warning regenerates from the snapshot, a base error returns to its slot, and
+    /// any other unread warning waits in `deferred`, in order, so no answer is lost behind another.
+    fn displace_urgent(&mut self) {
+        if let Some(displaced) = self.notice.as_ref().filter(|n| n.urgent) {
+            match self.notice_kind {
+                NoticeKind::Rewrite => self.seen_rewrite = None,
+                NoticeKind::BaseError => self.pending_base_error = Some(displaced.text.clone()),
+                NoticeKind::Other => self.deferred.push_back(displaced.text.clone()),
+            }
+        }
+    }
+```
+
+with `deferred: VecDeque<String>` on `ViewState` and, at the end of `observe` after the base error's replay, `if !answered_now && !self.notice.as_ref().is_some_and(|n| n.urgent) { if let Some(text) = self.deferred.pop_front() { self.warn(text); } }`, where `answered_now` is the disjunction of the answered flags of this `observe` (mark, action, target and, as the later tasks add them, comment, send, copy). `input::apply_action` already re-runs `observe` when a key clears a notice, which is when the next deferred warning speaks. A state test here, `two_answers_before_a_key_keep_the_first_warning`, observes a snapshot with a target error (`target_seq` 1, `target_error` set) and then one with another target error (`target_seq` 2) before any key, asserts the second is shown, and after a key clears it (`handle_key` with a navigation key) asserts the first is shown; Task 7's `a_comment_answer_and_a_send_answer_in_a_row_both_speak` does the same with a comment error followed by a send error.
 
 3. `input.rs`: in `handle_key`, before the `state.picker.is_some()` check, `if state.panes.is_some() { return panes_key(state, snapshot, key); }`:
 
@@ -7151,9 +7224,27 @@ Every existing test keeps passing: no existing call passes one of the five words
         st.observe(&snap);
         assert_eq!(st.notice.as_ref().map(|n| (n.text.as_str(), n.urgent)), Some(("target not remembered: read-only", true)));
     }
+
+    #[test]
+    fn two_answers_before_a_key_keep_the_first_warning() {
+        let (mut snap, mut st) = setup(&[(10, " --+ ")]);
+        snap.target_seq = 1;
+        snap.target_error = Some("target not remembered: read-only".into());
+        st.observe(&snap);
+        // A second answer before the first is read: it shows at once, the first waits.
+        snap.target_seq = 2;
+        snap.target_error = Some("target not remembered: disk full".into());
+        st.observe(&snap);
+        assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some("target not remembered: disk full"));
+        // Read: the first speaks; read again: nothing more is owed.
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some("target not remembered: read-only"), "an answer never loses the warning it displaced");
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert!(st.notice.is_none());
+    }
 ```
 
-In `view.rs`'s tests: `the_target_chip_is_drawn_and_drops_last_but_one` renders at 160 and 70 columns with `target_state = Live("idle")` and asserts `→ codex w4:p2` is in the first line at 160 and still at 70 while `files` and the stats are gone; and `the_pane_picker_overlay_lists_groups_and_hits_its_rows` renders with the picker open and asserts the headings, the clipboard row and one `Action::PickPaneRow(0)` hit on the first entry's line.
+In `view.rs`'s tests: `the_target_chip_is_drawn_and_drops_last_but_one` renders at 160 and 70 columns with `target_state = Live("idle")` and asserts `→ codex w4:p2` is in the first line at 160 and still at 70 while `files` and the stats are gone, and that its span is reverse accent like every other clickable chip; and `the_pane_picker_overlay_lists_groups_and_hits_its_rows` renders with the picker open and asserts the headings, the clipboard row and one `Action::PickPaneRow(0)` hit on the first entry's line. The existing `toolbar_chips_are_padded_reversed_accent_bold_and_plain_text_is_not` renders a snapshot with no target, where the chip reads `→ no agent`, is clickable and dim: it is the one clickable span that is not reverse accent, so the test changes in two named ways and no other: the chip count becomes 11 (the seven Phase 1 chips, the three action chips, the target chip), and the style assertion runs on every clickable span except the one whose action is `Action::PickPane`, which is asserted separately to be padded, hit over all its cells, and styled `Style::role(Role::Label)` with `reverse: false`. The ten original chips keep the reverse-accent guarantee untouched.
 
 - [ ] **Step 7: Gates and commit**
 
@@ -7279,7 +7370,7 @@ mod tests {
     fn titles_name_the_category_state_and_for_an_orphan_the_place() {
         let mut c = test_comment();
         assert_eq!(title(&c, false), "Bug · pending");
-        c.state = crate::engine::comments::CommentState::Unconfirmed { stamp: test_stamp(), before: None };
+        c.state = crate::engine::comments::CommentState::Unconfirmed { stamp: test_stamp(), before: Vec::new() };
         assert_eq!(title(&c, false), "Bug · sent?");
         c.state = crate::engine::comments::CommentState::Sent(test_stamp());
         assert_eq!(title(&c, true), "src/cart.py:16 · Bug · sent");
@@ -7955,11 +8046,12 @@ fn comment_key(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction) ->
             .iter()
             .filter(|c| c.is_editable())
             .filter(|c| rows::anchor_target(diff, &c.anchor) == Some(cursor))
-            .max_by_key(|c| c.created_at)
+            // The claim's order (Task 5): the id breaks a same-second tie, so a replayed older comment never wins.
+            .max_by_key(|c| (c.created_at, c.id.clone()))
             .map(|c| (*c).clone())
     };
     let file_comment = || -> Option<Comment> {
-        in_place.iter().filter(|c| c.is_editable() && matches!(c.anchor.span, AnchorSpan::File)).max_by_key(|c| c.created_at).map(|c| (*c).clone())
+        in_place.iter().filter(|c| c.is_editable() && matches!(c.anchor.span, AnchorSpan::File)).max_by_key(|c| (c.created_at, c.id.clone())).map(|c| (*c).clone())
     };
     let at_cap = snapshot.comments.iter().filter(|c| c.is_unsent()).count() >= comments::CAP;
     match action {
@@ -8170,6 +8262,19 @@ The tests that follow start from `review_setup` where they need a listed file, l
         st.observe(&snap);
         assert!(st.editor.is_none());
         assert!(matches!(handle_key(&mut st, &snap, key("x"), 120), Outcome::Engine(Command::DeleteComment { seen }) if seen.id == newer.id));
+        // Two cards made in the same second, the older one appended later by a journal replay: the id
+        // (Task 3's `new_id` increases with time) breaks the tie, so `x` deletes the newer, not the first found.
+        let mut first = comment_at(&anchor, "made first", 7);
+        first.id = "00000000000000010000000000000000".into();
+        let mut second = comment_at(&anchor, "made second", 7);
+        second.id = "00000000000000020000000000000000".into();
+        snap.comments = std::sync::Arc::new(vec![second.clone(), first.clone()]);
+        st.observe(&snap);
+        st.reconcile(&snap);
+        assert!(matches!(handle_key(&mut st, &snap, key("x"), 120), Outcome::Engine(Command::DeleteComment { seen }) if seen.id == second.id), "the same-second tie goes to the later id");
+        handle_key(&mut st, &snap, key("u"), 120);
+        assert_eq!(st.editor.as_ref().map(|e| e.text.as_str()), Some("made second"));
+        handle_key(&mut st, &snap, key("Esc"), 120);
         // Whitespace is inert; Esc discards; the limit title.
         handle_key(&mut st, &snap, key("i"), 120);
         handle_key(&mut st, &snap, key(" "), 120);
@@ -8248,6 +8353,26 @@ The tests that follow start from `review_setup` where they need a listed file, l
         snap.comment_token = Some(token);
         st.observe(&snap);
         assert_eq!(st.editor.as_ref().map(|e| e.text.as_str()), Some("theirs mine"));
+    }
+
+    #[test]
+    fn a_comment_answer_and_a_send_answer_in_a_row_both_speak() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        // Two answers before a key: the second shows at once, the first waits, then speaks.
+        snap.comment_seq = 1;
+        snap.comment_error = Some(comments::NOTICE_CAP.to_string());
+        snap.comment_refused = true;
+        st.observe(&snap);
+        assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some(comments::NOTICE_CAP));
+        snap.send_seq = 1;
+        snap.send_error = Some("could not verify w4:p2: deadline".to_string());
+        st.observe(&snap);
+        assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some("could not verify w4:p2: deadline"));
+        // Read (a key clears it): the displaced warning is back; read again: nothing more.
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some(comments::NOTICE_CAP), "the first answer was not lost");
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert!(st.notice.is_none());
     }
 
     #[test]
@@ -8366,7 +8491,7 @@ The tests that follow start from `review_setup` where they need a listed file, l
         unsure.id = "u".into();
         unsure.state = comments::CommentState::Unconfirmed {
             stamp: comments::Stamp { at: 1, nonce: "abc123".into(), item: 1, to: crate::engine::target::Destination::clipboard() },
-            before: None,
+            before: Vec::new(),
         };
         snap.comments = std::sync::Arc::new(vec![gone.clone(), unsure.clone()]);
         st.observe(&snap);
@@ -8467,7 +8592,7 @@ In `review.rs`'s tests:
         }
         for i in 0..unconfirmed {
             let mut c = comment_at(&anchor("other.rs", 1), &format!("u{i}"), 100 + i as u64);
-            c.state = CommentState::Unconfirmed { before: None, stamp: stamp("aaaaaa") };
+            c.state = CommentState::Unconfirmed { before: Vec::new(), stamp: stamp("aaaaaa") };
             comments.push(c);
         }
         s.comments = std::sync::Arc::new(comments);
@@ -9616,7 +9741,7 @@ before each gate it exercises.
 **Round 3 (codex, plan-complete, 2026-10-04).** Seventeen findings, all applied. Three
 were data-loss paths my earlier rounds had opened: `read_and_apply` now sets `others`, so
 a claim or settlement writes every worktree's records back (tested across two worktrees);
-`Unconfirmed` keeps the `before` stamp through the timeout, so a late definite failure
+`Unconfirmed` keeps the `before` stamps through the timeout, so a late definite failure
 restores the earlier correlation instead of `Pending`; and a prompt call that outlives the
 engine's wait carries the send lock with it, released after the host answers plus the
 Enter margin (tested with two viewers and a delayed late answer). `Accepted.restarted`
@@ -9753,3 +9878,16 @@ without a target shows `nothing to review` with `n` alone instead of opening the
 `check_request` applies the comment record's path and comparison rules plus one-based ordered
 ranges, while a request file that is no object reads as empty with a reported problem (seven
 malformed records and a malformed file tested).
+
+**Round 10 (codex, plan-complete, 2026-10-05).** Five findings, all applied. Two were HIGH:
+a retry kept only the one stamp it replaced, so a third attempt's failure followed by the
+second's late failure returned a record to `Pending` while the first send may have arrived
+(`before` is now the chain of uncertain stamps, newest first; a definite failure restores its
+head with the rest, a late success for any stamp in it settles the record as sent under that
+stamp; the sequence is tested); and the existing toolbar chip test could not pass with a dim
+clickable target chip (the test is named with its two changes: eleven chips, and the
+reverse-accent assertion excluding the `PickPane` span, which is asserted dim on its own).
+Then: an answer that displaces an unread `Other` warning now queues it (`deferred`, spoken when
+the answer is read; tests in Tasks 6 and 7 with two answers before a key); `u` and `x` break a
+same-second tie by id, as the claim orders; and the oversized-request fixture uses 350 files
+on a 750-character path, under Darwin's 1,024-byte limit.
