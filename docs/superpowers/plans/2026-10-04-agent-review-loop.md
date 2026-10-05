@@ -2175,6 +2175,7 @@ pub struct RequestRecord { pub nonce: String, pub at: u64, pub target: Destinati
 pub fn load_requests(state_dir: &Path, toplevel: &str) -> (Vec<RequestRecord>, Option<String>);
 pub fn record_request(state_dir: &Path, toplevel: &str, record: &RequestRecord) -> std::io::Result<()>;
 /// Nonces any retained record of either file carries, for 10.4's uniqueness check.
+pub fn nonces_of(comments: &[Comment]) -> BTreeSet<String>;                                         // the stamps and the chains behind them; shared by every nonce check
 pub fn nonces_in_use(state_dir: &Path, own: &[Comment]) -> std::io::Result<BTreeSet<String>>;   // every worktree's records in both files, plus `own`; a read error is an error
 
 // src/engine/types.rs: Snapshot gains
@@ -2485,6 +2486,32 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_record_met_by_a_transaction_is_logged_before_it_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = open(dir.path());
+        a.transact(Operation::Add(comment("a1", "x", 1)), 1).unwrap();
+        // A newer version's record lands in the file after the store opened: an unknown state.
+        let mut file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("comments.json")).unwrap()).unwrap();
+        let mut odd = serde_json::to_value(comment("odd", "y", 2)).unwrap();
+        odd["state"] = "resolved".into();
+        file["/repo"].as_array_mut().unwrap().push(odd);
+        std::fs::write(dir.path().join("comments.json"), file.to_string()).unwrap();
+        // The next transaction rewrites the array without it, and the log says so before the write.
+        a.transact(Operation::Add(comment("a2", "z", 3)), 3).unwrap();
+        let written = std::fs::read_to_string(dir.path().join("comments.json")).unwrap();
+        assert!(!written.contains("resolved"));
+        let log = std::fs::read_to_string(dir.path().join("config-problems.log")).unwrap();
+        assert!(log.contains("comments.json: 1 unusable record(s); rewritten without them"), "{log}");
+        // The same for a request record met by the next request write.
+        let bad = serde_json::json!({ "/repo": [{ "nonce": "x", "at": 1, "target": { "clipboard": true }, "files": [] }] });
+        std::fs::write(dir.path().join("requests.json"), bad.to_string()).unwrap();
+        record_request(dir.path(), "/repo", &RequestRecord { nonce: "abcdef".into(), at: 2, target: Destination::clipboard(), files: Vec::new() }).unwrap();
+        assert_eq!(load_requests(dir.path(), "/repo").0.len(), 1);
+        let log = std::fs::read_to_string(dir.path().join("config-problems.log")).unwrap();
+        assert!(log.contains("requests.json: 1 unusable record(s); rewritten without them"), "{log}");
+    }
+
+    #[test]
     fn a_failing_store_refuses_what_the_rules_refuse_instead_of_journaling_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = open(dir.path());
@@ -2570,38 +2597,6 @@ mod tests {
         assert_eq!(ids.iter().collect::<BTreeSet<_>>().len(), 50, "all distinct");
         // Task 5's `a_claim_takes_pending_and_unconfirmed_in_order_and_never_anothers_sending` relies on
         // this order for two comments made in the same second.
-    }
-
-    #[test]
-    fn retries_keep_every_uncertain_stamp_and_a_late_word_settles_the_right_one() {
-        // A was uncertain; retry B times out; retry C fails; then B's late failure arrives, then A's late success.
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = open(dir.path());
-        let mut a = comment("c", "x", 1);
-        a.state = CommentState::Unconfirmed { stamp: stamp("aaaaaa"), before: Vec::new() };
-        store.transact(Operation::Add(a), 1_000).unwrap();
-        let to = Destination::clipboard();
-        let ok = || Ok(());
-        let mut counter = 0;
-        let make_b = |_: u64| "bbbbbb".to_string();
-        store.claim(1_001, &to, &make_b, &mut counter, &ok, |_, _| Ok("b".into())).unwrap();
-        assert!(matches!(&store.comments()[0].state, CommentState::Sending { stamp, before } if stamp.nonce == "bbbbbb" && before.iter().map(|b| b.nonce.as_str()).collect::<Vec<_>>() == ["aaaaaa"]));
-        store.settle(1_002, "bbbbbb", Settlement::Unconfirmed).unwrap();
-        let make_c = |_: u64| "cccccc".to_string();
-        store.claim(1_003, &to, &make_c, &mut counter, &ok, |_, _| Ok("c".into())).unwrap();
-        assert!(matches!(&store.comments()[0].state, CommentState::Sending { stamp, before } if stamp.nonce == "cccccc" && before.iter().map(|b| b.nonce.as_str()).collect::<Vec<_>>() == ["bbbbbb", "aaaaaa"]), "the whole chain is kept");
-        store.settle(1_004, "cccccc", Settlement::Failed).unwrap();
-        assert!(matches!(&store.comments()[0].state, CommentState::Unconfirmed { stamp, before } if stamp.nonce == "bbbbbb" && before.len() == 1), "C's failure restores B, with A behind it");
-        store.settle(1_005, "bbbbbb", Settlement::Failed).unwrap();
-        assert!(matches!(&store.comments()[0].state, CommentState::Unconfirmed { stamp, before } if stamp.nonce == "aaaaaa" && before.is_empty()), "B's late failure restores A, not Pending: A may have arrived");
-        store.settle(1_006, "aaaaaa", Settlement::Sent).unwrap();
-        assert!(matches!(&store.comments()[0].state, CommentState::Sent(st) if st.nonce == "aaaaaa"));
-        // A late success for an attempt deeper in the chain settles the record as sent under that attempt.
-        let mut d = comment("d", "y", 2);
-        d.state = CommentState::Unconfirmed { stamp: stamp("eeeeee"), before: vec![stamp("dddddd")] };
-        store.transact(Operation::Add(d), 1_007).unwrap();
-        store.settle(1_008, "dddddd", Settlement::Sent).unwrap();
-        assert!(matches!(&store.comments()[1].state, CommentState::Sent(st) if st.nonce == "dddddd"));
     }
 
     #[test]
@@ -3265,6 +3260,11 @@ impl Store {
         };
         changed |= expire(&mut comments, now);
         if changed {
+            // The write below rewrites this worktree's array without its unusable records: say so first
+            // (10.7's drop-and-report), whatever brought the write about.
+            if let Some(problem) = &problem {
+                base::note_problem(&dir, &format!("{problem}; rewritten without them"));
+            }
             let written = (|| -> Result<(), TxError> {
                 #[cfg(test)]
                 if self.fail_writes {
@@ -3507,7 +3507,10 @@ fn append_request(state_dir: &Path, toplevel: &str, record: &RequestRecord) -> s
         // The file is replaced by a valid one below; the problem would otherwise never be seen.
         base::note_problem(state_dir, &problem);
     }
-    let (mut mine, _) = parse_requests(&all, toplevel);
+    let (mut mine, dropped) = parse_requests(&all, toplevel);
+    if let Some(dropped) = dropped {
+        base::note_problem(state_dir, &format!("{dropped}; rewritten without them"));
+    }
     mine.push(record.clone());
     all.insert(toplevel.to_string(), serde_json::Value::Array(mine.iter().map(|r| serde_json::to_value(r).unwrap_or_default()).collect()));
     write_request_map(state_dir, &all)
@@ -3581,7 +3584,10 @@ pub fn remove_request(state_dir: &Path, toplevel: &str, nonce: &str) -> std::io:
         if let Some(problem) = problem {
             base::note_problem(state_dir, &problem);
         }
-        let (mine, _) = parse_requests(&all, toplevel);
+        let (mine, dropped) = parse_requests(&all, toplevel);
+        if let Some(dropped) = dropped {
+            base::note_problem(state_dir, &format!("{dropped}; rewritten without them"));
+        }
         let kept: Vec<_> = mine.into_iter().filter(|r| r.nonce != nonce).map(|r| serde_json::to_value(r).unwrap_or_default()).collect();
         all.insert(toplevel.to_string(), serde_json::Value::Array(kept));
         write_request_map(state_dir, &all)
@@ -3591,17 +3597,23 @@ pub fn remove_request(state_dir: &Path, toplevel: &str, nonce: &str) -> std::io:
 /// Nonces any retained record of either file carries, every worktree's (two worktrees can share an
 /// agent pane, and a reply is matched by nonce alone), plus `own`, the array the caller holds. A file
 /// that cannot be read is an error: a nonce chosen blind could collide with one it holds.
-pub fn nonces_in_use(state_dir: &Path, own: &[Comment]) -> std::io::Result<BTreeSet<String>> {
-    fn nonces_of(comments: &[Comment]) -> impl Iterator<Item = String> + '_ {
-        comments.iter().flat_map(|c| {
+/// Every nonce an array's records carry: the current stamps and the chains behind them. The one
+/// collection the file-backed and the in-memory nonce checks share, so neither forgets an attempt.
+pub fn nonces_of(comments: &[Comment]) -> BTreeSet<String> {
+    comments
+        .iter()
+        .flat_map(|c| {
             let before: Vec<String> = match &c.state {
                 CommentState::Sending { before, .. } | CommentState::Unconfirmed { before, .. } => before.iter().map(|b| b.nonce.clone()).collect(),
                 _ => Vec::new(),
             };
             c.stamp().map(|s| s.nonce.clone()).into_iter().chain(before)
         })
-    }
-    let mut used: BTreeSet<String> = nonces_of(own).collect();
+        .collect()
+}
+
+pub fn nonces_in_use(state_dir: &Path, own: &[Comment]) -> std::io::Result<BTreeSet<String>> {
+    let mut used: BTreeSet<String> = nonces_of(own);
     match std::fs::read_to_string(state_dir.join(COMMENTS_FILE)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
@@ -4487,6 +4499,69 @@ Add to `comments.rs`'s tests:
 
 ```rust
     #[test]
+    fn retries_keep_every_uncertain_stamp_and_a_late_word_settles_the_right_one() {
+        // A was uncertain; retry B times out; retry C fails; then B's late failure arrives, then A's late success.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        let mut a = comment("c", "x", 1);
+        a.state = CommentState::Unconfirmed { stamp: stamp("aaaaaa"), before: Vec::new() };
+        store.transact(Operation::Add(a), 1_000).unwrap();
+        let to = Destination::clipboard();
+        let ok = || Ok(());
+        let mut counter = 0;
+        let make_b = |_: u64| "bbbbbb".to_string();
+        store.claim(1_001, &to, &make_b, &mut counter, &ok, |_, _| Ok("b".into())).unwrap();
+        assert!(matches!(&store.comments()[0].state, CommentState::Sending { stamp, before } if stamp.nonce == "bbbbbb" && before.iter().map(|b| b.nonce.as_str()).collect::<Vec<_>>() == ["aaaaaa"]));
+        store.settle(1_002, "bbbbbb", Settlement::Unconfirmed).unwrap();
+        let make_c = |_: u64| "cccccc".to_string();
+        store.claim(1_003, &to, &make_c, &mut counter, &ok, |_, _| Ok("c".into())).unwrap();
+        assert!(matches!(&store.comments()[0].state, CommentState::Sending { stamp, before } if stamp.nonce == "cccccc" && before.iter().map(|b| b.nonce.as_str()).collect::<Vec<_>>() == ["bbbbbb", "aaaaaa"]), "the whole chain is kept");
+        store.settle(1_004, "cccccc", Settlement::Failed).unwrap();
+        assert!(matches!(&store.comments()[0].state, CommentState::Unconfirmed { stamp, before } if stamp.nonce == "bbbbbb" && before.len() == 1), "C's failure restores B, with A behind it");
+        store.settle(1_005, "bbbbbb", Settlement::Failed).unwrap();
+        assert!(matches!(&store.comments()[0].state, CommentState::Unconfirmed { stamp, before } if stamp.nonce == "aaaaaa" && before.is_empty()), "B's late failure restores A, not Pending: A may have arrived");
+        store.settle(1_006, "aaaaaa", Settlement::Sent).unwrap();
+        assert!(matches!(&store.comments()[0].state, CommentState::Sent(st) if st.nonce == "aaaaaa"));
+        // A late success for an attempt deeper in the chain settles the record as sent under that attempt.
+        let mut d = comment("d", "y", 2);
+        d.state = CommentState::Unconfirmed { stamp: stamp("eeeeee"), before: vec![stamp("dddddd")] };
+        store.transact(Operation::Add(d), 1_007).unwrap();
+        store.settle(1_008, "dddddd", Settlement::Sent).unwrap();
+        assert!(matches!(&store.comments()[1].state, CommentState::Sent(st) if st.nonce == "dddddd"));
+        // While a retry is still sending: the earlier attempt's late success makes the record sent under
+        // it, and the retry's own failure then changes nothing; its late failure instead drops it from the
+        // chain, so the retry's failure lands on Pending, not on an attempt that never arrived.
+        let mut f = comment("f", "z", 3);
+        f.state = CommentState::Unconfirmed { stamp: stamp("ffffff"), before: Vec::new() };
+        store.transact(Operation::Add(f), 1_009).unwrap();
+        let make_g = |_: u64| "gggggg".to_string();
+        store.claim(1_010, &to, &make_g, &mut counter, &ok, |_, _| Ok("g".into())).unwrap();
+        store.settle(1_011, "ffffff", Settlement::Sent).unwrap();
+        assert!(matches!(&store.comments()[2].state, CommentState::Sent(st) if st.nonce == "ffffff"), "F arrived while G was sending");
+        store.settle(1_012, "gggggg", Settlement::Failed).unwrap();
+        assert!(matches!(&store.comments()[2].state, CommentState::Sent(st) if st.nonce == "ffffff"), "G's failure undoes nothing");
+        let mut h = comment("h", "w", 4);
+        h.state = CommentState::Unconfirmed { stamp: stamp("hhhhhh"), before: Vec::new() };
+        store.transact(Operation::Add(h), 1_013).unwrap();
+        let make_i = |_: u64| "iiiiii".to_string();
+        store.claim(1_014, &to, &make_i, &mut counter, &ok, |_, _| Ok("i".into())).unwrap();
+        store.settle(1_015, "hhhhhh", Settlement::Failed).unwrap();
+        assert!(matches!(&store.comments()[3].state, CommentState::Sending { stamp, before } if stamp.nonce == "iiiiii" && before.is_empty()), "H's late failure left the chain");
+        store.settle(1_016, "iiiiii", Settlement::Failed).unwrap();
+        assert!(store.comments()[3].is_pending(), "neither attempt arrived");
+        // Without a state directory the array is the store, and its chains count against a new nonce too.
+        let mut bare = Store::open(None, "/repo", 1_000).0;
+        let mut j = comment("j", "v", 5);
+        j.state = CommentState::Unconfirmed { stamp: stamp("kkkkkk"), before: vec![stamp("jjjjjj")] };
+        bare.transact(Operation::Add(j), 1_017).unwrap();
+        bare.transact(Operation::Add(comment("l", "u", 6)), 1_017).unwrap();
+        let colliding = |c: u64| ["jjjjjj", "kkkkkk", "llllll"][c as usize - 1].to_string();
+        let mut counter = 0;
+        let claimed = bare.claim(1_018, &to, &colliding, &mut counter, &ok, |_, _| Ok("l".into())).unwrap();
+        assert_eq!((claimed.nonce.as_str(), counter), ("llllll", 3), "a historical nonce is as taken as a current one");
+    }
+
+    #[test]
     fn a_claim_takes_pending_and_unconfirmed_in_order_and_never_anothers_sending() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = open(dir.path());
@@ -4675,7 +4750,7 @@ Then the methods, after `refresh`:
             guard().map_err(TxError::Refused)?;
             let used = match &store.state_dir {
                 Some(dir) => nonces_in_use(dir, &store.comments).map_err(|e| TxError::Io(format!("nonces: {e}")))?,
-                None => store.comments.iter().filter_map(|c| c.stamp().map(|s| s.nonce.clone())).collect(),
+                None => nonces_of(&store.comments),
             };
             let nonce = loop {
                 *counter += 1;
@@ -4744,14 +4819,25 @@ Then the methods, after `refresh`:
             let mut working = store.comments.clone();
             let mut changed = false;
             for comment in &mut working {
-                // A late success for an earlier attempt in the chain: that text reached the agent.
-                if outcome == Settlement::Sent {
-                    if let CommentState::Unconfirmed { before, .. } = &comment.state {
-                        if let Some(earlier) = before.iter().find(|b| b.nonce == nonce) {
-                            comment.state = CommentState::Sent(earlier.clone());
-                            changed = true;
-                            continue;
+                // A late word about an earlier attempt, while a newer one is sending or unconfirmed: a
+                // success means that text reached the agent (the record is sent under that attempt; a
+                // newer attempt arriving too is a duplicate, not a loss), a definite failure drops the
+                // attempt from the chain, so a later rollback never restores what never arrived.
+                if let CommentState::Sending { before, .. } | CommentState::Unconfirmed { before, .. } = &mut comment.state {
+                    if let Some(index) = before.iter().position(|b| b.nonce == nonce) {
+                        let arrived = match outcome {
+                            Settlement::Sent => Some(before[index].clone()),
+                            Settlement::Failed => {
+                                before.remove(index);
+                                None
+                            }
+                            Settlement::Unconfirmed => None,
+                        };
+                        if let Some(earlier) = arrived {
+                            comment.state = CommentState::Sent(earlier);
                         }
+                        changed = true;
+                        continue;
                     }
                 }
                 let (stamp, before) = match &comment.state {
@@ -5641,7 +5727,7 @@ pub async fn copy(ctx: Context, request: CopyRequest, comments: Vec<comments::Co
             // Nothing is stamped by a copy, so the nonce only has to be fresh against what is retained now;
             // a store that cannot be read is the journal's to report (10.7: `c` still copies), so the copy
             // falls back to what is in memory.
-            let in_memory = || comments.iter().filter_map(|c| c.stamp().map(|s| s.nonce.clone())).collect::<std::collections::BTreeSet<String>>();
+            let in_memory = || comments::nonces_of(&comments);
             let used: std::collections::BTreeSet<String> = match ctx.state_dir.clone() {
                 Some(dir) => {
                     let own = comments.clone();
@@ -7097,7 +7183,7 @@ A notice set here follows invariant 3 as the mark answer does: it is the answer 
     }
 ```
 
-with `deferred: VecDeque<String>` on `ViewState` and, at the end of `observe` after the base error's replay, `if !answered_now && !self.notice.as_ref().is_some_and(|n| n.urgent) { if let Some(text) = self.deferred.pop_front() { self.warn(text); } }`, where `answered_now` is the disjunction of the answered flags of this `observe` (mark, action, target and, as the later tasks add them, comment, send, copy). `input::apply_action` already re-runs `observe` when a key clears a notice, which is when the next deferred warning speaks. A state test here, `two_answers_before_a_key_keep_the_first_warning`, observes a snapshot with a target error (`target_seq` 1, `target_error` set) and then one with another target error (`target_seq` 2) before any key, asserts the second is shown, and after a key clears it (`handle_key` with a navigation key) asserts the first is shown; Task 7's `a_comment_answer_and_a_send_answer_in_a_row_both_speak` does the same with a comment error followed by a send error.
+with `deferred: VecDeque<String>` on `ViewState` and, at the end of `observe` after the base error's replay, `if !answered_now && self.notice.is_none() { if let Some(text) = self.deferred.pop_front() { self.warn(text); } }`: a deferred warning speaks only into an empty slot, never over a notice that has not been read, urgent or not (an answer shown through `notify`, a send error outside a box, must survive the unrelated snapshots that follow it); `answered_now` is the disjunction of the answered flags of this `observe` (mark, action, target and, as the later tasks add them, comment, send, copy). `input::apply_action` already re-runs `observe` when a key clears a notice, which is when the next deferred warning speaks. A state test here, `two_answers_before_a_key_keep_the_first_warning`, observes a snapshot with a target error (`target_seq` 1, `target_error` set) and then one with another target error (`target_seq` 2) before any key, asserts the second is shown, observes an unrelated snapshot (nothing answered) and asserts the second still stands, and after a key clears it (`handle_key` with a navigation key) asserts the first is shown; Task 8's `a_comment_answer_and_a_send_answer_in_a_row_both_speak` does the same with a comment error followed by a send error, an unrelated snapshot in between.
 
 3. `input.rs`: in `handle_key`, before the `state.picker.is_some()` check, `if state.panes.is_some() { return panes_key(state, snapshot, key); }`:
 
@@ -7234,6 +7320,10 @@ Every existing test keeps passing: no existing call passes one of the five words
         // A second answer before the first is read: it shows at once, the first waits.
         snap.target_seq = 2;
         snap.target_error = Some("target not remembered: disk full".into());
+        st.observe(&snap);
+        assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some("target not remembered: disk full"));
+        // An unrelated snapshot (a refresh that answered nothing) leaves the unread answer where it is.
+        snap.refreshing = !snap.refreshing;
         st.observe(&snap);
         assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some("target not remembered: disk full"));
         // Read: the first speaks; read again: nothing more is owed.
@@ -7938,7 +8028,7 @@ Tests in `review.rs`: `the_editor_title_names_the_place_and_the_chosen_category`
 
 `RESERVED` shrinks to `["y", "Y", "@", "c", "/"]` (Task 8 finishes it); `KEYS.len()` becomes 35, and `help_panel(false).rows.len()` 35 in the same `keys.rs` test.
 
-2. `state.rs`: the new fields (`editor`, `visual`, `orphan`, `seen_comment_seq`, and `comment_token: u64`, the counter whose next value numbers a save); `reconcile` rebuilds when any of the six parts of `built_from` changed (the diff's `Arc`, the mode, the comments' `Arc`, the files hash, the width, the editor's place and line count), where the files hash is `(snapshot.scope, snapshot.files.iter().map(FileKey::of))` hashed with `DefaultHasher`, and the width is the body width (`self.width` minus the panel); `rows::build(diff, self.mode, &rows::in_place(&snapshot.comments, diff, branch), &rows::orphans(&snapshot.comments, snapshot), cards::card_width(body_width, self.mode), self.editor_place().as_ref())`, with `editor_place()` deriving `EditorPlace` from `self.editor` (its anchor, or the orphan id it edits, and `editor.lines(card_width).len()`). `reconcile` also drops a visual selection whose diff is no longer the one on screen (below). When the diff is not `Ready` but orphans exist, or the editor is open, `reconcile` builds `rows::orphans_only(&orphans, body_width, self.editor_place().as_ref())` instead of clearing `self.rows`, with `cursor = None` (the editor is spliced at `EditorAnchor::End`: its anchor is in no loaded diff, and a draft must never be off screen while its keys are modal, as when the last changed file turns clean under an open editor), and clears it only when there are no orphans and no editor; the five-part `built_from` key is kept with a `None` diff in that case. `a_draft_stays_on_screen_when_the_diff_goes_away` (Step 7's tests) pins it. `observe` gains:
+2. `state.rs`: the new fields (`editor`, `visual`, `orphan`, `seen_comment_seq`, and `comment_token: u64`, the counter whose next value numbers a save); `reconcile` rebuilds when any of the six parts of `built_from` changed (the diff's `Arc`, the mode, the comments' `Arc`, the files hash, the width, the editor's place and line count), where the files hash is `(snapshot.scope, snapshot.files.iter().map(FileKey::of))` hashed with `DefaultHasher`, and the width is the body width (`self.width` minus the panel); `rows::build(diff, self.mode, &rows::in_place(&snapshot.comments, diff, branch), &rows::orphans(&snapshot.comments, snapshot), cards::card_width(body_width, self.mode), self.editor_place().as_ref())`, with `editor_place()` deriving `EditorPlace` from `self.editor` (its anchor, or the orphan id it edits, and `editor.lines(card_width).len()`). `reconcile` also drops a visual selection whose diff is no longer the one on screen (below). When the diff is not `Ready` but orphans exist, or the editor is open, `reconcile` builds `rows::orphans_only(&orphans, cards::card_width(body_width, self.mode), self.editor_place().as_ref())` (the same card width `build` receives, so a long orphan wraps at the width it is drawn at and `frame_text` truncates nothing) instead of clearing `self.rows`, with `cursor = None` (the editor is spliced at `EditorAnchor::End`: its anchor is in no loaded diff, and a draft must never be off screen while its keys are modal, as when the last changed file turns clean under an open editor), and clears it only when there are no orphans and no editor; the five-part `built_from` key is kept with a `None` diff in that case. `a_draft_stays_on_screen_when_the_diff_goes_away` (Step 7's tests) pins it. `observe` gains:
 
 ```rust
         if snapshot.comment_seq != self.seen_comment_seq {
@@ -8356,26 +8446,6 @@ The tests that follow start from `review_setup` where they need a listed file, l
     }
 
     #[test]
-    fn a_comment_answer_and_a_send_answer_in_a_row_both_speak() {
-        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
-        // Two answers before a key: the second shows at once, the first waits, then speaks.
-        snap.comment_seq = 1;
-        snap.comment_error = Some(comments::NOTICE_CAP.to_string());
-        snap.comment_refused = true;
-        st.observe(&snap);
-        assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some(comments::NOTICE_CAP));
-        snap.send_seq = 1;
-        snap.send_error = Some("could not verify w4:p2: deadline".to_string());
-        st.observe(&snap);
-        assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some("could not verify w4:p2: deadline"));
-        // Read (a key clears it): the displaced warning is back; read again: nothing more.
-        handle_key(&mut st, &snap, key("j"), 120);
-        assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some(comments::NOTICE_CAP), "the first answer was not lost");
-        handle_key(&mut st, &snap, key("j"), 120);
-        assert!(st.notice.is_none());
-    }
-
-    #[test]
     fn a_draft_stays_on_screen_when_the_diff_goes_away() {
         let (mut snap, mut st) = review_setup(&[(10, " + ")]);
         handle_key(&mut st, &snap, key("i"), 120);
@@ -8498,6 +8568,30 @@ The tests that follow start from `review_setup` where they need a listed file, l
         st.reconcile(&snap);
         assert!(st.rows.as_ref().is_some_and(|r| r.orphan_tops.len() == 2), "the orphan section is built without a diff");
         assert_eq!(st.cursor, None);
+        // A long orphan is wrapped at the width it is drawn at, in both modes: every wrapped piece is on
+        // screen whole, and the pieces concatenate back to the text (`cards::wrap` is lossless).
+        let long = "x".repeat(300);
+        let mut wide = gone.clone();
+        wide.id = "wide".into();
+        wide.text = long.clone();
+        snap.comments = std::sync::Arc::new(vec![wide]);
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            st.requested_mode = mode;
+            st.resize(120, 20);
+            st.observe(&snap);
+            st.reconcile(&snap);
+            let rendered = crate::tui::view::render(&snap, &st, 120, 24).plain();
+            let pieces: Vec<String> = st.rows.as_ref().unwrap().rows.iter().filter_map(|r| match r { Row::Card { line: crate::tui::cards::CardLine::Text(t), .. } => Some(t.clone()), _ => None }).collect();
+            assert_eq!(pieces.concat(), long, "{mode:?}");
+            for piece in &pieces {
+                assert!(rendered.iter().any(|l| l.contains(piece.as_str())), "{mode:?}: a wrapped piece was cut: {piece}");
+            }
+        }
+        snap.comments = std::sync::Arc::new(vec![gone.clone(), unsure.clone()]);
+        st.requested_mode = ViewMode::Unified;
+        st.resize(120, 20);
+        st.observe(&snap);
+        st.reconcile(&snap);
         handle_key(&mut st, &snap, key("j"), 120);
         assert_eq!(st.orphan, Some(0), "j from nothing enters the orphan section");
         handle_key(&mut st, &snap, key("j"), 120);
@@ -9237,6 +9331,31 @@ and a unit test that a `Vec<u8>` receives exactly the sequence.
     }
 
     #[test]
+    fn a_comment_answer_and_a_send_answer_in_a_row_both_speak() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        // Two answers before a key: the second shows at once, the first waits, then speaks.
+        snap.comment_seq = 1;
+        snap.comment_error = Some(comments::NOTICE_CAP.to_string());
+        snap.comment_refused = true;
+        st.observe(&snap);
+        assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some(comments::NOTICE_CAP));
+        snap.send_seq = 1;
+        snap.send_error = Some("could not verify w4:p2: deadline".to_string());
+        st.observe(&snap);
+        assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some("could not verify w4:p2: deadline"));
+        // A send error outside a box is a plain notice; an unrelated snapshot must not replace it with
+        // the deferred warning before it is read.
+        snap.refreshing = !snap.refreshing;
+        st.observe(&snap);
+        assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some("could not verify w4:p2: deadline"));
+        // Read (a key clears it): the displaced warning is back; read again: nothing more.
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some(comments::NOTICE_CAP), "the first answer was not lost");
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert!(st.notice.is_none());
+    }
+
+    #[test]
     fn a_box_whose_target_goes_away_becomes_the_picker_and_asks_for_rows() {
         let (mut snap, mut st) = review_setup(&[(10, " + ")]);
         snap.target = Some(pane_target());
@@ -9891,3 +10010,17 @@ Then: an answer that displaces an unread `Other` warning now queues it (`deferre
 the answer is read; tests in Tasks 6 and 7 with two answers before a key); `u` and `x` break a
 same-second tie by id, as the claim orders; and the oversized-request fixture uses 350 files
 on a 750-character path, under Darwin's 1,024-byte limit.
+
+**Round 11 (codex, plan-complete, 2026-10-05).** Six findings, all applied. Two were HIGH:
+two tests added in round 10 reached forward again (the retry-chain test moved to Task 5's
+claim tests, the two-answers test to Task 8), and `settle` ignored a late word about an attempt
+behind a newer one (a late success for a stamp in the chain now settles the record as sent
+under it whether the newer attempt is sending or unconfirmed, a late failure drops the attempt
+from the chain so a later rollback cannot restore it; both tested with the retry still
+sending). Then: one `nonces_of` serves the file-backed and the in-memory nonce checks, so a
+chain's stamps count everywhere (tested without a state directory); a deferred warning speaks
+only into an empty notice slot, never over an unread plain notice (both tests observe an
+unrelated snapshot in between); `orphans_only` wraps at `cards::card_width`, the width the cards
+are drawn at (a 300-character orphan tested whole in both modes); and a write that drops
+unusable records logs it first, in `comments.json`'s rewrite and in `requests.json`'s, with a
+test that plants an unknown-state record after the store opened.
