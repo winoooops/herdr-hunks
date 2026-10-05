@@ -7,6 +7,7 @@ pub mod gitver;
 pub mod host;
 pub mod marks;
 pub mod nav;
+pub mod prompt;
 pub mod sections;
 pub mod session;
 pub mod target;

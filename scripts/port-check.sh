@@ -1,5 +1,5 @@
 #!/bin/sh
-# Verifies src/git/ == pinned vimeflow sources + port/patches/*.patch, byte for byte.
+# Verifies the frozen git tree and review prompt against the vimeflow pin.
 set -eu
 PIN=91e45b1c
 src="${1:?usage: port-check.sh <vimeflow-checkout>}"
@@ -51,4 +51,10 @@ if [ -n "$non_regular" ]; then
   exit 1
 fi
 diff -ru "$work/src/git" src/git
-echo "port-check: src/git matches $PIN + $(ls port/patches/*.patch 2>/dev/null | wc -l | tr -d ' ') patch(es)"
+prompt=src/features/diff/prompts/delegated-review.prompt.md
+git -C "$src" show "$PIN:$prompt" > "$work/delegated-review.md"
+if ! cmp -s "$work/delegated-review.md" src/engine/prompts/delegated-review.md; then
+  echo "port-check: src/engine/prompts/delegated-review.md differs from $PIN:$prompt" >&2
+  exit 1
+fi
+echo "port-check: src/git and the review prompt match $PIN + $(ls port/patches/*.patch 2>/dev/null | wc -l | tr -d ' ') patch(es)"

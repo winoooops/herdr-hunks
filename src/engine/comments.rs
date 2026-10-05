@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::base;
 use super::nav::Side;
+use super::prompt::is_nonce;
 use super::target::Destination;
 use super::FileKey;
 use crate::actions::reuse;
@@ -218,10 +219,6 @@ pub fn check_text(text: &str) -> Result<String, String> {
         return Err(NOTICE_LIMIT.to_string());
     }
     Ok(clean)
-}
-
-fn is_nonce(text: &str) -> bool {
-    (6..=16).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 fn stamp_ok(stamp: &Stamp) -> bool {

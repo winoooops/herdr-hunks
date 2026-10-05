@@ -12,9 +12,9 @@ use super::comments;
 use super::host::{self, SessionRef};
 use super::target::{self, PaneRow, Target, TargetState};
 use super::{
-    actions, branch, gitver, marks, worktree, Action, Base, BaseSource, Command, Comparison,
-    DiffState, FileKey, LoadedDiff, Mark, MarkState, PreImage, QuickBase, RepoState, Scope,
-    Snapshot, NO_BASE_NOTICE,
+    actions, branch, gitver, marks, prompt, worktree, Action, Base, BaseSource, Command,
+    Comparison, DiffState, FileKey, LoadedDiff, Mark, MarkState, PreImage, QuickBase, RepoState,
+    Scope, Snapshot, NO_BASE_NOTICE,
 };
 use crate::git::{self, ChangedFile, GetGitDiffResponse, GitStatusResponse};
 use crate::runtime::EventSink;
@@ -56,6 +56,8 @@ pub struct SessionConfig {
     pub pick_write_gate: Option<Arc<Semaphore>>,
     /// Test hook for target writes made by comments or checks.
     pub target_write_gate: Option<Arc<Semaphore>>,
+    /// Makes a dispatch nonce; injected so tests can force collisions.
+    pub nonce: Arc<dyn Fn(u64) -> String + Send + Sync>,
 }
 
 pub struct EngineHandle {
@@ -121,6 +123,7 @@ impl SessionConfig {
             own_pane: None,
             pick_write_gate: None,
             target_write_gate: None,
+            nonce: Arc::new(prompt::nonce),
         }
     }
 }
