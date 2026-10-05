@@ -92,7 +92,7 @@ pub fn handle_key(
         return outcome;
     }
     if state.panes.is_some() {
-        return panes_key(state, snapshot, key);
+        return panes_key(state, snapshot, key, width);
     }
     if state.picker.is_some() {
         return picker_key(state, snapshot, key);
@@ -155,6 +155,17 @@ pub fn handle_paste(state: &mut ViewState, snapshot: &Snapshot, text: &str) -> O
         picker
             .input
             .extend(text.chars().filter(|ch| !ch.is_control()));
+        picker.retarget(snapshot);
+        return Outcome::Redraw;
+    }
+    if let Some(picker) = state.picker.as_mut() {
+        let before = picker.input.len();
+        picker
+            .input
+            .extend(text.chars().filter(|ch| !ch.is_control()));
+        if picker.input.len() == before {
+            return Outcome::Inert;
+        }
         picker.retarget(snapshot);
         return Outcome::Redraw;
     }
@@ -516,7 +527,7 @@ fn comment_key(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction) ->
     }
 }
 
-fn panes_key(state: &mut ViewState, snapshot: &Snapshot, key: KeyEvent) -> Outcome {
+fn panes_key(state: &mut ViewState, snapshot: &Snapshot, key: KeyEvent, width: u16) -> Outcome {
     let overlay = state
         .body_height
         .saturating_add(u16::from(view::notice(state, snapshot).is_some()));
@@ -524,7 +535,7 @@ fn panes_key(state: &mut ViewState, snapshot: &Snapshot, key: KeyEvent) -> Outco
         return Outcome::Inert;
     };
     let choices = picker.choices(snapshot);
-    let visible = picker.visible(overlay);
+    let visible = picker.visible(snapshot, width.min(panes::WIDTH), overlay);
     match (key.code, key.modifiers) {
         (KeyCode::Esc, KeyModifiers::NONE) => {
             state.panes = None;
@@ -1054,7 +1065,8 @@ pub fn handle_mouse(
             .saturating_add(u16::from(view::notice(state, snapshot).is_some()));
         if let Some(picker) = state.panes.as_mut() {
             let choices = picker.choices(snapshot);
-            return redraw_if(picker.move_by(delta, &choices, picker.visible(overlay)));
+            let visible = picker.visible(snapshot, width.min(panes::WIDTH), overlay);
+            return redraw_if(picker.move_by(delta, &choices, visible));
         }
         if let Some(picker) = state.picker.as_mut() {
             let visible = picker.visible(overlay);
@@ -3011,6 +3023,42 @@ pub(crate) mod tests {
         assert_eq!(handle_paste(&mut st, &snap, "y\rn"), Outcome::Inert);
         assert!(st.confirm.as_ref().unwrap().drawn);
         assert!(st.pending_action.is_none());
+    }
+
+    #[test]
+    fn paste_in_the_base_picker_filters_without_submitting() {
+        let (mut snap, mut st) = setup(&[(1, "+")]);
+        assert_eq!(
+            handle_key(&mut st, &snap, key("B"), 120),
+            Outcome::Engine(Command::LoadRefs(1))
+        );
+        snap.refs_seq = 1;
+        snap.refs = Some(std::sync::Arc::new(vec!["refs/remotes/origin/main".into()]));
+        st.observe(&snap);
+        let submitted = st.submitted_pick_seq;
+        let outcome = handle_paste(&mut st, &snap, "origin/main\n");
+        let picker = st.picker.as_ref().unwrap();
+        assert_eq!(picker.input, "origin/main");
+        assert_eq!(outcome, Outcome::Redraw);
+        assert_eq!(
+            picker.rows(&snap)[picker.cursor].submit().as_deref(),
+            Some("refs/remotes/origin/main")
+        );
+        assert!(picker.pending.is_none() && !picker.done);
+        assert_eq!(st.submitted_pick_seq, submitted);
+    }
+
+    #[test]
+    fn paste_of_only_controls_in_the_base_picker_is_inert() {
+        let (snap, mut st) = setup(&[(1, "+")]);
+        handle_key(&mut st, &snap, key("B"), 120);
+        assert_eq!(
+            handle_paste(&mut st, &snap, "\r\n\t\0\u{1b}\u{7f}"),
+            Outcome::Inert
+        );
+        let picker = st.picker.as_ref().unwrap();
+        assert!(picker.input.is_empty());
+        assert!(picker.pending.is_none() && !picker.done);
     }
 
     #[test]

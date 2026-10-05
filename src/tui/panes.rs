@@ -152,9 +152,13 @@ impl PanePicker {
         choices
     }
 
-    pub fn visible(&self, height: u16) -> usize {
-        // The frame, the input line, two headings and the footer leave this many rows for entries.
-        usize::from(height.saturating_sub(8)).max(1)
+    pub fn visible(&self, snapshot: &Snapshot, width: u16, height: u16) -> usize {
+        self.rows_and_positions(snapshot, width, height)
+            .1
+            .iter()
+            .filter(|row| **row != usize::MAX)
+            .count()
+            .max(1)
     }
 
     pub(super) fn window(&self, visible: usize) -> usize {
@@ -172,19 +176,44 @@ impl PanePicker {
         height: u16,
     ) -> (Vec<Row>, Vec<usize>) {
         let line = usize::from(width).saturating_sub(4).max(1);
-        let mut rows = vec![Row::Text(truncate(
-            &sanitize(&format!("> {}_", self.input)),
-            line,
-        ))];
+        let mut head = Panel {
+            title: String::new(),
+            rows: vec![Row::Text(truncate(
+                &sanitize(&format!("> {}_", self.input)),
+                line,
+            ))],
+            footer: String::new(),
+            cursor: None,
+            offset: 0,
+        };
         let choices = self.choices(snapshot);
         if self.loaded(snapshot) {
             if let Some(error) = &snapshot.panes_error {
-                rows.push(Row::Warn(sanitize(error)));
+                head.rows.push(Row::Warn(sanitize(error)));
             } else if snapshot.panes.as_ref().is_none_or(|panes| panes.is_empty()) {
-                rows.push(Row::Note(NO_AGENT.to_string()));
+                head.rows.push(Row::Note(NO_AGENT.to_string()));
             }
         }
-        let visible = self.visible(height);
+        let headings = [true, false]
+            .into_iter()
+            .filter(|group| {
+                choices
+                    .iter()
+                    .any(|c| matches!(c, Choice::Pane(row) if row.this_worktree == *group))
+            })
+            .count();
+        let body = usize::from(height.saturating_sub(4));
+        if dialog::line_count(&head, width) + headings + 1 > body {
+            match head.rows.get_mut(1) {
+                Some(row @ Row::Note(_)) => *row = Row::Text(truncate(NO_AGENT, line)),
+                Some(Row::Warn(error)) => *error = truncate(error, line),
+                _ => {}
+            }
+        }
+        let visible = body
+            .saturating_sub(dialog::line_count(&head, width) + headings)
+            .max(1);
+        let mut rows = head.rows;
         let first = self.window(visible);
         let mut positions = vec![usize::MAX; choices.len()];
         let mut last_group: Option<bool> = None;
@@ -572,6 +601,29 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_host_keeps_the_clipboard_visible_in_a_short_panel() {
+        let picker = PanePicker::open(1, ReturnTo::Nothing);
+        let s = snapshot_with(Vec::new(), 1);
+        for height in [10, 8] {
+            let panel = picker.panel(&s, 40, height);
+            assert!(panel
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Entry { label, .. } if label == CLIPBOARD_ROW)));
+            let line = picker
+                .panel_line(&s, 40, height, 0)
+                .expect("the clipboard must have a visible line");
+            assert!(line < usize::from(height - 4));
+            let rendered = dialog::render(&panel, 40, height);
+            let text: String = rendered[line + 1]
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect();
+            assert!(text.contains("✂ clipboard"), "{text}");
+        }
+    }
+
+    #[test]
     fn a_choice_becomes_the_target_it_names() {
         let row = pane("w1:p3", "claude", "idle", "/r", "fix", true);
         let target = Choice::Pane(row.clone()).target("/run/h.sock");
@@ -642,10 +694,48 @@ mod tests {
     }
 
     #[test]
-    fn a_choice_clipped_by_the_panel_has_no_hit_line() {
+    fn a_long_warning_keeps_the_clipboard_visible() {
         let mut s = snapshot_with(Vec::new(), 1);
         s.panes_error = Some("deadline ".repeat(100));
         let picker = PanePicker::open(1, ReturnTo::Nothing);
-        assert_eq!(picker.panel_line(&s, 44, 8, 0), None);
+        let panel = picker.panel(&s, 44, 8);
+        assert!(
+            matches!(&panel.rows[1], Row::Warn(error) if error == &truncate(&"deadline ".repeat(100), 40))
+        );
+        assert_eq!(picker.panel_line(&s, 44, 8, 0), Some(2));
+        assert_eq!(picker.panel_line(&s, 44, 6, 0), None);
+    }
+
+    #[test]
+    fn a_wrapped_warning_keeps_the_selected_entry_visible() {
+        let mut s = snapshot_with(
+            (0..12)
+                .map(|index| {
+                    pane(
+                        &format!("w1:p{index}"),
+                        "codex",
+                        "idle",
+                        "/r",
+                        "",
+                        index < 6,
+                    )
+                })
+                .collect(),
+            1,
+        );
+        s.panes_error = Some("deadline ".repeat(12));
+        for height in [8, 10, 20] {
+            let mut picker = PanePicker::open(1, ReturnTo::Nothing);
+            let choices = picker.choices(&s);
+            for index in 0..choices.len() {
+                assert_eq!(picker.cursor, index);
+                let line = picker
+                    .panel_line(&s, 40, height, index)
+                    .expect("the selected entry must stay visible");
+                assert!(line < usize::from(height - 4));
+                let visible = picker.visible(&s, 40, height);
+                picker.move_by(1, &choices, visible);
+            }
+        }
     }
 }

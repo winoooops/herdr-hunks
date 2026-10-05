@@ -1008,7 +1008,7 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
             lines[y + 1] = line;
         }
         hits.clear();
-        let first = picker.window(picker.visible(panel_height));
+        let first = picker.window(picker.visible(snapshot, panel_width, panel_height));
         let listed = panel
             .rows
             .iter()
@@ -2350,6 +2350,15 @@ mod tests {
         let hit = &r.hits[0];
         assert_eq!((hit.y, &hit.action), (6, &Action::PickPaneRow(0)));
         assert!(r.plain()[6].contains("✂ clipboard"), "{:?}", r.plain());
+
+        st.resize(40, body_height(&st, &snap, 10));
+        let r = render(&snap, &st, 40, 10);
+        let hit = r
+            .hits
+            .iter()
+            .find(|hit| hit.action == Action::PickPaneRow(0))
+            .expect("the clipboard must be clickable at 40×10");
+        assert!(r.plain()[usize::from(hit.y)].contains("✂ clipboard"));
     }
 
     use crate::engine::comments::{self, Category, CommentState};
