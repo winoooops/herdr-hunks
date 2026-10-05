@@ -126,6 +126,7 @@ fn run_terminal(
     let mut width = terminal.size()?.width;
     let mut state = initial_state(config, width);
     state.popup = std::env::var("HERDR_HUNKS_PLACEMENT").as_deref() == Ok("popup");
+    state.socket_path = std::env::var("HERDR_SOCKET_PATH").ok();
     if let Some(notice) = notice {
         state.notify(notice);
     }

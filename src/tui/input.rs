@@ -71,6 +71,9 @@ pub fn handle_key(
     if state.confirm.is_some() {
         return confirm_key(state, key);
     }
+    if state.panes.is_some() {
+        return panes_key(state, snapshot, key);
+    }
     if state.picker.is_some() {
         return picker_key(state, snapshot, key);
     }
@@ -152,6 +155,78 @@ fn open_box(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction) -> Ou
         total,
     ));
     Outcome::Redraw
+}
+
+fn panes_key(state: &mut ViewState, snapshot: &Snapshot, key: KeyEvent) -> Outcome {
+    let overlay = state
+        .body_height
+        .saturating_add(u16::from(view::notice(state, snapshot).is_some()));
+    let Some(picker) = state.panes.as_mut() else {
+        return Outcome::Inert;
+    };
+    let choices = picker.choices(snapshot);
+    let visible = picker.visible(overlay);
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, KeyModifiers::NONE) => {
+            state.panes = None;
+            Outcome::Redraw
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => pick_pane(state, snapshot, picker_cursor(state)),
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            redraw_if(picker.move_by(1, &choices, visible))
+        }
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            redraw_if(picker.move_by(-1, &choices, visible))
+        }
+        (KeyCode::Backspace, KeyModifiers::NONE) => {
+            if picker.input.pop().is_some() {
+                picker.retarget(snapshot);
+                Outcome::Redraw
+            } else {
+                Outcome::Inert
+            }
+        }
+        (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) if !ch.is_control() => {
+            picker.input.push(ch);
+            picker.retarget(snapshot);
+            Outcome::Redraw
+        }
+        _ => Outcome::Inert,
+    }
+}
+
+fn redraw_if(moved: bool) -> Outcome {
+    if moved {
+        Outcome::Redraw
+    } else {
+        Outcome::Inert
+    }
+}
+
+fn picker_cursor(state: &ViewState) -> usize {
+    state.panes.as_ref().map(|p| p.cursor).unwrap_or(0)
+}
+
+/// Enter or a click submits a target under a fresh token and waits for its echoed answer.
+fn pick_pane(state: &mut ViewState, snapshot: &Snapshot, index: usize) -> Outcome {
+    let socket = state.socket_path.clone().unwrap_or_default();
+    let Some(picker) = state.panes.as_mut() else {
+        return Outcome::Inert;
+    };
+    if picker.pending.is_some() {
+        return Outcome::Inert;
+    }
+    let choices = picker.choices(snapshot);
+    let Some(choice) = choices.get(index) else {
+        return Outcome::Inert;
+    };
+    picker.cursor = index;
+    state.pick_token += 1;
+    picker.pending = Some(state.pick_token);
+    Outcome::Engine(Command::SetTarget {
+        token: state.pick_token,
+        target: choice.target(&socket),
+    })
 }
 
 fn picker_key(state: &mut ViewState, snapshot: &Snapshot, key: KeyEvent) -> Outcome {
@@ -261,6 +336,14 @@ fn act(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction, width: u16
                 }
                 Some(_) => Outcome::Engine(Command::SetScope(snapshot.scope.other())),
             };
+        }
+        PickPane => {
+            state.panes_token += 1;
+            state.panes = Some(crate::tui::panes::PanePicker::open(
+                state.panes_token,
+                crate::tui::panes::ReturnTo::Nothing,
+            ));
+            return Outcome::Engine(Command::LoadPanes(state.panes_token));
         }
         PickBase => {
             state.refs_token += 1;
@@ -451,6 +534,10 @@ pub fn handle_mouse(
         let overlay = state
             .body_height
             .saturating_add(u16::from(view::notice(state, snapshot).is_some()));
+        if let Some(picker) = state.panes.as_mut() {
+            let choices = picker.choices(snapshot);
+            return redraw_if(picker.move_by(delta, &choices, picker.visible(overlay)));
+        }
         if let Some(picker) = state.picker.as_mut() {
             let visible = picker.visible(overlay);
             let rows = picker.rows(snapshot);
@@ -470,6 +557,12 @@ pub fn handle_mouse(
     }
     if state.help_open || ev.kind != MouseEventKind::Down(MouseButton::Left) {
         return Outcome::Inert;
+    }
+    if state.panes.is_some() {
+        return match rendered.hit(ev.column, ev.row) {
+            Some(Action::PickPaneRow(index)) => pick_pane(state, snapshot, *index),
+            _ => Outcome::Inert,
+        };
     }
     if state.picker.is_some() {
         return match rendered.hit(ev.column, ev.row) {
@@ -516,16 +609,26 @@ mod tests {
     };
 
     fn key(text: &str) -> KeyEvent {
-        match text.strip_prefix("ctrl+") {
-            Some(c) => KeyEvent::new(
-                KeyCode::Char(c.chars().next().unwrap()),
-                KeyModifiers::CONTROL,
-            ),
-            None => KeyEvent::new(
-                KeyCode::Char(text.chars().next().unwrap()),
-                KeyModifiers::NONE,
-            ),
-        }
+        let code = match text {
+            "Enter" => KeyCode::Enter,
+            "Esc" => KeyCode::Esc,
+            "Backspace" => KeyCode::Backspace,
+            "Down" => KeyCode::Down,
+            "Up" => KeyCode::Up,
+            _ => {
+                return match text.strip_prefix("ctrl+") {
+                    Some(c) => KeyEvent::new(
+                        KeyCode::Char(c.chars().next().unwrap()),
+                        KeyModifiers::CONTROL,
+                    ),
+                    None => KeyEvent::new(
+                        KeyCode::Char(text.chars().next().unwrap()),
+                        KeyModifiers::NONE,
+                    ),
+                }
+            }
+        };
+        KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     fn setup(hunks: &[(u32, &str)]) -> (crate::engine::Snapshot, ViewState) {
@@ -2125,5 +2228,83 @@ mod tests {
         handle_key(&mut st, &snap, key("t"), 120);
         let notice = st.notice.as_ref().expect("the warning follows the answer");
         assert!(notice.urgent && notice.text.contains("no longer on this branch"));
+    }
+    #[test]
+    fn a_opens_the_pane_picker_and_enter_picks_a_target() {
+        let (mut snap, mut st) = setup(&[(10, " --+ ")]);
+        st.socket_path = Some("/run/h.sock".into());
+        assert_eq!(
+            handle_key(&mut st, &snap, key("A"), 120),
+            Outcome::Engine(Command::LoadPanes(1))
+        );
+        assert!(st.panes.is_some());
+        // This opening receives its agent row.
+        snap.panes = Some(std::sync::Arc::new(vec![crate::engine::PaneRow {
+            record: crate::engine::host::PaneRecord {
+                pane_id: "w1:p2".into(),
+                agent: Some("codex".into()),
+                ..Default::default()
+            },
+            this_worktree: true,
+        }]));
+        snap.panes_seq = 1;
+        st.observe(&snap);
+        let outcome = handle_key(&mut st, &snap, key("Enter"), 120);
+        assert!(
+            matches!(outcome, Outcome::Engine(Command::SetTarget { token: 1, target: crate::engine::Target::Pane { pane, socket, .. } }) if pane == "w1:p2" && socket == "/run/h.sock")
+        );
+        // A pending pick accepts no second Enter and closes on its token.
+        assert_eq!(
+            handle_key(&mut st, &snap, key("Enter"), 120),
+            Outcome::Inert
+        );
+        snap.target_seq = 1;
+        snap.target_token = Some(1);
+        st.observe(&snap);
+        assert!(st.panes.is_none());
+        // Esc keeps the target as it is.
+        handle_key(&mut st, &snap, key("A"), 120);
+        assert_eq!(handle_key(&mut st, &snap, key("Esc"), 120), Outcome::Redraw);
+        assert!(st.panes.is_none());
+        // A refused pick (not remembered) is the viewer's notice, once.
+        snap.target_seq = 2;
+        snap.target_error = Some("target not remembered: read-only".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| (n.text.as_str(), n.urgent)),
+            Some(("target not remembered: read-only", true))
+        );
+    }
+
+    #[test]
+    fn two_answers_before_a_key_keep_the_first_warning() {
+        let (mut snap, mut st) = setup(&[(10, " --+ ")]);
+        snap.target_seq = 1;
+        snap.target_error = Some("target not remembered: read-only".into());
+        st.observe(&snap);
+        // A second answer before the first is read: it shows at once, the first waits.
+        snap.target_seq = 2;
+        snap.target_error = Some("target not remembered: disk full".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("target not remembered: disk full")
+        );
+        // An unrelated snapshot leaves the unread answer on screen.
+        snap.refreshing = !snap.refreshing;
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("target not remembered: disk full")
+        );
+        // Read: the first speaks; read again: nothing more is owed.
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("target not remembered: read-only"),
+            "an answer never loses the warning it displaced"
+        );
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert!(st.notice.is_none());
     }
 }

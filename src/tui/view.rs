@@ -28,6 +28,8 @@ pub enum Action {
     SelectFile(usize),
     CursorToRow(usize),
     PickRow(usize),
+    PickPane,
+    PickPaneRow(usize),
 }
 
 impl Action {
@@ -42,10 +44,14 @@ impl Action {
             Self::ToggleView => KeyAction::ToggleView,
             Self::ToggleFiles => KeyAction::ToggleFiles,
             Self::Refresh => KeyAction::Refresh,
+            Self::PickPane => KeyAction::PickPane,
             Self::StageHunk => KeyAction::StageHunk,
             Self::DiscardHunk => KeyAction::DiscardHunk,
             Self::DiscardFile => KeyAction::DiscardFile,
-            Self::SelectFile(_) | Self::CursorToRow(_) | Self::PickRow(_) => return None,
+            Self::SelectFile(_)
+            | Self::CursorToRow(_)
+            | Self::PickRow(_)
+            | Self::PickPaneRow(_) => return None,
         })
     }
 }
@@ -62,6 +68,7 @@ impl Hit {
         state.mouse_requested
             && !state.help_open
             && state.picker.is_none()
+            && state.panes.is_none()
             && state.confirm.is_none()
             && state
                 .hover
@@ -127,8 +134,8 @@ fn is_conflict(raw_diff: &str) -> bool {
     })
 }
 
-/// One toolbar item: its text pieces (clickable when they carry an action) and its drop order.
-type ToolbarItem = (Vec<(String, Option<Action>)>, u8);
+/// A toolbar item carries its text pieces, drop order, optional tone and dim flag.
+type ToolbarItem = (Vec<(String, Option<Action>)>, u8, Option<Semantic>, bool);
 
 /// Toolbar items left to right; a higher drop order drops first.
 fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Vec<ToolbarItem> {
@@ -201,6 +208,8 @@ fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Ve
                 ("›".into(), Some(Action::NextFile)),
             ],
             0,
+            None,
+            false,
         ),
         (
             vec![
@@ -210,8 +219,15 @@ fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Ve
                 ("↓".into(), Some(Action::NextHunk)),
             ],
             1,
+            None,
+            false,
         ),
-        (vec![(scope_chip, Some(Action::ToggleScope))], 2),
+        (
+            vec![(scope_chip, Some(Action::ToggleScope))],
+            3,
+            None,
+            false,
+        ),
         (
             vec![(
                 if state.mode == ViewMode::Split {
@@ -222,7 +238,9 @@ fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Ve
                 .into(),
                 Some(Action::ToggleView),
             )],
-            3,
+            4,
+            None,
+            false,
         ),
     ];
     if snapshot.scope == Scope::Worktree {
@@ -240,23 +258,34 @@ fn toolbar_items(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> Ve
                     (" ".into(), None),
                     chip("discard file", Action::DiscardFile),
                 ],
-                8,
+                9,
+                None,
+                false,
             ),
         );
         items.push((
             vec![(if staged { "STAGED" } else { "UNSTAGED" }.into(), None)],
-            4,
+            5,
+            None,
+            false,
         ));
     }
-    items.push((vec![(stats, None)], 5));
-    items.push((vec![("files".into(), Some(Action::ToggleFiles))], 6));
-    items.push((vec![(busy.into(), Some(Action::Refresh))], 7));
+    items.push((vec![(stats, None)], 6, None, false));
+    let (chip_text, tone, dim) = crate::tui::panes::chip(snapshot);
+    items.push((vec![(chip_text, Some(Action::PickPane))], 2, tone, dim));
+    items.push((
+        vec![("files".into(), Some(Action::ToggleFiles))],
+        7,
+        None,
+        false,
+    ));
+    items.push((vec![(busy.into(), Some(Action::Refresh))], 8, None, false));
     items
 }
 
 fn toolbar(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> (Line, Vec<Hit>) {
     let mut items = toolbar_items(snapshot, state, total_width);
-    for (item, _) in &mut items {
+    for (item, _, _, _) in &mut items {
         for (text, action) in item {
             if action.is_some() {
                 *text = format!(" {text} ");
@@ -267,13 +296,16 @@ fn toolbar(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> (Line, V
         |item: &Vec<(String, Option<Action>)>| item.iter().map(|(t, _)| width(t)).sum::<usize>();
     // drop from the right until it fits; steppers (drop order 0 and 1) go last
     while items.len() > 1
-        && 1 + items.iter().map(|(i, _)| item_width(i) + 3).sum::<usize>()
+        && 1 + items
+            .iter()
+            .map(|(i, _, _, _)| item_width(i) + 3)
+            .sum::<usize>()
             > usize::from(total_width)
     {
         let worst = items
             .iter()
             .enumerate()
-            .max_by_key(|(_, (_, order))| *order)
+            .max_by_key(|(_, (_, order, _, _))| *order)
             .map(|(i, _)| i)
             .unwrap();
         items.remove(worst);
@@ -281,7 +313,7 @@ fn toolbar(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> (Line, V
     let mut line: Line = vec![Span::body(" ")];
     let mut hits = Vec::new();
     let mut x = 1u16;
-    for (item, _) in items {
+    for (item, _, tone, dim) in items {
         for (text, action) in item {
             let w = width(&text) as u16;
             if let Some(action) = action {
@@ -305,14 +337,18 @@ fn toolbar(snapshot: &Snapshot, state: &ViewState, total_width: u16) -> (Line, V
                     };
                     line.push(Span::new(
                         text,
-                        Style {
-                            reverse: true,
-                            semantic: if hit.hovered(state) {
-                                None
-                            } else {
-                                Some(Semantic::Accent)
-                            },
-                            ..Style::role(Role::Emphasis)
+                        if dim {
+                            Style::role(Role::Label)
+                        } else {
+                            Style {
+                                reverse: true,
+                                semantic: if hit.hovered(state) {
+                                    None
+                                } else {
+                                    Some(tone.unwrap_or(Semantic::Accent))
+                                },
+                                ..Style::role(Role::Emphasis)
+                            }
                         },
                     ));
                     hits.push(hit);
@@ -617,6 +653,7 @@ pub fn body_is_drawn(state: &ViewState, snapshot: &Snapshot, columns: u16, heigh
         && height >= 10
         && !state.help_open
         && state.picker.is_none()
+        && state.panes.is_none()
         && state.confirm.is_none()
         && (matches!(&snapshot.diff, DiffState::Ready(_)) || snapshot.files.is_empty())
 }
@@ -777,6 +814,40 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
                 x1: (x + usize::from(panel_width)) as u16,
                 action: Action::PickRow(first + i),
             });
+        }
+    }
+    if let Some(picker) = &state.panes {
+        let panel_width = columns.min(crate::tui::panes::WIDTH);
+        let panel_height = height.saturating_sub(2);
+        let x = usize::from((columns - panel_width) / 2);
+        let panel = picker.panel(snapshot, panel_width, panel_height);
+        for (y, overlay) in dialog::render(&panel, panel_width, panel_height)
+            .into_iter()
+            .enumerate()
+        {
+            let background = &lines[y + 1];
+            let mut line = clip_line(background, 0, x);
+            line.extend(overlay);
+            let right = x + usize::from(panel_width);
+            line.extend(clip_line(background, right, usize::from(columns) - right));
+            lines[y + 1] = line;
+        }
+        hits.clear();
+        let first = picker.window(picker.visible(panel_height));
+        let listed = panel
+            .rows
+            .iter()
+            .filter(|row| matches!(row, dialog::Row::Entry { .. }))
+            .count();
+        for index in first..first + listed {
+            if let Some(line) = picker.panel_line(snapshot, panel_width, panel_height, index) {
+                hits.push(Hit {
+                    y: (2 + line) as u16,
+                    x0: x as u16,
+                    x1: (x + usize::from(panel_width)) as u16,
+                    action: Action::PickPaneRow(index),
+                });
+            }
         }
     }
     if let Some(confirm) = &state.confirm {
@@ -945,7 +1016,7 @@ mod tests {
 
     #[test]
     fn a_narrow_toolbar_drops_items_from_the_right_and_keeps_the_steppers() {
-        let (r, _) = rendered(50, 20, FilesPanel::Hidden);
+        let (r, _) = rendered(65, 20, FilesPanel::Hidden);
         let bar = &r.plain()[0];
         assert!(bar.contains("‹  a.rs 2/2  ›") && bar.contains("{} 1/2"));
         assert!(bar.contains("worktree") && !bar.contains("unified"));
@@ -1206,13 +1277,18 @@ mod tests {
                         "{}",
                         span.text
                     );
-                    assert_eq!(
-                        span.style,
-                        Style {
-                            reverse: true,
-                            ..Style::semantic(Role::Emphasis, Semantic::Accent)
-                        }
-                    );
+                    if *action == Action::PickPane {
+                        assert_eq!(span.text, " → no agent ");
+                        assert_eq!(span.style, Style::role(Role::Label));
+                    } else {
+                        assert_eq!(
+                            span.style,
+                            Style {
+                                reverse: true,
+                                ..Style::semantic(Role::Emphasis, Semantic::Accent)
+                            }
+                        );
+                    }
                     for cell in x..end {
                         assert_eq!(r.hit(cell, 0), Some(action));
                     }
@@ -1221,8 +1297,8 @@ mod tests {
                 }
                 x = end;
             }
-            // The seven Phase 1 chips and the three action chips of spec 9.3.
-            assert_eq!(chips, 10);
+            // The seven viewer chips, three action chips and target chip.
+            assert_eq!(chips, 11);
             assert!(r.lines[0]
                 .iter()
                 .any(|s| s.text == if busy { " … " } else { " ⟳ " }));
@@ -1827,9 +1903,8 @@ mod tests {
 
     #[test]
     fn the_toolbar_group_sits_between_the_steppers_and_drops_first() {
-        // The fixture's toolbar needs about 132 columns with the group; it shows at 140 and is the
-        // first thing dropped below that.
-        let (r, _) = rendered(140, 20, FilesPanel::Hidden);
+        // The action group fits at 160 columns and drops first when space runs out.
+        let (r, _) = rendered(160, 20, FilesPanel::Hidden);
         let bar = &r.plain()[0];
         let stepper = bar.find("‹  a.rs").unwrap();
         let group = bar.find(" stage ").unwrap();
@@ -1864,7 +1939,7 @@ mod tests {
         }
         snap.selected.as_mut().unwrap().staged = true;
         let st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
-        let bar = render(&snap, &st, 140, 20).plain()[0].clone();
+        let bar = render(&snap, &st, 160, 20).plain()[0].clone();
         assert!(
             bar.contains(" unstage ") && !bar.contains(" stage "),
             "{bar}"
@@ -1876,12 +1951,12 @@ mod tests {
             merge_base: Some("m".repeat(40)),
             source: crate::engine::BaseSource::Default,
         });
-        let r = render(&snap, &st, 140, 20);
+        let r = render(&snap, &st, 160, 20);
         assert!(!r.plain()[0].contains("discard"));
         assert!(!r.plain().last().unwrap().contains("s stage"));
         snap.scope = Scope::Worktree;
         snap.diff = DiffState::Loading;
-        let r = render(&snap, &st, 140, 20);
+        let r = render(&snap, &st, 160, 20);
         assert!(r.plain()[0].contains("discard"));
         assert!(!r.hits.iter().any(|h| matches!(
             h.action,
@@ -1923,5 +1998,101 @@ mod tests {
             render(&snap, &st, 39, 10).plain(),
             vec!["terminal too small"]
         );
+    }
+
+    #[test]
+    fn the_target_chip_is_drawn_and_drops_last_but_one() {
+        let mut snap = files(snapshot("a.rs", "chip", &[(1, "+"), (20, "+")]));
+        snap.target = Some(crate::engine::Target::Pane {
+            pane: "w4:p2".into(),
+            socket: "/s".into(),
+            agent: "codex".into(),
+            session: None,
+            title: String::new(),
+        });
+        snap.target_state = crate::engine::TargetState::Live("idle".into());
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        for columns in [160, 70] {
+            st.resize(columns, body_height(&st, &snap, 24));
+            st.reconcile(&snap);
+            let r = render(&snap, &st, columns, 24);
+            let bar = &r.plain()[0];
+            assert!(bar.contains("→ codex w4:p2"), "{bar}");
+            if columns == 70 {
+                assert!(!bar.contains("files") && !bar.contains("+4 −3"), "{bar}");
+            }
+            let span = r.lines[0]
+                .iter()
+                .find(|s| s.text.contains("→ codex"))
+                .unwrap();
+            assert_eq!(
+                span.style,
+                Style {
+                    reverse: true,
+                    ..Style::semantic(Role::Emphasis, Semantic::Accent)
+                }
+            );
+            let hit = r
+                .hits
+                .iter()
+                .find(|h| h.action == Action::PickPane)
+                .unwrap();
+            assert_eq!(r.hit(hit.x0, 0), Some(&Action::PickPane));
+        }
+    }
+
+    #[test]
+    fn the_pane_picker_overlay_lists_groups_and_hits_its_rows() {
+        use crate::engine::{host::PaneRecord, PaneRow};
+        use crate::tui::panes::{PanePicker, ReturnTo, CLIPBOARD_ROW};
+        let mut snap = files(snapshot("a.rs", "panes", &[(1, "+")]));
+        snap.panes = Some(std::sync::Arc::new(vec![
+            PaneRow {
+                record: PaneRecord {
+                    pane_id: "w1:p2".into(),
+                    agent: Some("codex".into()),
+                    ..Default::default()
+                },
+                this_worktree: true,
+            },
+            PaneRow {
+                record: PaneRecord {
+                    pane_id: "w2:p1".into(),
+                    agent: Some("kimi".into()),
+                    ..Default::default()
+                },
+                this_worktree: false,
+            },
+        ]));
+        snap.panes_seq = 1;
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        st.resize(120, body_height(&st, &snap, 24));
+        st.reconcile(&snap);
+        st.panes = Some(PanePicker::open(1, ReturnTo::Nothing));
+        let r = render(&snap, &st, 120, 24);
+        let text = r.plain();
+        for piece in ["Send to", "this worktree", "other panes", CLIPBOARD_ROW] {
+            assert!(text.iter().any(|line| line.contains(piece)), "{text:?}");
+        }
+        let first: Vec<_> = r
+            .hits
+            .iter()
+            .filter(|hit| hit.action == Action::PickPaneRow(0))
+            .collect();
+        assert_eq!(first.len(), 1);
+        assert!(text[usize::from(first[0].y)].contains("codex  w1:p2"));
+        assert!(r
+            .hits
+            .iter()
+            .all(|h| matches!(h.action, Action::PickPaneRow(_))));
+        assert!(!body_is_drawn(&st, &snap, 120, 24));
+
+        snap.panes = Some(std::sync::Arc::new(Vec::new()));
+        st.resize(44, body_height(&st, &snap, 24));
+        let r = render(&snap, &st, 44, 24);
+        assert_eq!(r.hits.len(), 1);
+        let hit = &r.hits[0];
+        assert_eq!((hit.y, &hit.action), (6, &Action::PickPaneRow(0)));
+        assert!(r.plain()[6].contains("✂ clipboard"), "{:?}", r.plain());
     }
 }

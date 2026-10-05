@@ -1,4 +1,6 @@
 //! Everything the TUI owns that is not in the snapshot, and the 4.8 reconciliation rules.
+use std::collections::VecDeque;
+
 use crate::engine::nav::{self, Side, ViewMode};
 use crate::engine::{DiffState, LoadedDiff, Snapshot};
 use crate::tui::layout::{clamp_scroll, ensure_visible, reanchor, LineSpan};
@@ -52,6 +54,10 @@ pub struct ViewState {
     pub confirm: Option<crate::tui::confirm::Confirm>,
     /// The action `y` sent, until its answer and, when a form ran, its Arc have both passed.
     pub pending_action: Option<PendingAction>,
+    pub panes: Option<crate::tui::panes::PanePicker>,
+    pub panes_token: u64,
+    pub pick_token: u64,
+    pub socket_path: Option<String>,
     pub refs_token: u64,
     /// Last submitted pick's reply sequence, retained when the picker closes.
     pub submitted_pick_seq: u64,
@@ -64,6 +70,8 @@ pub struct ViewState {
     pending_base_error: Option<String>,
     /// What the notice on screen is, so displacing one can put it back.
     notice_kind: NoticeKind,
+    seen_target_seq: u64,
+    deferred: VecDeque<String>,
     seen_mark_seq: u64,
     seen_action_seq: u64,
     seen_rewrite: Option<(String, String, crate::engine::MarkState)>,
@@ -91,6 +99,10 @@ impl ViewState {
             picker: None,
             confirm: None,
             pending_action: None,
+            panes: None,
+            panes_token: 0,
+            pick_token: 0,
+            socket_path: None,
             refs_token: 0,
             submitted_pick_seq: 0,
             notice: None,
@@ -100,6 +112,8 @@ impl ViewState {
             seen_base_error: None,
             pending_base_error: None,
             notice_kind: NoticeKind::Other,
+            seen_target_seq: 0,
+            deferred: VecDeque::new(),
             seen_mark_seq: 0,
             seen_action_seq: 0,
             seen_rewrite: None,
@@ -218,23 +232,25 @@ impl ViewState {
                 self.picker = None;
             }
         }
+        if let Some(picker) = &mut self.panes {
+            picker.observe(snapshot);
+            if picker.done {
+                self.panes = None;
+            }
+        }
+        let answered_target = snapshot.target_seq != self.seen_target_seq;
+        if answered_target {
+            self.seen_target_seq = snapshot.target_seq;
+            if let Some(error) = &snapshot.target_error {
+                self.displace_urgent();
+                self.warn(crate::tui::sanitize::sanitize(error));
+            }
+        }
         let mut answered_mark = false;
         if snapshot.mark_seq != self.seen_mark_seq {
             self.seen_mark_seq = snapshot.mark_seq;
             answered_mark = true;
-            // The answer to the key the user just pressed is shown at once, even over an
-            // unread warning -- but displacing one puts it back, so it speaks again once this
-            // answer is read. A classification warning regenerates itself from the snapshot;
-            // a base error is text nothing else holds, so it returns to its slot. If the
-            // answer resolved what the warning was about, the branch below finds nothing to
-            // say and nothing comes back.
-            if let Some(displaced) = self.notice.as_ref().filter(|n| n.urgent) {
-                match self.notice_kind {
-                    NoticeKind::Rewrite => self.seen_rewrite = None,
-                    NoticeKind::BaseError => self.pending_base_error = Some(displaced.text.clone()),
-                    NoticeKind::Other => {}
-                }
-            }
+            self.displace_urgent();
             match (&snapshot.mark_error, &snapshot.mark) {
                 (Some(error), _) => self.warn(crate::tui::sanitize::sanitize(error)),
                 (None, Some(mark)) => {
@@ -249,16 +265,7 @@ impl ViewState {
             self.seen_action_seq = snapshot.action_seq;
             answered_action = true;
             if let Some(pending) = self.pending_action.take() {
-                // The answer to the key the user just pressed is shown at once (8.5's rule for M).
-                if let Some(displaced) = self.notice.as_ref().filter(|n| n.urgent) {
-                    match self.notice_kind {
-                        NoticeKind::Rewrite => self.seen_rewrite = None,
-                        NoticeKind::BaseError => {
-                            self.pending_base_error = Some(displaced.text.clone())
-                        }
-                        NoticeKind::Other => {}
-                    }
-                }
+                self.displace_urgent();
                 match &snapshot.action_error {
                     Some(error) => {
                         let mut text = format!(
@@ -287,6 +294,7 @@ impl ViewState {
         {
             self.pending_action = None;
         }
+        let answered_now = answered_target || answered_mark || answered_action;
         // Warn only for the pair the engine conclusively classified.
         let rewritten = snapshot.mark.as_ref().and_then(|mark| {
             let at = mark.classified_at.clone()?;
@@ -295,7 +303,7 @@ impl ViewState {
         });
         // Leave the warning pending until an urgent answer has been acknowledged.
         let urgent_stands = self.notice.as_ref().is_some_and(|n| n.urgent);
-        if rewritten != self.seen_rewrite && !answered_mark && !answered_action && !urgent_stands {
+        if rewritten != self.seen_rewrite && !answered_now && !urgent_stands {
             self.seen_rewrite = rewritten.clone();
             match rewritten.map(|(_, _, state)| state) {
                 Some(MarkState::Rewritten) => {
@@ -326,11 +334,26 @@ impl ViewState {
         // warning -- including the one the branch above just set, whose pair is already
         // recorded and would never speak again.
         if let Some(error) = self.pending_base_error.clone() {
-            if !answered_mark && !answered_action && !self.notice.as_ref().is_some_and(|n| n.urgent)
-            {
+            if !answered_now && !self.notice.as_ref().is_some_and(|n| n.urgent) {
                 self.pending_base_error = None;
                 self.warn(error);
                 self.notice_kind = NoticeKind::BaseError;
+            }
+        }
+        if !answered_now && self.notice.is_none() {
+            if let Some(text) = self.deferred.pop_front() {
+                self.warn(text);
+            }
+        }
+    }
+
+    /// Urgent answers displace unread warnings; each warning retains its way back.
+    fn displace_urgent(&mut self) {
+        if let Some(displaced) = self.notice.as_ref().filter(|n| n.urgent) {
+            match self.notice_kind {
+                NoticeKind::Rewrite => self.seen_rewrite = None,
+                NoticeKind::BaseError => self.pending_base_error = Some(displaced.text.clone()),
+                NoticeKind::Other => self.deferred.push_back(displaced.text.clone()),
             }
         }
     }

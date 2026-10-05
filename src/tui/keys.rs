@@ -22,6 +22,7 @@ pub enum KeyAction {
     ToggleScope,
     PickBase,
     MarkReviewed,
+    PickPane,
     StageHunk,
     DiscardHunk,
     DiscardFile,
@@ -165,6 +166,12 @@ pub const KEYS: &[Binding] = &[
         vimeflow: None,
     },
     Binding {
+        key: "A",
+        label: "send to (pane)",
+        action: KeyAction::PickPane,
+        vimeflow: None,
+    },
+    Binding {
         key: "g",
         label: "first row",
         action: KeyAction::First,
@@ -295,8 +302,8 @@ mod tests {
                 assert_eq!(lookup(&KeyEvent::new(code, modifiers)), None);
             }
         }
-        assert_eq!(KEYS.len(), 27);
-        assert_eq!(help_panel(false).rows.len(), 27);
+        assert_eq!(KEYS.len(), 28);
+        assert_eq!(help_panel(false).rows.len(), 28);
     }
 
     #[test]
