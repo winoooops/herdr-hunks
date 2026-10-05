@@ -622,7 +622,7 @@ impl HostClient for HerdrHost {
             .map_err(classify)?;
         // The envelope the host documents: `{"id", "result": {"type": "agent_prompted", ...}}`. Anything
         // else arrived after the line was written and proves nothing: uncertain, never success.
-        if response["result"].is_object() && response["result"]["type"].as_str().is_some() {
+        if response["result"]["type"].as_str() == Some("agent_prompted") {
             Ok(())
         } else {
             Err(HostFailure::After(format!("agent.prompt reply not understood: {response}")))
@@ -645,6 +645,8 @@ pub struct Scripted {
     pub panes: Mutex<BTreeMap<String, PaneRecord>>,
     /// `Err` fails every `pane.get` and `pane.list` with it until cleared.
     pub list_failure: Mutex<Option<HostFailure>>,
+    /// `Some(record)` makes every `pane.get` answer that record whatever pane was asked for.
+    pub answer_pane_get_with: Mutex<Option<PaneRecord>>,
     /// Pushed results for `agent_prompt`, consumed first to last; empty means `Ok(())`.
     pub prompt_results: Mutex<Vec<Result<(), HostFailure>>>,
     /// Every `agent_prompt` call as `(pane, text)`, and when each began (before its delay).
@@ -679,6 +681,9 @@ impl HostClient for Scripted {
         self.calls.lock().unwrap().push("pane.get".into());
         if let Some(failure) = self.list_failure.lock().unwrap().clone() {
             return Err(failure);
+        }
+        if let Some(record) = self.answer_pane_get_with.lock().unwrap().clone() {
+            return Ok(record);
         }
         self.panes.lock().unwrap().get(pane).cloned().ok_or(HostFailure::Api {
             code: "pane_not_found".into(),
@@ -893,6 +898,8 @@ fn the_host_client_speaks_the_three_methods_over_the_socket() {
     assert!(matches!(host.agent_prompt("w1:p2", "x"), Err(HostFailure::After(_))));
     fake.reply_raw(Some(serde_json::Value::Null));
     assert!(matches!(host.agent_prompt("w1:p2", "x"), Err(HostFailure::After(_))));
+    fake.reply_raw(Some(serde_json::json!({ "result": { "type": "pong" } })));
+    assert!(matches!(host.agent_prompt("w1:p2", "x"), Err(HostFailure::After(_))), "another method's success is not this one's");
     fake.reply_raw(None);
     assert!(matches!(host.pane_get("w9:p9"), Err(HostFailure::Api { code, .. }) if code == "pane_not_found"));
     fake.stop();
@@ -1055,6 +1062,10 @@ mod tests {
         let mut nameless = pane(Some("codex"), "idle", Some("s1"));
         nameless.agent_status = None;
         assert_eq!(compare(&t, socket, &Ok(nameless)), Some(TargetState::Live("unknown".into())));
+        // A reply about another pane is no answer about this one.
+        let mut other_pane = pane(Some("codex"), "idle", Some("s1"));
+        other_pane.pane_id = "w4:p9".into();
+        assert_eq!(compare(&t, socket, &Ok(other_pane)), None);
     }
 
     #[test]
@@ -1400,6 +1411,7 @@ pub fn compare(
     fresh: &Result<PaneRecord, HostFailure>,
 ) -> Option<TargetState> {
     let Target::Pane {
+        pane,
         socket,
         agent,
         session,
@@ -1423,6 +1435,8 @@ pub fn compare(
             Some(TargetState::Gone)
         }
         Err(_) => None,
+        // A reply about another pane is no answer about this one: the check did not run.
+        Ok(record) if record.pane_id != *pane => None,
         Ok(record) => {
             if record.agent.as_deref() != Some(agent.as_str()) {
                 return Some(TargetState::Left);
@@ -1748,8 +1762,8 @@ with `target: None, target_state: TargetState::Unverified, target_seq: 0, target
 ```rust
     /// Answer with the agent panes and this opening's token on the snapshot (spec 10.2).
     LoadPanes(u64),
-    /// Remember and publish the target; the next refresh checks it.
-    SetTarget(Target),
+    /// Remember and publish the target; the next refresh checks it (`target::Target`, by path: `nav::Target` is imported here).
+    SetTarget(crate::engine::target::Target),
 ```
 
 - [ ] **Step 8: The session**
@@ -2084,7 +2098,7 @@ pub struct RequestRecord { pub nonce: String, pub at: u64, pub target: Destinati
 pub fn load_requests(state_dir: &Path, toplevel: &str) -> (Vec<RequestRecord>, Option<String>);
 pub fn record_request(state_dir: &Path, toplevel: &str, record: &RequestRecord) -> std::io::Result<()>;
 /// Nonces any retained record of either file carries, for 10.4's uniqueness check.
-pub fn nonces_in_use(state_dir: &Path, own: &[Comment]) -> BTreeSet<String>;   // every worktree's records in both files, plus `own`
+pub fn nonces_in_use(state_dir: &Path, own: &[Comment]) -> std::io::Result<BTreeSet<String>>;   // every worktree's records in both files, plus `own`; a read error is an error
 
 // src/engine/types.rs: Snapshot gains
 pub comments: Arc<Vec<Comment>>,
@@ -2294,8 +2308,10 @@ mod tests {
         let mut store = open(dir.path());
         store.transact(Operation::Add(comment("fine", "kept", 1)), 1_000).unwrap();
         let mut stale = comment("stale", "x", 2);
-        stale.state = CommentState::Sending { stamp: Stamp { at: 900, ..stamp("aaaaaa") }, before: None };
+        // Claimed fifty seconds ago: not expired when added, expired when reopened a minute later.
+        stale.state = CommentState::Sending { stamp: Stamp { at: 950, ..stamp("aaaaaa") }, before: None };
         store.transact(Operation::Add(stale), 1_000).unwrap();
+        assert!(matches!(store.comments()[1].state, CommentState::Sending { .. }));
         // Opened later, the expiry must be written; when it cannot be, the records are still shown.
         let mut reopened = Store::open_for_tests_with_failing_writes(dir.path(), "/repo", 1_100);
         assert_eq!(reopened.comments().len(), 2, "a failed expiry write hid the loaded comments");
@@ -2347,7 +2363,8 @@ mod tests {
         assert!(notice.starts_with("comments not remembered: "));
         a.transact(Operation::Edit { id: "a1".into(), category: Category::Bug, text: "mine, edited".into(), seen: comment("a1", "mine", 1) }, 4).unwrap_err();
         assert_eq!(a.journal_len(), 2);
-        assert_eq!(a.comments().len(), 2);
+        assert_eq!(a.comments().len(), 2, "the earlier unsaved add is still on screen after a second failed write");
+        assert!(a.comments().iter().any(|c| c.id == "a2" && c.text == "later"));
         // Meanwhile b edits a1 and adds b1.
         b.transact(Operation::Edit { id: "a1".into(), category: Category::Question, text: "b's edit".into(), seen: comment("a1", "mine", 1) }, 5).unwrap();
         b.transact(Operation::Add(comment("b1", "b", 6)), 6).unwrap();
@@ -2422,23 +2439,30 @@ mod tests {
         assert_eq!((loaded, problem), (vec![record.clone()], None));
         let mut sent = comment("c", "x", 1);
         sent.state = CommentState::Sent(stamp("oqzpww"));
-        let used = nonces_in_use(dir.path(), &[sent.clone()]);
+        let used = nonces_in_use(dir.path(), &[sent.clone()]).unwrap();
         assert_eq!(used, ["oqzpww", "wvpx71"].into_iter().map(String::from).collect::<BTreeSet<_>>());
         // Another worktree's records count too: two worktrees can share one agent pane.
         let mut elsewhere = Store::open(Some(dir.path().to_path_buf()), "/other", 1_000).0;
         let mut theirs = comment("t", "x", 1);
         theirs.state = CommentState::Sent(stamp("zzzzz9"));
         elsewhere.transact(Operation::Add(theirs), 1_001).unwrap();
-        assert!(nonces_in_use(dir.path(), &[]).contains("zzzzz9"));
+        assert!(nonces_in_use(dir.path(), &[]).unwrap().contains("zzzzz9"));
+        // An unreadable file is an error, not an empty set: a blind nonce could collide with what it holds.
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::create_dir(unreadable.path().join("comments.json")).unwrap();   // a directory where a file should be
+        assert!(nonces_in_use(unreadable.path(), &[]).is_err());
+        assert!(record_request_fresh(unreadable.path(), "/repo", &make, &mut 0, &|| Ok(()), |nonce| Ok((RequestRecord { nonce: nonce.into(), ..record.clone() }, String::new()))).is_err());
         // A fresh request reads the comments file under the lock, not a captured array.
         let mut store = open(dir.path());
         store.transact(Operation::Add(sent), 1_001).unwrap();
         let mut counter = 0;
         let make = |c: u64| if c == 1 { "oqzpww".to_string() } else { format!("r{c:05}") };
-        let nonce = record_request_fresh(dir.path(), "/repo", &make, &mut counter, &|| Ok(()), |nonce| RequestRecord { nonce: nonce.into(), ..record.clone() }).unwrap();
-        assert_eq!((nonce.as_str(), counter), ("r00002", 2), "the nonce a comment carries was passed over");
-        assert!(record_request_fresh(dir.path(), "/repo", &make, &mut counter, &|| Err("changed".into()), |nonce| RequestRecord { nonce: nonce.into(), ..record.clone() }).is_err());
+        let (nonce, text) = record_request_fresh(dir.path(), "/repo", &make, &mut counter, &|| Ok(()), |nonce| Ok((RequestRecord { nonce: nonce.into(), ..record.clone() }, format!("text for {nonce}")))).unwrap();
+        assert_eq!((nonce.as_str(), text.as_str(), counter), ("r00002", "text for r00002", 2), "the nonce a comment carries was passed over");
+        assert!(record_request_fresh(dir.path(), "/repo", &make, &mut counter, &|| Err("changed".into()), |nonce| Ok((RequestRecord { nonce: nonce.into(), ..record.clone() }, String::new()))).is_err());
         assert_eq!(load_requests(dir.path(), "/repo").0.len(), 2, "a refused guard records nothing");
+        assert!(record_request_fresh(dir.path(), "/repo", &make, &mut counter, &|| Ok(()), |_| Err("review too large".to_string())).is_err());
+        assert_eq!(load_requests(dir.path(), "/repo").0.len(), 2, "a refused build records nothing");
         // A malformed record is dropped alone.
         let mut bad = serde_json::to_value(&record).unwrap();
         bad["nonce"] = "x".into();
@@ -2979,8 +3003,12 @@ impl Store {
                 std::fs::rename(&tmp, &path).map_err(|e| TxError::Io(format!("{COMMENTS_FILE}: {e}")))
             })();
             if let Err(e) = written {
-                // The screen shows what the file holds, never a change the file does not.
+                // The screen shows what the file holds plus what this viewer still owes it: the journal's
+                // operations are reapplied, so an earlier unsaved add is not hidden by a later failure.
                 self.comments = loaded;
+                for entry in &self.journal {
+                    let _ = apply(&mut self.comments, entry);
+                }
                 self.mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
                 return Err(e);
             }
@@ -3196,20 +3224,17 @@ pub fn record_request_fresh(
     make: &dyn Fn(u64) -> String,
     counter: &mut u64,
     guard: &dyn Fn() -> Result<(), String>,
-    build: impl FnOnce(&str) -> RequestRecord,
-) -> std::io::Result<String> {
+    build: impl FnOnce(&str) -> Result<(RequestRecord, String), String>,
+) -> std::io::Result<(String, String)> {
     if !state_dir.is_absolute() {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "state directory must be absolute"));
     }
     let mut build = Some(build);
-    let mut chosen = String::new();
+    let mut chosen = (String::new(), String::new());
     reuse::with_lock(state_dir, || -> std::io::Result<()> {
         guard().map_err(|e| std::io::Error::new(std::io::ErrorKind::Interrupted, e))?;
-        let comments = match read_file(&state_dir.join(COMMENTS_FILE)) {
-            Ok(Some((text, _))) => parse_comments(&text, toplevel).1,
-            _ => Vec::new(),
-        };
-        let used = nonces_in_use(state_dir, &comments);
+        // Both files are read under the lock, and a read that fails fails the request: see `nonces_in_use`.
+        let used = nonces_in_use(state_dir, &[])?;
         let nonce = loop {
             *counter += 1;
             let candidate = make(*counter);
@@ -3217,9 +3242,11 @@ pub fn record_request_fresh(
                 break candidate;
             }
         };
-        let record = (build.take().expect("built once"))(&nonce);
+        // The text is built, and its bound checked, before anything is written: a refusal records nothing.
+        let (record, text) = (build.take().expect("built once"))(&nonce)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Interrupted, e))?;
         append_request(state_dir, toplevel, &record)?;
-        chosen = nonce;
+        chosen = (nonce, text);
         Ok(())
     })??;
     Ok(chosen)
@@ -3261,8 +3288,9 @@ pub fn remove_request(state_dir: &Path, toplevel: &str, nonce: &str) -> std::io:
 }
 
 /// Nonces any retained record of either file carries, every worktree's (two worktrees can share an
-/// agent pane, and a reply is matched by nonce alone), plus `own`, the array the caller holds.
-pub fn nonces_in_use(state_dir: &Path, own: &[Comment]) -> BTreeSet<String> {
+/// agent pane, and a reply is matched by nonce alone), plus `own`, the array the caller holds. A file
+/// that cannot be read is an error: a nonce chosen blind could collide with one it holds.
+pub fn nonces_in_use(state_dir: &Path, own: &[Comment]) -> std::io::Result<BTreeSet<String>> {
     fn nonces_of(comments: &[Comment]) -> impl Iterator<Item = String> + '_ {
         comments.iter().flat_map(|c| {
             let before = match &c.state {
@@ -3273,19 +3301,28 @@ pub fn nonces_in_use(state_dir: &Path, own: &[Comment]) -> BTreeSet<String> {
         })
     }
     let mut used: BTreeSet<String> = nonces_of(own).collect();
-    if let Ok(Some((text, _))) = read_file(&state_dir.join(COMMENTS_FILE)) {
-        if let Ok(all) = serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&text) {
-            for toplevel in all.keys() {
-                used.extend(nonces_of(&parse_comments(&text, toplevel).1));
+    match std::fs::read_to_string(state_dir.join(COMMENTS_FILE)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+        Ok(text) => {
+            // A malformed file retains nothing readable; its records are dropped on the next write anyway.
+            if let Ok(all) = serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&text) {
+                for toplevel in all.keys() {
+                    used.extend(nonces_of(&parse_comments(&text, toplevel).1));
+                }
             }
         }
     }
-    if let Ok(text) = std::fs::read_to_string(state_dir.join(REQUESTS_FILE)) {
-        if let Ok(all) = serde_json::from_str::<BTreeMap<String, Vec<serde_json::Value>>>(&text) {
-            used.extend(all.values().flatten().filter_map(|v| v["nonce"].as_str().map(str::to_string)));
+    match std::fs::read_to_string(state_dir.join(REQUESTS_FILE)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+        Ok(text) => {
+            if let Ok(all) = serde_json::from_str::<BTreeMap<String, Vec<serde_json::Value>>>(&text) {
+                used.extend(all.values().flatten().filter_map(|v| v["nonce"].as_str().map(str::to_string)));
+            }
         }
     }
-    used
+    Ok(used)
 }
 ```
 
@@ -4070,8 +4107,9 @@ pub struct Claimed { pub comments: Vec<Comment>, pub text: String, pub nonce: St
 /// `Unconfirmed`, or what it was.
 pub fn settle(&mut self, now: u64, nonce: &str, outcome: Settlement) -> Result<(), String>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum Settlement { Sent, Unconfirmed, Failed }
-/// Under the lock: both files reread, a nonce no retained record carries, `guard`, then `build(nonce)`'s record appended.
-pub fn record_request_fresh(state_dir: &Path, toplevel: &str, make: &dyn Fn(u64) -> String, counter: &mut u64, guard: &dyn Fn() -> Result<(), String>, build: impl FnOnce(&str) -> RequestRecord) -> std::io::Result<String /* the nonce */>;
+/// Under the lock: `guard`, both files reread, a nonce no retained record carries, then `build(nonce)`, which returns
+/// the record and the text it goes with or a refusal (the bound) that writes nothing; the record is appended.
+pub fn record_request_fresh(state_dir: &Path, toplevel: &str, make: &dyn Fn(u64) -> String, counter: &mut u64, guard: &dyn Fn() -> Result<(), String>, build: impl FnOnce(&str) -> Result<(RequestRecord, String), String>) -> std::io::Result<(String /* the nonce */, String /* the text */)>;
 pub fn remove_request(state_dir: &Path, toplevel: &str, nonce: &str) -> std::io::Result<()>;
 /// `clipboard.md` replaced under the state lock, so two copies never truncate each other's temporary file.
 pub fn write_clipboard(state_dir: &Path, text: &str) -> std::io::Result<PathBuf>;
@@ -4315,7 +4353,7 @@ Then the methods, after `refresh`:
             // The caller's last word before anything is stamped: the send's selection generation.
             guard().map_err(TxError::Refused)?;
             let used = match &store.state_dir {
-                Some(dir) => nonces_in_use(dir, &store.comments),
+                Some(dir) => nonces_in_use(dir, &store.comments).map_err(|e| TxError::Io(format!("nonces: {e}")))?,
                 None => store.comments.iter().filter_map(|c| c.stamp().map(|s| s.nonce.clone())).collect(),
             };
             let nonce = loop {
@@ -4673,10 +4711,13 @@ pub enum Refusal {
 fn gates(target: &Target, state: Option<TargetState>, record: Option<&host::PaneRecord>, accepted: &Accepted, failure: Option<&host::HostFailure>) -> Result<(), (String, Refusal)> {
     let Target::Pane { pane, agent, .. } = target else { return Ok(()) };
     let Some(state) = state else {
-        return Err((
-            format!("could not verify {pane}: {}", failure.map(host::HostFailure::message).unwrap_or_else(|| "no answer".into())),
-            Refusal::Other,
-        ));
+        // No state: the check failed, or the host answered about some other pane (`compare` rejects it).
+        let reason = match (failure, record) {
+            (Some(f), _) => f.message(),
+            (None, Some(r)) if r.pane_id != *pane => format!("the host answered about {}", r.pane_id),
+            (None, _) => "no answer".to_string(),
+        };
+        return Err((format!("could not verify {pane}: {reason}"), Refusal::Other));
     };
     // The continuity gate.
     match &state {
@@ -4828,7 +4869,8 @@ async fn send_inner(
         Destination::Pane { pane, .. } => pane.clone(),
         Destination::Clipboard { .. } => String::new(),
     };
-    let bound = move |text: &str| -> Result<(), String> {
+    // Shared by the closures below, each of which runs on the blocking pool with its own clone.
+    let bound: Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync> = Arc::new(move |text: &str| {
         let len = encoded_len(&pane_for_bound, text);
         if len > REQUEST_BOUND {
             return Err(format!(
@@ -4837,7 +4879,7 @@ async fn send_inner(
             ));
         }
         Ok(())
-    };
+    });
     // Steps 2 and 3: the claim (feedback), or the text and its record (request), on the blocking pool.
     let toplevel = ctx.toplevel.clone();
     let make = ctx.nonce.clone();
@@ -4854,13 +4896,13 @@ async fn send_inner(
     });
     let (text, items, nonce, claimed) = match (&request.kind, request_files) {
         (SendKind::Feedback, _) => {
-            let (to2, guard2) = (to.clone(), guard.clone());
+            let (to2, guard2, bound2) = (to.clone(), guard.clone(), bound.clone());
             let mut c = *counter;
             let (returned, result) = blocking(move || {
                 let result = store.claim(now, &to2, make.as_ref(), &mut c, guard2.as_ref(), |eligible, nonce| {
                     let items: Vec<prompt::Item<'_>> = eligible.iter().map(|(n, c)| prompt::Item { number: *n, comment: c }).collect();
                     let text = prompt::review(&toplevel, &items, nonce);
-                    bound(&text)?;
+                    bound2(&text)?;
                     Ok(text)
                 });
                 (store, result.map(|claimed| (claimed, c)))
@@ -4880,7 +4922,8 @@ async fn send_inner(
                 comments::AnchorComparison::Branch { merge_base, .. } => Some(merge_base),
                 comments::AnchorComparison::Worktree => None,
             };
-            let text_of = move |nonce: &str| {
+            // Built per nonce inside the reservations below; `Arc`'d so each blocking closure can own a copy.
+            let text_of = Arc::new(move |nonce: &str| {
                 prompt::request(
                     &toplevel,
                     &lines,
@@ -4890,34 +4933,28 @@ async fn send_inner(
                     },
                     nonce,
                 )
-            };
+            });
             let items = files.len() as u32;
-            // The bound is checked on the text as it will go out, nonce included, once the nonce is known;
-            // a text over it removes the record it was given, so nothing is retained for a refused request.
+            // The bound is checked on the text as it will go out, nonce included, inside the reservation
+            // where there is one, so a refused request is never recorded.
             let over_bound = |text: &str| bound(text).err();
             match (&to, &ctx.state_dir) {
                 // A pane: the record precedes the call, as the claim does; a definite failure removes it.
                 (Destination::Pane { .. }, Some(dir)) => {
-                    let (dir2, top, make, to2, guard2, mut c) = (dir.clone(), ctx.toplevel.clone(), ctx.nonce.clone(), to.clone(), guard.clone(), *counter);
+                    // The text is built and bounded inside the reservation: an oversized request leaves the file untouched.
+                    let (dir2, top, make, to2, guard2, bound2, mut c) = (dir.clone(), ctx.toplevel.clone(), ctx.nonce.clone(), to.clone(), guard.clone(), bound.clone(), *counter);
                     let recorded = blocking(move || {
-                        let nonce = comments::record_request_fresh(&dir2, &top, make.as_ref(), &mut c, guard2.as_ref(), |nonce| RequestRecord {
-                            nonce: nonce.to_string(),
-                            at: now,
-                            target: to2,
-                            files,
+                        let (nonce, text) = comments::record_request_fresh(&dir2, &top, make.as_ref(), &mut c, guard2.as_ref(), |nonce| {
+                            let text = text_of(nonce);
+                            bound2(&text)?;
+                            Ok((RequestRecord { nonce: nonce.to_string(), at: now, target: to2, files }, text))
                         })?;
-                        Ok::<_, std::io::Error>((nonce, c))
+                        Ok::<_, std::io::Error>((nonce, text, c))
                     })
                     .await;
                     match recorded {
-                        Ok((nonce, c)) => {
+                        Ok((nonce, text, c)) => {
                             *counter = c;
-                            let text = text_of(&nonce);
-                            if let Some(e) = over_bound(&text) {
-                                let (dir, top, n) = (dir.clone(), ctx.toplevel.clone(), nonce.clone());
-                                let _ = blocking(move || comments::remove_request(&dir, &top, &n)).await;
-                                bail!(store, e);
-                            }
                             (text, items, nonce, false)
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => bail!(store, e.into_inner().map(|e| e.to_string()).unwrap_or_default()),
@@ -4940,23 +4977,23 @@ async fn send_inner(
                 // The clipboard: the record takes its nonce under the lock, the text carries it, the copy
                 // follows, and a copy that reached nothing removes the record again (spec 10.4's rule).
                 (Destination::Clipboard { .. }, dir) => {
-                    let nonce = match dir {
+                    let (nonce, text) = match dir {
                         Some(dir) => {
-                            let (dir, top, make, guard2, mut c, files2) = (dir.clone(), ctx.toplevel.clone(), ctx.nonce.clone(), guard.clone(), *counter, files.clone());
+                            let (dir, top, make, guard2, bound2, mut c, files2) = (dir.clone(), ctx.toplevel.clone(), ctx.nonce.clone(), guard.clone(), bound.clone(), *counter, files.clone());
+                            let text_of2 = text_of.clone();
                             let recorded = blocking(move || {
-                                let nonce = comments::record_request_fresh(&dir, &top, make.as_ref(), &mut c, guard2.as_ref(), |nonce| RequestRecord {
-                                    nonce: nonce.to_string(),
-                                    at: now,
-                                    target: Destination::clipboard(),
-                                    files: files2,
+                                let (nonce, text) = comments::record_request_fresh(&dir, &top, make.as_ref(), &mut c, guard2.as_ref(), |nonce| {
+                                    let text = text_of2(nonce);
+                                    bound2(&text)?;
+                                    Ok((RequestRecord { nonce: nonce.to_string(), at: now, target: Destination::clipboard(), files: files2 }, text))
                                 })?;
-                                Ok::<_, std::io::Error>((nonce, c))
+                                Ok::<_, std::io::Error>((nonce, text, c))
                             })
                             .await;
                             match recorded {
-                                Ok((nonce, c)) => {
+                                Ok((nonce, text, c)) => {
                                     *counter = c;
-                                    nonce
+                                    (nonce, text)
                                 }
                                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => bail!(store, e.into_inner().map(|e| e.to_string()).unwrap_or_default()),
                                 Err(e) => bail!(store, format!("request not recorded: {e}")),
@@ -4967,17 +5004,14 @@ async fn send_inner(
                                 bail!(store, e);
                             }
                             *counter += 1;
-                            (ctx.nonce)(*counter)
+                            let nonce = (ctx.nonce)(*counter);
+                            let text = text_of(&nonce);
+                            if let Some(e) = over_bound(&text) {
+                                bail!(store, e);
+                            }
+                            (nonce, text)
                         }
                     };
-                    let text = text_of(&nonce);
-                    if let Some(e) = over_bound(&text) {
-                        if let Some(dir) = dir.clone() {
-                            let (top, n) = (ctx.toplevel.clone(), nonce.clone());
-                            let _ = blocking(move || comments::remove_request(&dir, &top, &n)).await;
-                        }
-                        bail!(store, e);
-                    }
                     let (dir2, text2) = (dir.clone(), text.clone());
                     let (copy, file) = blocking(move || copy_out(dir2.as_deref(), &text2, "a review request")).await;
                     if file.is_err() && copy.osc.is_none() {
@@ -5069,8 +5103,9 @@ async fn send_inner(
 
 /// The send lock, taken on the blocking pool; `waiting(true)` while another viewer holds it.
 async fn hold_send_lock(path: PathBuf, waiting: Arc<dyn Fn(bool) + Send + Sync>) -> Result<SendLock, String> {
-    // Try at once; only a contended lock is worth a notice.
-    match SendLock::try_take(&path) {
+    // Try at once (on the pool: it creates the directory and opens the file); only a contended lock is worth a notice.
+    let first = path.clone();
+    match blocking(move || SendLock::try_take(&first)).await {
         Ok(Some(lock)) => return Ok(lock),
         Ok(None) => {}
         Err(e) => return Err(format!("{SEND_LOCK}: {e}")),
@@ -5208,8 +5243,11 @@ pub async fn copy(ctx: Context, request: CopyRequest, comments: Vec<comments::Co
                 return Err(NOTICE_NO_PENDING.to_string());
             }
             // Nothing is stamped by a copy, so the nonce only has to be fresh against what is retained now.
-            let used: std::collections::BTreeSet<String> = match &ctx.state_dir {
-                Some(dir) => comments::nonces_in_use(dir, &comments),
+            let used: std::collections::BTreeSet<String> = match ctx.state_dir.clone() {
+                Some(dir) => {
+                    let own = comments.clone();
+                    blocking(move || comments::nonces_in_use(&dir, &own)).await.map_err(|e| format!("nonces: {e}"))?
+                }
                 None => comments.iter().filter_map(|c| c.stamp().map(|s| s.nonce.clone())).collect(),
             };
             let nonce = loop {
@@ -5232,40 +5270,41 @@ pub async fn copy(ctx: Context, request: CopyRequest, comments: Vec<comments::Co
             };
             // The record takes its nonce under the lock; the text carries it; a copy that reached
             // nothing removes the record again, so a record exists only for a text that went somewhere.
-            let nonce = match &ctx.state_dir {
+            let (toplevel, scope_of2, lines2) = (ctx.toplevel.clone(), scope_of.clone(), lines.clone());
+            let text_of = Arc::new(move |nonce: &str| {
+                prompt::request(
+                    &toplevel,
+                    &lines2,
+                    match &scope_of2 {
+                        Some(mb) => prompt::RequestScope::Branch { merge_base: mb },
+                        None => prompt::RequestScope::Worktree,
+                    },
+                    nonce,
+                )
+            });
+            let (nonce, text) = match &ctx.state_dir {
                 Some(dir) => {
-                    let (dir, top, make, mut c, files2, now) = (dir.clone(), ctx.toplevel.clone(), ctx.nonce.clone(), counter, files.clone(), ctx.now);
+                    let (dir, top, make, mut c, files2, now, text_of2) = (dir.clone(), ctx.toplevel.clone(), ctx.nonce.clone(), counter, files.clone(), ctx.now, text_of.clone());
                     let (latest, generation) = (ctx.latest_generation.clone(), ctx.generation);
-                    let (nonce, c) = blocking(move || {
+                    let (nonce, text, c) = blocking(move || {
                         // A copy made for one target must not be recorded against another picked meanwhile.
                         let guard = || if latest.load(Ordering::SeqCst) == generation { Ok(()) } else { Err("the target changed; press @ again".to_string()) };
-                        let nonce = comments::record_request_fresh(&dir, &top, make.as_ref(), &mut c, &guard, |nonce| RequestRecord {
-                            nonce: nonce.to_string(),
-                            at: now,
-                            target: Destination::clipboard(),
-                            files: files2,
+                        let (nonce, text) = comments::record_request_fresh(&dir, &top, make.as_ref(), &mut c, &guard, |nonce| {
+                            Ok((RequestRecord { nonce: nonce.to_string(), at: now, target: Destination::clipboard(), files: files2 }, text_of2(nonce)))
                         })?;
-                        Ok::<_, std::io::Error>((nonce, c))
+                        Ok::<_, std::io::Error>((nonce, text, c))
                     })
                     .await
                     .map_err(|e| format!("request not recorded: {e}"))?;
                     counter = c;
-                    nonce
+                    (nonce, text)
                 }
                 None => {
                     counter += 1;
-                    (ctx.nonce)(counter)
+                    let nonce = (ctx.nonce)(counter);
+                    (nonce.clone(), text_of(&nonce))
                 }
             };
-            let text = prompt::request(
-                &ctx.toplevel,
-                &lines,
-                match &scope_of {
-                    Some(mb) => prompt::RequestScope::Branch { merge_base: mb },
-                    None => prompt::RequestScope::Worktree,
-                },
-                &nonce,
-            );
             let (dir, text2) = (ctx.state_dir.clone(), text.clone());
             let (out, file) = blocking(move || copy_out(dir.as_deref(), &text2, &format!("a review request for {} files", lines.len()))).await;
             if file.is_err() && out.osc.is_none() {
@@ -5530,6 +5569,10 @@ The three `Done` arms:
         *host.list_failure.lock().unwrap() = Some(host::HostFailure::After("deadline".into()));
         assert_eq!(send(dispatch::Accepted::default()).send_error.as_deref(), Some("could not verify w4:p2: deadline"));
         *host.list_failure.lock().unwrap() = None;
+        // A reply naming another pane is refused as a check that could not run, and nothing is adopted.
+        *host.answer_pane_get_with.lock().unwrap() = Some(agent_pane("w4:p9", "codex", "idle", Some("s1"), &top));
+        assert_eq!(send(dispatch::Accepted::default()).send_error.as_deref(), Some("could not verify w4:p2: the host answered about w4:p9"));
+        *host.answer_pane_get_with.lock().unwrap() = None;
         assert_eq!(host.prompts.lock().unwrap().len(), 0, "nothing was sent by a refusal");
         // The accepted restart sends, and the target record adopts the new session.
         host.set_pane(agent_pane("w4:p2", "codex", "idle", Some("s2"), &top));
@@ -5832,8 +5875,15 @@ The three `Done` arms:
         assert_eq!(files, [("a.txt", vec![(1, 2)]), ("b.txt", vec![(1, 1)])]);
         // A staged rename with further unstaged edits: both halves are read with their own source
         // (the staged half's `-M old new`, the unstaged half's none), so neither records empty ranges.
+        // The file is given enough common content first, or git sees a deletion and an addition.
+        let body: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.path().join("b.txt"), &body).unwrap();
+        git(dir.path(), &["add", "b.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "a longer b"]);
         git(dir.path(), &["mv", "b.txt", "c.txt"]);
-        std::fs::write(dir.path().join("c.txt"), "B\nmore\n").unwrap();
+        std::fs::write(dir.path().join("c.txt"), format!("{body}more\n")).unwrap();
+        let status = Proc::new("git").arg("-C").arg(dir.path()).args(["status", "--porcelain=v1"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&status.stdout).contains("RM b.txt -> c.txt"), "the fixture must be a staged rename with unstaged edits");
         handle.commands.send(Command::Refresh).unwrap();
         wait_for(&handle, "both halves listed", |s| s.files.iter().filter(|f| f.path == "c.txt").count() == 2);
         handle.commands.send(Command::Send(dispatch::SendRequest { kind: dispatch::SendKind::Review { scope: dispatch::ReviewScope::All }, accepted: Default::default() })).unwrap();
@@ -5935,6 +5985,21 @@ Two more session tests, for the late answer and the oversized review:
         assert!(s.send_error.as_deref().unwrap().starts_with("review too large to send at once ("), "{:?}", s.send_error);
         assert!(s.comments.iter().all(|c| c.is_pending()), "nothing was stamped");
         assert_eq!(host.prompts.lock().unwrap().len(), 0, "the host was not called");
+        // An oversized request leaves requests.json untouched: the bound runs inside the reservation. The
+        // request text names each file twice, so a hundred untracked files twelve directories deep, on a
+        // path of some 2,900 characters, put it past 512 KiB (one name is capped at 255 bytes, a path at 4,096).
+        let before = std::fs::read_to_string(state.path().join("requests.json")).ok();
+        let deep = (0..12).fold(dir.path().to_path_buf(), |p, i| p.join(format!("{i}{}", "d".repeat(239))));
+        std::fs::create_dir_all(&deep).unwrap();
+        for i in 0..100 {
+            std::fs::write(deep.join(format!("{i}.txt")), "x\n").unwrap();
+        }
+        handle.commands.send(Command::Refresh).unwrap();
+        wait_for(&handle, "a hundred rows", |s| s.files.len() >= 100);
+        handle.commands.send(Command::Send(dispatch::SendRequest { kind: dispatch::SendKind::Review { scope: dispatch::ReviewScope::All }, accepted: Default::default() })).unwrap();
+        let s = wait_for(&handle, "request refused", |s| s.send_seq == 2);
+        assert!(s.send_error.as_deref().unwrap().starts_with("review too large"), "{:?}", s.send_error);
+        assert_eq!(std::fs::read_to_string(state.path().join("requests.json")).ok(), before, "a refused request was recorded");
     }
 ```
 
@@ -5991,8 +6056,8 @@ impl PanePicker {
     pub fn retarget(&mut self, snapshot: &Snapshot);
     /// Closes on the answered pick; the error, if any, is the viewer's notice (observe takes it).
     pub fn observe(&mut self, snapshot: &Snapshot);
-    /// The row index in the panel for `choices[i]`, headings counted.
-    pub fn panel_row(&self, snapshot: &Snapshot, choice: usize) -> usize;
+    /// The rendered line (within the panel's rows) where `choices[i]` is drawn, wrapped notes counted at their rendered height; `None` when it is not drawn.
+    pub fn panel_line(&self, snapshot: &Snapshot, width: u16, height: u16, choice: usize) -> Option<usize>;
 }
 
 /// The chip of 10.2: text and tone from the target and its state.
@@ -6118,7 +6183,7 @@ mod tests {
         assert!(plain[5].starts_with("E codex  w1:p2  working  ~/other"));
         assert_eq!(plain[6], format!("E {CLIPBOARD_ROW} | "));
         assert_eq!(panel.cursor, Some(2));
-        assert_eq!(picker.panel_row(&s, 3), 6);
+        assert_eq!(picker.panel_line(&s, WIDTH, 20, 3), Some(6));
         assert_eq!(panel.title, "Send to");
         assert_eq!(panel.footer, "Enter pick · Esc cancel · type to filter");
     }
@@ -6131,6 +6196,11 @@ mod tests {
         assert!(panel.rows.iter().any(|r| matches!(r, Row::Note(t) if t == NO_AGENT)));
         assert_eq!(picker.choices(&s), vec![Choice::Clipboard]);
         assert_eq!(panel.cursor, Some(2));
+        // The no-agent note wraps: two lines at the panel's width, three at 44 columns. The clipboard
+        // row's line follows the rendered lines (the input line plus the note's), not its row index.
+        assert_eq!(picker.panel_line(&s, WIDTH, 20, 0), Some(3));
+        assert_eq!(picker.panel_line(&s, 44, 20, 0), Some(4));
+        assert_eq!(picker.panel_line(&s, 44, 20, 1), None, "a choice that does not exist has no line");
         let mut s = s;
         s.panes_error = Some("could not list panes: deadline".into());
         let panel = picker.panel(&s, WIDTH, 20);
@@ -6178,7 +6248,7 @@ Expected: compile errors.
 ```rust
 //! The pane picker of spec 10.2, built like the base picker: an input line that filters, three groups.
 use crate::engine::{PaneRow, Snapshot, Target, TargetState};
-use crate::tui::dialog::{Panel, Row};
+use crate::tui::dialog::{self, Panel, Row};
 use crate::tui::format::truncate;
 use crate::tui::sanitize::sanitize;
 use crate::tui::style::Semantic;
@@ -6347,8 +6417,14 @@ impl PanePicker {
         (rows, positions)
     }
 
-    pub fn panel_row(&self, snapshot: &Snapshot, choice: usize) -> usize {
-        self.rows_and_positions(snapshot, WIDTH, u16::MAX).1.get(choice).copied().unwrap_or(0)
+    /// The terminal line (within the panel's rows, frame excluded) where `choices[choice]` is drawn: the
+    /// rendered height of every row before it, because a `Note` or `Warn` wraps to several lines at the
+    /// panel's width while an `Entry` is one.
+    pub fn panel_line(&self, snapshot: &Snapshot, width: u16, height: u16, choice: usize) -> Option<usize> {
+        let (rows, positions) = self.rows_and_positions(snapshot, width, height);
+        let row = positions.get(choice).copied().filter(|p| *p != usize::MAX)?;
+        let before = Panel { title: String::new(), rows: rows[..row].to_vec(), footer: String::new(), cursor: None, offset: 0 };
+        Some(dialog::line_count(&before, width))
     }
 
     pub fn panel(&self, snapshot: &Snapshot, width: u16, height: u16) -> Panel {
@@ -6545,7 +6621,7 @@ and in `act`: `PickPane => { state.panes_token += 1; state.panes = Some(PanePick
     items.push((vec![(chip_text, Some(Action::PickPane))], 2, tone, dim));
 ```
 
-and the drop orders shift up by one from the scope chip on (scope 3, view 4, STAGED 5, stats 6, files 7, busy 8, actions 9), so the target chip drops last but one. `Action::PickPane` is always enabled. The overlay: after the base picker's block, the same for `state.panes` with `panes::WIDTH`, hits `Action::PickPaneRow(first + i)` for each entry row (use `panel_row` to map choices to rows, skipping heading rows). `body_is_drawn` gains `&& state.panes.is_none()`.
+and the drop orders shift up by one from the scope chip on (scope 3, view 4, STAGED 5, stats 6, files 7, busy 8, actions 9), so the target chip drops last but one. `Action::PickPane` is always enabled. The overlay: after the base picker's block, the same for `state.panes` with `panes::WIDTH`, hits `Action::PickPaneRow(first + i)` for each choice `first + i` whose `picker.panel_line(snapshot, panel_width, panel_height, first + i)` is `Some(line)`, at `y = 2 + line` (the rendered line, so a wrapped note or warning above moves the hits with the rows it pushes down; `the_pane_picker_overlay_lists_groups_and_hits_its_rows` also renders the empty-host picker at 44 columns and asserts the clipboard row's one hit is at `y = 6`, the line that shows it, below the three-line note). `body_is_drawn` gains `&& state.panes.is_none()`.
 
 5. `shell.rs`: `state.socket_path = std::env::var("HERDR_SOCKET_PATH").ok();` in `run_terminal` after `state.popup`.
 
@@ -7863,6 +7939,13 @@ In `review.rs`'s tests:
         let mut other = ReviewBox::finish();
         other.refuse("could not verify w4:p2: deadline".into(), Refusal::Other);
         assert_eq!(other.offers(&s).y, Some("send"), "an unacceptable refusal keeps a plain retry");
+        // A refusal never offers more than the state the chip now shows: blocked or no host after a refusal.
+        let blocked = with_comments(Some(pane()), TargetState::Live("blocked".into()), 1, 0);
+        assert_eq!(refused.offers(&blocked).y, None, "send anyway is withdrawn while the agent is blocked");
+        assert_eq!(texts(&refused.panel(&blocked, 60))[0], "codex is working in w4:p2; the review would queue behind its current turn.", "the refusal is still what the box says");
+        let no_host = with_comments(Some(pane()), TargetState::NoHost, 1, 0);
+        let offers = other.offers(&no_host);
+        assert!(offers.y.is_none() && !offers.pick && offers.copy);
         // Blocked offers no Y at all.
         let s = with_comments(Some(pane()), TargetState::Live("blocked".into()), 1, 0);
         assert!(ReviewBox::finish().submit(&s).is_none());
@@ -7924,6 +8007,7 @@ pub enum BoxKind {
     Request,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Offers {
     pub y: Option<&'static str>,
     pub pick: bool,
@@ -8019,13 +8103,23 @@ impl ReviewBox {
         let all = Offers { y: Some("send"), pick: true, copy: true, scope_line: false, nothing: false };
         let anyway = Offers { y: Some("send anyway"), ..all };
         let no_y = Offers { y: None, ..all };
+        // The table decides what the current state allows; a refusal replaces the line and may relabel
+        // Y, but never offers more than the state does: a target that went blocked or lost its host
+        // after a refusal offers what blocked or no-host offers.
+        let (line, table) = self.table_line(snapshot, &agent, &pane, &what, files, all, anyway, no_y);
         if let Some((message, refusal)) = &self.refusal {
-            let offers = match refusal {
-                Refusal::Busy | Refusal::Restarted(_) => anyway,
-                Refusal::Other => all,
+            // A plain send under an accepted refusal reads "send anyway"; nothing else is relabelled.
+            let y = match (table.y, refusal) {
+                (Some("send") | Some("delegate"), Refusal::Busy | Refusal::Restarted(_)) => Some("send anyway"),
+                (y, _) => y,
             };
-            return (sanitize(message), offers);
+            return (sanitize(message), Offers { y, ..table });
         }
+        (line, table)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn table_line(&self, snapshot: &Snapshot, agent: &str, pane: &str, what: &str, files: usize, all: Offers, anyway: Offers, no_y: Offers) -> (String, Offers) {
         match (&snapshot.target_state, self.kind) {
             (TargetState::Clipboard, BoxKind::Finish) => (
                 format!("Copy {what} across {} to the clipboard?", plural(files, "file")),
@@ -8879,3 +8973,26 @@ reads a four-megabyte request) and the fake's silent mode holds the stream open 
 deadline; the recording test moves to its own integration file (`review_loop_guarantee.rs`),
 since it changes process-wide state; and `request_files` is unit-tested on a `Failed`
 selected row, an unreadable row and a branch-scope snapshot.
+
+**Round 6 (codex, plan-complete, 2026-10-05).** Eleven findings, all applied. Three were
+HIGH: `Command::SetTarget` still named the review `Target` unqualified where `types.rs`
+imports `nav::Target` (now by path, like the snapshot field); a failed write in
+`read_and_apply` replaced the comments with the file's and so hid an earlier journaled add
+behind a later failure (the journal is reapplied after the reload); and the failed-expiry
+fixture seeded a claim already expired at the time of its own transaction (seeded at 950,
+reopened at 1,100). Then: `compare` rejects a `pane.get` reply that names another pane (no
+state, so the send refuses "could not verify … the host answered about <pane>" and adopts
+nothing; the fake gained `answer_pane_get_with`); `HerdrHost::agent_prompt` requires
+`result.type == "agent_prompted"`, with `pong` as the control; `nonces_in_use` and
+`record_request_fresh` return read errors instead of an empty set, tested with a directory in
+the file's place; the request text and its bound are built inside the reservation (`build`
+returns the record and the text, or a refusal that writes nothing), and a session test puts a
+hundred deep untracked files past the bound and asserts `requests.json` unchanged; the Finish
+and Request boxes compute their offers from the current state table first and a refusal only
+replaces the line and relabels a plain send, so a blocked or hostless target after a refusal
+withdraws Y (transition tests added); the pane picker's hits come from the rendered layout
+(`panel_line` counts wrapped notes through `dialog::line_count`, `None` for an undrawn
+choice) and the empty-host picker is tested at 44 columns; the rename regression commits
+twenty common lines first and asserts `RM b.txt -> c.txt` before requesting ranges; and the
+remaining synchronous filesystem work (`nonces_in_use` in `copy`, the send lock's first
+`try_take`) moved onto the blocking pool.
