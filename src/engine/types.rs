@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::engine::comments::{Anchor, Category, Comment};
+use crate::engine::dispatch::{CopyOut, CopyRequest, Refusal, SendOutcome, SendRequest};
 use crate::engine::nav::{targets_for_diff, unified_order, Target};
 use crate::engine::target::{PaneRow, TargetState};
 use crate::git::{ChangedFile, ChangedFileStatus, FileDiff, GetGitDiffResponse};
@@ -333,6 +334,13 @@ pub struct Snapshot {
     pub comment_refused: bool,
     /// The add or edit token; absent for deletions and refresh notices.
     pub comment_token: Option<u64>,
+    pub send_seq: u64,
+    pub send_error: Option<String>,
+    pub send_refusal: Option<Refusal>,
+    pub send_outcome: Option<SendOutcome>,
+    pub send_waiting: bool,
+    pub copy_seq: u64,
+    pub copy: Option<Arc<CopyOut>>,
 }
 
 impl Snapshot {
@@ -381,12 +389,21 @@ impl Snapshot {
             comment_error: None,
             comment_refused: false,
             comment_token: None,
+            send_seq: 0,
+            send_error: None,
+            send_refusal: None,
+            send_outcome: None,
+            send_waiting: false,
+            copy_seq: 0,
+            copy: None,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    Send(SendRequest),
+    Copy(CopyRequest),
     Select(FileKey),
     SelectNext,
     SelectPrev,

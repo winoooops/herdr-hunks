@@ -285,6 +285,20 @@ pub fn expire(comments: &mut [Comment], now: u64) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claimed {
+    pub comments: Vec<Comment>,
+    pub text: String,
+    pub nonce: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settlement {
+    Sent,
+    Unconfirmed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
     Add(Comment),
     Edit {
@@ -514,7 +528,7 @@ impl Store {
         {
             self.reads += 1;
         }
-        let (mut all, mut comments, problem) = match read_file(&path).map_err(TxError::Io)? {
+        let (all, mut comments, problem) = match read_file(&path).map_err(TxError::Io)? {
             None => (BTreeMap::new(), Vec::new(), None),
             Some((text, _)) => parse_comments(&text, &self.toplevel),
         };
@@ -557,21 +571,7 @@ impl Store {
             if let Some(problem) = &problem {
                 base::note_problem(&dir, &format!("{problem}; rewritten without them"));
             }
-            let written = (|| -> Result<(), TxError> {
-                #[cfg(test)]
-                if self.fail_writes {
-                    return Err(TxError::Io(format!("{COMMENTS_FILE}: write failed (test)")));
-                }
-                all.insert(
-                    self.toplevel.clone(),
-                    serde_json::to_value(&comments).map_err(|e| TxError::Io(e.to_string()))?,
-                );
-                let tmp = dir.join(format!("{COMMENTS_FILE}.{}.tmp", std::process::id()));
-                std::fs::write(&tmp, serde_json::to_vec_pretty(&all).unwrap_or_default())
-                    .map_err(|e| TxError::Io(format!("{COMMENTS_FILE}: {e}")))?;
-                std::fs::rename(&tmp, &path)
-                    .map_err(|e| TxError::Io(format!("{COMMENTS_FILE}: {e}")))
-            })();
+            let written = self.write_locked_with(&comments);
             if let Err(e) = written {
                 // Restore the file's records, then overlay this viewer's unsaved work.
                 self.comments = loaded;
@@ -594,6 +594,27 @@ impl Store {
             return Err(TxError::Refused(refusal));
         }
         Ok((dropped, problem))
+    }
+
+    fn write_locked_with(&self, comments: &[Comment]) -> Result<(), TxError> {
+        let dir = self
+            .state_dir
+            .as_ref()
+            .expect("locked() checked the directory");
+        #[cfg(test)]
+        if self.fail_writes {
+            return Err(TxError::Io(format!("{COMMENTS_FILE}: write failed (test)")));
+        }
+        let mut all = self.others.clone();
+        all.insert(
+            self.toplevel.clone(),
+            serde_json::to_value(comments).map_err(|e| TxError::Io(e.to_string()))?,
+        );
+        let tmp = dir.join(format!("{COMMENTS_FILE}.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&all).unwrap_or_default())
+            .map_err(|e| TxError::Io(format!("{COMMENTS_FILE}: {e}")))?;
+        std::fs::rename(&tmp, dir.join(COMMENTS_FILE))
+            .map_err(|e| TxError::Io(format!("{COMMENTS_FILE}: {e}")))
     }
 
     pub fn transact(&mut self, op: Operation, now: u64) -> Result<Option<String>, String> {
@@ -676,6 +697,198 @@ impl Store {
             Ok(Ok((dropped, problem))) => dropped.into_iter().chain(problem).collect(),
             Ok(Err(TxError::Refused(e) | TxError::Io(e)))
             | Err(TxError::Refused(e) | TxError::Io(e)) => vec![e],
+        }
+    }
+
+    /// Spec 10.4 steps 2 and 3 in one transaction: the nonce is chosen against the records as they
+    /// are under the lock, so no viewer that waited on `send.lock` can have introduced it since.
+    /// `build` receives the eligible records numbered `[#1..n]` and the nonce, and returns the text
+    /// to send, or a refusal (the bound) that stamps nothing.
+    pub fn claim(
+        &mut self,
+        now: u64,
+        to: &Destination,
+        make: &dyn Fn(u64) -> String,
+        counter: &mut u64,
+        guard: &dyn Fn() -> Result<(), String>,
+        build: impl FnOnce(&[(u32, &Comment)], &str) -> Result<String, String>,
+    ) -> Result<Claimed, String> {
+        if !self.journal.is_empty() {
+            return Err(format!(
+                "comments not saved: {}; fix it before sending",
+                self.journal_reason
+                    .clone()
+                    .unwrap_or_else(|| "the store could not be written".into())
+            ));
+        }
+        let mut build = Some(build);
+        let mut body = |store: &mut Self| -> Result<Claimed, TxError> {
+            if store.state_dir.is_some() {
+                store.read_and_apply(None, now)?;
+            } else {
+                expire(&mut store.comments, now);
+            }
+            // The caller's last word before anything is stamped: the send's selection generation.
+            guard().map_err(TxError::Refused)?;
+            let used = match &store.state_dir {
+                Some(dir) => nonces_in_use(dir, &store.comments)
+                    .map_err(|e| TxError::Io(format!("nonces: {e}")))?,
+                None => nonces_of(&store.comments),
+            };
+            let nonce = loop {
+                *counter += 1;
+                let candidate = make(*counter);
+                if !used.contains(&candidate) {
+                    break candidate;
+                }
+            };
+            // Order by creation time and id, including replayed comments.
+            let mut ordered: Vec<&Comment> = store
+                .comments
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c.state,
+                        CommentState::Pending | CommentState::Unconfirmed { .. }
+                    )
+                })
+                .collect();
+            ordered.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+            let eligible: Vec<(u32, &Comment)> = ordered
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| (i as u32 + 1, c))
+                .collect();
+            if eligible.is_empty() {
+                return Err(TxError::Refused(NOTICE_NOTHING.to_string()));
+            }
+            let text =
+                (build.take().expect("built once"))(&eligible, &nonce).map_err(TxError::Refused)?;
+            let ids: Vec<(String, u32)> =
+                eligible.iter().map(|(n, c)| (c.id.clone(), *n)).collect();
+            // Stamped on a working copy: the array shows the claim only once the file holds it.
+            let mut working = store.comments.clone();
+            let mut claimed = Vec::new();
+            for comment in &mut working {
+                if let Some((_, item)) = ids.iter().find(|(id, _)| id == &comment.id) {
+                    // Retain every uncertain attempt, newest first.
+                    let before = match &comment.state {
+                        CommentState::Unconfirmed { stamp, before } => {
+                            std::iter::once(stamp.clone())
+                                .chain(before.iter().cloned())
+                                .collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    comment.state = CommentState::Sending {
+                        stamp: Stamp {
+                            at: now,
+                            nonce: nonce.clone(),
+                            item: *item,
+                            to: to.clone(),
+                        },
+                        before,
+                    };
+                    claimed.push(comment.clone());
+                }
+            }
+            if store.state_dir.is_some() {
+                store.write_locked_with(&working)?;
+            }
+            store.comments = working;
+            Ok(Claimed {
+                comments: claimed,
+                text,
+                nonce,
+            })
+        };
+        let outcome = if self.state_dir.is_some() {
+            self.locked(|store| body(store))
+        } else {
+            // The array is the store (spec 10.3): a claim and its settlement run in memory.
+            Ok(body(self))
+        };
+        match outcome {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(TxError::Refused(e) | TxError::Io(e)))
+            | Err(TxError::Refused(e) | TxError::Io(e)) => Err(e),
+        }
+    }
+
+    /// Spec 10.4 step 5: records still `Sending` under `nonce`, and `Unconfirmed` ones when a late
+    /// answer arrives after the engine's wait (spec 10.6); never the cap. On a working copy, so a
+    /// failed write leaves the array as the file has it.
+    pub fn settle(&mut self, now: u64, nonce: &str, outcome: Settlement) -> Result<(), String> {
+        let body = |store: &mut Self| -> Result<(), TxError> {
+            if store.state_dir.is_some() {
+                store.read_and_apply(None, now)?;
+            }
+            let mut working = store.comments.clone();
+            let mut changed = false;
+            for comment in &mut working {
+                // Late successes settle earlier attempts; failures remove them from the chain.
+                if let CommentState::Sending { before, .. }
+                | CommentState::Unconfirmed { before, .. } = &mut comment.state
+                {
+                    if let Some(index) = before.iter().position(|b| b.nonce == nonce) {
+                        let arrived = match outcome {
+                            Settlement::Sent => Some(before[index].clone()),
+                            Settlement::Failed => {
+                                before.remove(index);
+                                None
+                            }
+                            Settlement::Unconfirmed => None,
+                        };
+                        if let Some(earlier) = arrived {
+                            comment.state = CommentState::Sent(earlier);
+                        }
+                        changed = true;
+                        continue;
+                    }
+                }
+                let (stamp, before) = match &comment.state {
+                    CommentState::Sending { stamp, before } if stamp.nonce == nonce => {
+                        (stamp.clone(), before.clone())
+                    }
+                    // A late answer overrides the timeout for the same nonce.
+                    CommentState::Unconfirmed { stamp, before }
+                        if stamp.nonce == nonce && outcome != Settlement::Unconfirmed =>
+                    {
+                        (stamp.clone(), before.clone())
+                    }
+                    _ => continue,
+                };
+                comment.state = match outcome {
+                    Settlement::Sent => CommentState::Sent(stamp),
+                    Settlement::Unconfirmed => CommentState::Unconfirmed { stamp, before },
+                    // Restore the newest earlier attempt because it may have arrived.
+                    Settlement::Failed => match before.split_first() {
+                        Some((earlier, rest)) => CommentState::Unconfirmed {
+                            stamp: earlier.clone(),
+                            before: rest.to_vec(),
+                        },
+                        None => CommentState::Pending,
+                    },
+                };
+                changed = true;
+            }
+            if changed {
+                if store.state_dir.is_some() {
+                    store.write_locked_with(&working)?;
+                }
+                store.comments = working;
+            }
+            Ok(())
+        };
+        let result = if self.state_dir.is_some() {
+            self.locked(body)
+        } else {
+            Ok(body(self))
+        };
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(TxError::Refused(e) | TxError::Io(e)))
+            | Err(TxError::Refused(e) | TxError::Io(e)) => Err(e),
         }
     }
 
@@ -2157,5 +2370,532 @@ mod tests {
         assert_eq!(json["category"], "bug");
         let back: Comment = serde_json::from_value(json).unwrap();
         assert_eq!(back, c);
+    }
+    #[test]
+    fn retries_keep_every_uncertain_stamp_and_a_late_word_settles_the_right_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        let mut a = comment("c", "x", 1);
+        a.state = CommentState::Unconfirmed {
+            stamp: stamp("aaaaaa"),
+            before: Vec::new(),
+        };
+        store.transact(Operation::Add(a), 1_000).unwrap();
+        let to = Destination::clipboard();
+        let ok = || Ok(());
+        let mut counter = 0;
+        let make_b = |_: u64| "bbbbbb".to_string();
+        store
+            .claim(
+                1_001,
+                &to,
+                &make_b,
+                &mut counter,
+                &ok,
+                |_, _| Ok("b".into()),
+            )
+            .unwrap();
+        assert!(
+            matches!(&store.comments()[0].state, CommentState::Sending { stamp, before } if stamp.nonce == "bbbbbb" && before.iter().map(|b| b.nonce.as_str()).collect::<Vec<_>>() == ["aaaaaa"])
+        );
+        store
+            .settle(1_002, "bbbbbb", Settlement::Unconfirmed)
+            .unwrap();
+        let make_c = |_: u64| "cccccc".to_string();
+        store
+            .claim(
+                1_003,
+                &to,
+                &make_c,
+                &mut counter,
+                &ok,
+                |_, _| Ok("c".into()),
+            )
+            .unwrap();
+        assert!(
+            matches!(&store.comments()[0].state, CommentState::Sending { stamp, before } if stamp.nonce == "cccccc" && before.iter().map(|b| b.nonce.as_str()).collect::<Vec<_>>() == ["bbbbbb", "aaaaaa"]),
+            "the whole chain is kept"
+        );
+        store.settle(1_004, "cccccc", Settlement::Failed).unwrap();
+        assert!(
+            matches!(&store.comments()[0].state, CommentState::Unconfirmed { stamp, before } if stamp.nonce == "bbbbbb" && before.len() == 1),
+            "C's failure restores B, with A behind it"
+        );
+        store.settle(1_005, "bbbbbb", Settlement::Failed).unwrap();
+        assert!(
+            matches!(&store.comments()[0].state, CommentState::Unconfirmed { stamp, before } if stamp.nonce == "aaaaaa" && before.is_empty()),
+            "B's late failure restores A, not Pending: A may have arrived"
+        );
+        store.settle(1_006, "aaaaaa", Settlement::Sent).unwrap();
+        assert!(
+            matches!(&store.comments()[0].state, CommentState::Sent(st) if st.nonce == "aaaaaa")
+        );
+
+        let mut d = comment("d", "y", 2);
+        d.state = CommentState::Unconfirmed {
+            stamp: stamp("eeeeee"),
+            before: vec![stamp("dddddd")],
+        };
+        store.transact(Operation::Add(d), 1_007).unwrap();
+        store.settle(1_008, "dddddd", Settlement::Sent).unwrap();
+        assert!(
+            matches!(&store.comments()[1].state, CommentState::Sent(st) if st.nonce == "dddddd")
+        );
+        // Late answers for an earlier attempt must survive a newer retry.
+        let mut f = comment("f", "z", 3);
+        f.state = CommentState::Unconfirmed {
+            stamp: stamp("ffffff"),
+            before: Vec::new(),
+        };
+        store.transact(Operation::Add(f), 1_009).unwrap();
+        let make_g = |_: u64| "gggggg".to_string();
+        store
+            .claim(
+                1_010,
+                &to,
+                &make_g,
+                &mut counter,
+                &ok,
+                |_, _| Ok("g".into()),
+            )
+            .unwrap();
+        store.settle(1_011, "ffffff", Settlement::Sent).unwrap();
+        assert!(
+            matches!(&store.comments()[2].state, CommentState::Sent(st) if st.nonce == "ffffff"),
+            "F arrived while G was sending"
+        );
+        store.settle(1_012, "gggggg", Settlement::Failed).unwrap();
+        assert!(
+            matches!(&store.comments()[2].state, CommentState::Sent(st) if st.nonce == "ffffff"),
+            "G's failure undoes nothing"
+        );
+        let mut h = comment("h", "w", 4);
+        h.state = CommentState::Unconfirmed {
+            stamp: stamp("hhhhhh"),
+            before: Vec::new(),
+        };
+        store.transact(Operation::Add(h), 1_013).unwrap();
+        let make_i = |_: u64| "iiiiii".to_string();
+        store
+            .claim(
+                1_014,
+                &to,
+                &make_i,
+                &mut counter,
+                &ok,
+                |_, _| Ok("i".into()),
+            )
+            .unwrap();
+        store.settle(1_015, "hhhhhh", Settlement::Failed).unwrap();
+        assert!(
+            matches!(&store.comments()[3].state, CommentState::Sending { stamp, before } if stamp.nonce == "iiiiii" && before.is_empty()),
+            "H's late failure left the chain"
+        );
+        store.settle(1_016, "iiiiii", Settlement::Failed).unwrap();
+        assert!(store.comments()[3].is_pending(), "neither attempt arrived");
+
+        let mut bare = Store::open(None, "/repo", 1_000).0;
+        let mut j = comment("j", "v", 5);
+        j.state = CommentState::Unconfirmed {
+            stamp: stamp("kkkkkk"),
+            before: vec![stamp("jjjjjj")],
+        };
+        // The first add of a session without a state directory says so once, and keeps the record.
+        assert_eq!(
+            bare.transact(Operation::Add(j), 1_017).unwrap_err(),
+            format!("{NOTICE_NOT_REMEMBERED}no state directory")
+        );
+        assert_eq!(bare.comments().len(), 1);
+        bare.transact(Operation::Add(comment("l", "u", 6)), 1_017)
+            .unwrap();
+        let colliding = |c: u64| ["jjjjjj", "kkkkkk", "llllll"][c as usize - 1].to_string();
+        let mut counter = 0;
+        let claimed = bare
+            .claim(1_018, &to, &colliding, &mut counter, &ok, |_, _| {
+                Ok("l".into())
+            })
+            .unwrap();
+        assert_eq!(
+            (claimed.nonce.as_str(), counter),
+            ("llllll", 3),
+            "a historical nonce is as taken as a current one"
+        );
+    }
+
+    #[test]
+    fn a_claim_takes_pending_and_unconfirmed_in_order_and_never_anothers_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        store
+            .transact(Operation::Add(comment("p1", "first", 1)), 1_010)
+            .unwrap();
+        let mut unconfirmed = comment("u1", "second", 2);
+        unconfirmed.state = CommentState::Unconfirmed {
+            before: Vec::new(),
+            stamp: stamp("oldone"),
+        };
+        store.transact(Operation::Add(unconfirmed), 1_010).unwrap();
+        let mut theirs = comment("s1", "third", 3);
+        // Claimed by another viewer a second ago: still theirs, not expired.
+        theirs.state = CommentState::Sending {
+            stamp: Stamp {
+                at: 1_010,
+                ..stamp("theirs")
+            },
+            before: Vec::new(),
+        };
+        store.transact(Operation::Add(theirs), 1_010).unwrap();
+        store
+            .transact(Operation::Add(comment("p2", "fourth", 4)), 1_010)
+            .unwrap();
+
+        store
+            .transact(Operation::Add(comment("p0", "zeroth", 0)), 1_010)
+            .unwrap();
+        // Monotonic ids order comments made within one second.
+        let (first, second) = (new_id(), new_id());
+        store
+            .transact(
+                Operation::Add(Comment {
+                    id: second.clone(),
+                    ..comment("x", "made second", 5)
+                }),
+                1_010,
+            )
+            .unwrap();
+        store
+            .transact(
+                Operation::Add(Comment {
+                    id: first.clone(),
+                    ..comment("x", "made first", 5)
+                }),
+                1_010,
+            )
+            .unwrap();
+        let to = Destination::Pane {
+            pane: "w4:p2".into(),
+            agent: "codex".into(),
+            session: None,
+        };
+        let make = |counter: u64| format!("n{counter:05}");
+        let ok = || Ok(());
+        let mut counter = 0;
+        let claimed = store
+            .claim(1_011, &to, &make, &mut counter, &ok, |items, nonce| {
+                let numbered: Vec<_> = items.iter().map(|(n, c)| format!("{n}:{}", c.id)).collect();
+                Ok(format!("{nonce}|{}", numbered.join(",")))
+            })
+            .unwrap();
+
+        assert_eq!(claimed.nonce, "n00001");
+
+        assert_eq!(
+            claimed.text,
+            format!("n00001|1:p0,2:p1,3:u1,4:p2,5:{first},6:{second}")
+        );
+        assert_eq!(claimed.comments.len(), 6);
+        for c in &claimed.comments {
+            match &c.state {
+                CommentState::Sending { stamp, before } => {
+                    assert_eq!((stamp.nonce.as_str(), &stamp.to), ("n00001", &to));
+                    let expected_item = ["p0", "p1", "u1", "p2", first.as_str(), second.as_str()]
+                        .iter()
+                        .position(|id| *id == c.id)
+                        .unwrap() as u32
+                        + 1;
+                    assert_eq!(stamp.item, expected_item);
+                    assert_eq!(
+                        !before.is_empty(),
+                        c.id == "u1",
+                        "only the unconfirmed one remembers its earlier stamp"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(
+            matches!(&store.comments()[2].state, CommentState::Sending { stamp, .. } if stamp.nonce == "theirs")
+        );
+        // Nothing eligible: another viewer took it all.
+        let mut other = open(dir.path());
+        assert_eq!(
+            other
+                .claim(1_012, &to, &make, &mut counter, &ok, |_, _| Ok(
+                    String::new()
+                ))
+                .unwrap_err(),
+            NOTICE_NOTHING
+        );
+        // Nonce collisions and guard or bound refusals must leave pending text untouched.
+        other
+            .transact(Operation::Add(comment("p3", "fifth", 5)), 1_012)
+            .unwrap();
+        let colliding = |counter: u64| {
+            if counter == 1 {
+                "n00001".to_string()
+            } else {
+                format!("m{counter:05}")
+            }
+        };
+        let mut counter = 0;
+        assert_eq!(
+            other
+                .claim(1_013, &to, &colliding, &mut counter, &ok, |_, _| Err(
+                    "too large".to_string()
+                ))
+                .unwrap_err(),
+            "too large"
+        );
+        assert_eq!(
+            counter, 2,
+            "n00001 was tried and passed over before build refused"
+        );
+        assert!(other.comments().iter().all(|c| !matches!(&c.state, CommentState::Sending { stamp, .. } if stamp.nonce == "m00002")), "a refusal inside build stamps nothing");
+        let changed = || Err("the target changed; press Y again".to_string());
+        assert_eq!(
+            other
+                .claim(1_014, &to, &make, &mut counter, &changed, |_, _| Ok(
+                    String::new()
+                ))
+                .unwrap_err(),
+            "the target changed; press Y again"
+        );
+        assert!(other
+            .comments()
+            .iter()
+            .find(|c| c.id == "p3")
+            .unwrap()
+            .is_pending());
+        // A write that fails leaves the array as the file has it: nothing shows Sending.
+        other.fail_writes_for_tests(true);
+        assert!(other
+            .claim(1_015, &to, &make, &mut counter, &ok, |_, _| Ok(
+                String::new()
+            ))
+            .is_err());
+        assert!(
+            other
+                .comments()
+                .iter()
+                .find(|c| c.id == "p3")
+                .unwrap()
+                .is_pending(),
+            "a failed write never shows a claim the file does not have"
+        );
+        other.fail_writes_for_tests(false);
+        // Another worktree's array survives a claim and a settlement.
+        let mut elsewhere = Store::open(Some(dir.path().to_path_buf()), "/other", 1_000).0;
+        elsewhere
+            .transact(Operation::Add(comment("e1", "theirs", 1)), 1_015)
+            .unwrap();
+        other
+            .transact(Operation::Add(comment("p4", "sixth", 6)), 1_016)
+            .unwrap();
+        let claimed = other
+            .claim(1_017, &to, &make, &mut counter, &ok, |_, nonce| {
+                Ok(nonce.to_string())
+            })
+            .unwrap();
+        other
+            .settle(1_018, &claimed.nonce, Settlement::Sent)
+            .unwrap();
+        elsewhere.refresh(1_019);
+        assert_eq!(
+            elsewhere
+                .comments()
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["e1"],
+            "the other worktree's records were dropped by a write"
+        );
+        // Without a state directory the claim runs on the array alone.
+        let mut bare = Store::open(None, "/repo", 1_000).0;
+        bare.transact(Operation::Add(comment("x", "bare", 1)), 1_000)
+            .unwrap_err();
+        let claimed = bare
+            .claim(
+                1_001,
+                &Destination::clipboard(),
+                &make,
+                &mut 0,
+                &ok,
+                |_, nonce| Ok(nonce.to_string()),
+            )
+            .unwrap();
+        assert_eq!(claimed.comments.len(), 1);
+        bare.settle(1_002, &claimed.nonce, Settlement::Unconfirmed)
+            .unwrap();
+        assert!(matches!(
+            bare.comments()[0].state,
+            CommentState::Unconfirmed { .. }
+        ));
+    }
+
+    #[test]
+    fn settlement_touches_only_this_nonce_and_restores_what_a_retry_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        store
+            .transact(Operation::Add(comment("p1", "a", 1)), 10)
+            .unwrap();
+        let mut unconfirmed = comment("u1", "b", 2);
+        unconfirmed.state = CommentState::Unconfirmed {
+            before: Vec::new(),
+            stamp: stamp("oldone"),
+        };
+        store.transact(Operation::Add(unconfirmed), 10).unwrap();
+        let to = Destination::clipboard();
+        let fixed = |name: &'static str| move |_: u64| name.to_string();
+        let ok = || Ok(());
+        store
+            .claim(1_011, &to, &fixed("aaa111"), &mut 0, &ok, |_, _| {
+                Ok(String::new())
+            })
+            .unwrap();
+        // Another viewer's claim in between is never settled by this one.
+        let mut other = open(dir.path());
+        other
+            .transact(Operation::Add(comment("p9", "c", 9)), 1_012)
+            .unwrap();
+        other
+            .claim(1_012, &to, &fixed("bbb222"), &mut 0, &ok, |_, _| {
+                Ok(String::new())
+            })
+            .unwrap();
+        store.settle(1_013, "aaa111", Settlement::Failed).unwrap();
+        let by_id = |store: &Store, id: &str| {
+            store
+                .comments()
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap()
+                .state
+                .clone()
+        };
+        assert_eq!(by_id(&store, "p1"), CommentState::Pending);
+        assert!(
+            matches!(by_id(&store, "u1"), CommentState::Unconfirmed { stamp: s, .. } if s.nonce == "oldone"),
+            "the earlier stamp came back"
+        );
+        assert!(
+            matches!(by_id(&store, "p9"), CommentState::Sending { stamp, .. } if stamp.nonce == "bbb222")
+        );
+        store
+            .claim(1_014, &to, &fixed("ccc333"), &mut 0, &ok, |_, _| {
+                Ok(String::new())
+            })
+            .unwrap();
+        store
+            .settle(1_015, "ccc333", Settlement::Unconfirmed)
+            .unwrap();
+        assert!(
+            matches!(by_id(&store, "p1"), CommentState::Unconfirmed { stamp: s, .. } if s.nonce == "ccc333")
+        );
+        // A late answer settles records the timeout already marked unconfirmed (spec 10.6).
+        store.settle(1_016, "ccc333", Settlement::Sent).unwrap();
+        assert!(matches!(by_id(&store, "p1"), CommentState::Sent(s) if s.nonce == "ccc333"));
+        store
+            .transact(Operation::Add(comment("p2", "again", 16)), 1_016)
+            .unwrap();
+        store
+            .claim(1_016, &to, &fixed("ddd444"), &mut 0, &ok, |_, _| {
+                Ok(String::new())
+            })
+            .unwrap();
+        store.settle(1_017, "ddd444", Settlement::Sent).unwrap();
+        assert!(
+            matches!(by_id(&store, "p2"), CommentState::Sent(s) if s.nonce == "ddd444" && s.item == 1)
+        );
+        assert!(
+            matches!(by_id(&store, "u1"), CommentState::Sent(s) if s.nonce == "ccc333"),
+            "a sent record is never claimed again"
+        );
+        // A late success must not mark replacement text as sent.
+        let mut unsure = comment("e1", "old text", 17);
+        unsure.state = CommentState::Unconfirmed {
+            stamp: stamp("ggg777"),
+            before: Vec::new(),
+        };
+        store
+            .transact(Operation::Add(unsure.clone()), 1_017)
+            .unwrap();
+        store
+            .transact(
+                Operation::Edit {
+                    id: "e1".into(),
+                    category: Category::Bug,
+                    text: "new text".into(),
+                    seen: unsure,
+                },
+                1_017,
+            )
+            .unwrap();
+        store.settle(1_017, "ggg777", Settlement::Sent).unwrap();
+        assert!(
+            matches!(by_id(&store, "e1"), CommentState::Pending),
+            "the late success must not mark the new text sent"
+        );
+        // A failed settlement write leaves the array as the file has it.
+        store
+            .transact(Operation::Add(comment("p3", "later", 18)), 1_018)
+            .unwrap();
+        store
+            .claim(1_018, &to, &fixed("fff666"), &mut 0, &ok, |_, _| {
+                Ok(String::new())
+            })
+            .unwrap();
+        store.fail_writes_for_tests(true);
+        assert!(store.settle(1_019, "fff666", Settlement::Sent).is_err());
+        assert!(
+            matches!(by_id(&store, "p3"), CommentState::Sending { .. }),
+            "the screen never shows a settlement the file does not have"
+        );
+        store.fail_writes_for_tests(false);
+        // The cap never refuses a rollback: fifty pending plus fifty returning is allowed.
+        let mut full = open(dir.path());
+        for i in 0..50 {
+            let mut c = comment(&format!("x{i}"), "t", 20);
+            c.state = CommentState::Sending {
+                stamp: Stamp {
+                    at: 1_020,
+                    ..stamp("eee555")
+                },
+                before: Vec::new(),
+            };
+            full.comments_mut_for_tests().push(c);
+        }
+        full.write_for_tests();
+        full.settle(1_021, "eee555", Settlement::Failed).unwrap();
+        assert_eq!(
+            full.comments().iter().filter(|c| c.is_pending()).count(),
+            50
+        );
+    }
+
+    #[test]
+    fn a_claim_is_refused_while_the_journal_is_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        store
+            .transact(Operation::Add(comment("p1", "a", 1)), 10)
+            .unwrap();
+        store.fail_writes_for_tests(true);
+        store
+            .transact(Operation::Add(comment("p2", "b", 2)), 11)
+            .unwrap_err();
+        store.fail_writes_for_tests(false);
+        let error = store
+            .claim(
+                1_012,
+                &Destination::clipboard(),
+                &|c| format!("n{c:05}"),
+                &mut 0,
+                &|| Ok(()),
+                |_, _| Ok(String::new()),
+            )
+            .unwrap_err();
+        assert!(error.starts_with("comments not saved: "), "{error}");
+        assert!(store.comments().iter().all(|c| c.is_pending()));
     }
 }

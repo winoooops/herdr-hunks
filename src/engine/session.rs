@@ -8,7 +8,6 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Semaphore;
 
 use super::base::{self, MarkRecord, ResolveInputs};
-use super::comments;
 use super::host::{self, SessionRef};
 use super::target::{self, PaneRow, Target, TargetState};
 use super::{
@@ -16,6 +15,7 @@ use super::{
     Comparison, DiffState, FileKey, LoadedDiff, Mark, MarkState, PreImage, QuickBase, RepoState,
     Scope, Snapshot, NO_BASE_NOTICE,
 };
+use super::{comments, dispatch};
 use crate::git::{self, ChangedFile, GetGitDiffResponse, GitStatusResponse};
 use crate::runtime::EventSink;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -58,6 +58,9 @@ pub struct SessionConfig {
     pub target_write_gate: Option<Arc<Semaphore>>,
     /// Makes a dispatch nonce; injected so tests can force collisions.
     pub nonce: Arc<dyn Fn(u64) -> String + Send + Sync>,
+    pub host_wait: Duration,
+    /// Test hook between the transaction and the final selection check.
+    pub send_gate: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 pub struct EngineHandle {
@@ -124,6 +127,8 @@ impl SessionConfig {
             pick_write_gate: None,
             target_write_gate: None,
             nonce: Arc::new(prompt::nonce),
+            host_wait: host::ENGINE_WAIT,
+            send_gate: None,
         }
     }
 }
@@ -231,6 +236,9 @@ struct Loaded {
 
 enum StoreOp {
     Comment(comments::Operation, Option<u64>),
+    Send(dispatch::SendRequest, dispatch::Context),
+    Refresh,
+    LateAnswer(String, comments::Settlement),
 }
 
 struct State {
@@ -282,6 +290,15 @@ struct State {
     store_opened: bool,
     store_opening: bool,
     store_queue: VecDeque<StoreOp>,
+    send_in_flight: bool,
+    nonce: Arc<dyn Fn(u64) -> String + Send + Sync>,
+    nonce_counter: u64,
+    send_seq: u64,
+    copy_seq: u64,
+    host_wait: Duration,
+    send_gate: Option<Arc<dyn Fn() + Send + Sync>>,
+    late_tx: UnboundedSender<(String, comments::Settlement)>,
+    late_rx: UnboundedReceiver<(String, comments::Settlement)>,
     comment_seq: u64,
     target_write_gate: Option<Arc<Semaphore>>,
     /// Advanced by every pick; older checks and sends are superseded.
@@ -357,6 +374,9 @@ fn markable(
 }
 
 enum Done {
+    SendWaiting(bool),
+    Sent(dispatch::Finished),
+    Copied(Result<(dispatch::CopyOut, u64), String>),
     StoreOpened(comments::Store, Vec<String>),
     StoreRefreshed(comments::Store, Vec<String>),
     Comment {
@@ -609,26 +629,6 @@ async fn load_rows(
     })
 }
 
-/// A blocking host call bounded by `ENGINE_WAIT` (spec 10.6).
-async fn call_host<T: Send + 'static>(
-    host: Option<Arc<dyn host::HostClient>>,
-    call: impl FnOnce(&dyn host::HostClient) -> Result<T, host::HostFailure> + Send + 'static,
-) -> Result<T, host::HostFailure> {
-    let Some(host) = host else {
-        return Err(host::HostFailure::NoHost(
-            "no host: HERDR_SOCKET_PATH is unset".into(),
-        ));
-    };
-    let handle = tokio::task::spawn_blocking(move || call(host.as_ref()));
-    match tokio::time::timeout(host::ENGINE_WAIT, handle).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(e)) => Err(host::HostFailure::After(format!("host call failed: {e}"))),
-        Err(_) => Err(host::HostFailure::After(
-            "the host did not answer in time".into(),
-        )),
-    }
-}
-
 /// Resolve the remembered target, then an agent opener, then nothing (spec 10.2).
 async fn resolve_target(
     job: &Job,
@@ -649,7 +649,7 @@ async fn resolve_target(
         return None;
     }
     let pane = opener.to_string();
-    let record = call_host(job.host.clone(), move |h| h.pane_get(&pane))
+    let record = dispatch::call_host(job.host.clone(), move |h| h.pane_get(&pane))
         .await
         .ok()?;
     // A reply about another pane preselects nothing: the id typed into the environment is the one asked about.
@@ -726,7 +726,7 @@ async fn run_job(job: Job) -> Done {
         (_, Some((_, Some((Target::Pane { .. }, _))))) => None,
         (Some((target @ Target::Pane { pane, .. }, generation)), _) => {
             job.checks.fetch_add(1, Ordering::SeqCst);
-            let fresh = call_host(job.host.clone(), {
+            let fresh = dispatch::call_host(job.host.clone(), {
                 let pane = pane.clone();
                 move |h| h.pane_get(&pane)
             })
@@ -777,32 +777,85 @@ impl State {
             return;
         }
         self.store_queue.push_back(StoreOp::Comment(op, token));
-        self.run_store_queue_comments(results);
+        self.run_store_queue(results);
     }
 
-    fn run_store_queue_comments(&mut self, results: &UnboundedSender<Done>) {
-        let Some(store) = self.store.take() else {
+    fn run_store_queue(&mut self, results: &UnboundedSender<Done>) {
+        let Some(mut store) = self.store.take() else {
             return;
         };
-        let Some(StoreOp::Comment(op, token)) = self.store_queue.pop_front() else {
+        let Some(op) = self.store_queue.pop_front() else {
             self.store = Some(store);
             return;
         };
-        let mut store = store;
         let results = results.clone();
         tokio::spawn(async move {
-            let (store, outcome) = tokio::task::spawn_blocking(move || {
-                let outcome = store.transact(op, now());
-                (store, outcome)
-            })
-            .await
-            .expect("transaction task");
-            let _ = results.send(Done::Comment {
-                token,
-                store: Some(store),
-                outcome,
-            });
+            let done = match op {
+                StoreOp::Send(request, ctx) => {
+                    let waiting = results.clone();
+                    Done::Sent(
+                        dispatch::send(ctx, request, store, move |value| {
+                            let _ = waiting.send(Done::SendWaiting(value));
+                        })
+                        .await,
+                    )
+                }
+                StoreOp::Comment(op, token) => {
+                    let (store, outcome) = tokio::task::spawn_blocking(move || {
+                        let outcome = store.transact(op, now());
+                        (store, outcome)
+                    })
+                    .await
+                    .expect("transaction task");
+                    Done::Comment {
+                        token,
+                        store: Some(store),
+                        outcome,
+                    }
+                }
+                StoreOp::Refresh | StoreOp::LateAnswer(_, _) => {
+                    let (store, problems) = tokio::task::spawn_blocking(move || {
+                        let problems = match op {
+                            StoreOp::LateAnswer(nonce, settlement) => store
+                                .settle(now(), &nonce, settlement)
+                                .err()
+                                .into_iter()
+                                .collect(),
+                            _ => store.refresh(now()),
+                        };
+                        (store, problems)
+                    })
+                    .await
+                    .expect("store refresh task");
+                    Done::StoreRefreshed(store, problems)
+                }
+            };
+            let _ = results.send(done);
         });
+    }
+
+    fn dispatch_context(&self, cwd: &str) -> dispatch::Context {
+        dispatch::Context {
+            toplevel: match &self.snapshot.repo {
+                RepoState::Repo { toplevel, .. } => toplevel.clone(),
+                _ => cwd.to_string(),
+            },
+            state_dir: self.inputs.state_dir.clone(),
+            host: self.host.clone(),
+            host_wait: self.host_wait,
+            late: self.late_tx.clone(),
+            worktree_renames: self.worktree_renames.clone(),
+            socket_path: self.socket_path.clone(),
+            target: self.snapshot.target.clone(),
+            generation: self.selection_generation,
+            latest_generation: self.latest_selection.clone(),
+            nonce: self.nonce.clone(),
+            nonce_counter: self.nonce_counter,
+            snapshot: Arc::new(self.snapshot.clone()),
+            lane: self.diff_lane.clone(),
+            clock: Arc::new(now),
+            send_gate: self.send_gate.clone(),
+        }
     }
 
     fn write_target(&mut self, next: &Snapshot, results: &UnboundedSender<Done>) {
@@ -869,17 +922,15 @@ impl State {
                 .expect("store open task");
                 let _ = results.send(Done::StoreOpened(store, problems));
             });
-        } else if let Some(mut store) = self.store.take() {
-            let results = results.clone();
-            tokio::spawn(async move {
-                let (store, problems) = tokio::task::spawn_blocking(move || {
-                    let problems = store.refresh(now());
-                    (store, problems)
-                })
-                .await
-                .expect("store refresh task");
-                let _ = results.send(Done::StoreRefreshed(store, problems));
-            });
+        } else {
+            if !self
+                .store_queue
+                .iter()
+                .any(|op| matches!(op, StoreOp::Refresh))
+            {
+                self.store_queue.push_back(StoreOp::Refresh);
+            }
+            self.run_store_queue(results);
         }
     }
 
@@ -1101,7 +1152,7 @@ fn fingerprint(s: &Snapshot) -> String {
         DiffState::Ready(d) => format!("ready:{:p}", Arc::as_ptr(d)),
     };
     format!(
-        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:p}|{}|{:?}|{}|{:?}",
+        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:p}|{}|{:?}|{}|{:?}|{}|{:?}|{:?}|{:?}|{}|{}|{:?}",
         s.repo,
         serde_json::to_string(&s.files).unwrap_or_default(),
         s.selected,
@@ -1142,6 +1193,13 @@ fn fingerprint(s: &Snapshot) -> String {
         s.comment_error,
         s.comment_refused,
         s.comment_token,
+        s.send_seq,
+        s.send_error,
+        s.send_refusal,
+        s.send_outcome,
+        s.send_waiting,
+        s.copy_seq,
+        s.copy.as_ref().map(Arc::as_ptr),
     )
 }
 
@@ -1242,6 +1300,7 @@ async fn run(
     target_writes_waiting: Arc<AtomicUsize>,
     target_writes_done: Arc<AtomicUsize>,
 ) {
+    let (late_tx, late_rx) = unbounded_channel();
     let mut state = State {
         snapshot: Snapshot::empty(&config.path.to_string_lossy()),
         branch: None,
@@ -1284,6 +1343,15 @@ async fn run(
         store_opened: false,
         store_opening: false,
         store_queue: VecDeque::new(),
+        send_in_flight: false,
+        nonce: config.nonce.clone(),
+        nonce_counter: 0,
+        send_seq: 0,
+        copy_seq: 0,
+        host_wait: config.host_wait,
+        send_gate: config.send_gate.clone(),
+        late_tx,
+        late_rx,
         comment_seq: 0,
         target_write_gate: config.target_write_gate.clone(),
         selection_generation: 0,
@@ -1347,10 +1415,53 @@ async fn run(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            Some((nonce, settlement)) = state.late_rx.recv() => {
+                state.store_queue.push_back(StoreOp::LateAnswer(nonce, settlement));
+                state.run_store_queue(&results_tx);
+            }
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 match command {
                     Command::Shutdown => break,
+                    Command::Send(request) => {
+                        let refusal = if state.send_in_flight {
+                            Some(dispatch::NOTICE_IN_PROGRESS.to_string())
+                        } else if !state.store_opened {
+                            Some("not a git repository".to_string())
+                        } else if matches!(request.kind, dispatch::SendKind::Feedback)
+                            && !state.snapshot.comments.iter().any(|c| matches!(c.state, comments::CommentState::Pending | comments::CommentState::Unconfirmed { .. }))
+                        {
+                            Some(dispatch::NOTICE_NO_PENDING.to_string())
+                        } else {
+                            None
+                        };
+                        if let Some(refusal) = refusal {
+                            state.send_seq += 1;
+                            let mut next = state.snapshot.clone();
+                            next.send_seq = state.send_seq;
+                            next.send_error = Some(refusal);
+                            next.send_refusal = Some(dispatch::Refusal::Other);
+                            next.send_outcome = None;
+                            publish(&mut state, next, &snapshots);
+                        } else {
+                            // Queue behind transactions with the confirmed target and generation.
+                            state.send_in_flight = true;
+                            let ctx = state.dispatch_context(&cwd);
+                            state.store_queue.push_back(StoreOp::Send(request, ctx));
+                            state.run_store_queue(&results_tx);
+                        }
+                    }
+                    Command::Copy(request) => {
+                        // Copies read published comments without borrowing the store.
+                        let ctx = state.dispatch_context(&cwd);
+                        let comments = state.snapshot.comments.to_vec();
+                        let results = results_tx.clone();
+                        tokio::spawn(async move {
+                            let outcome = dispatch::copy(ctx, request, comments).await;
+                            let _ = results.send(Done::Copied(outcome));
+                        });
+                    }
+
                     Command::Refresh => {
                         state.resolve_pending = true;
                         let mut next = state.snapshot.clone();
@@ -1496,7 +1607,7 @@ async fn run(
                         tokio::spawn(async move {
                             let result = match host {
                                 None => Ok(Vec::new()),
-                                Some(_) => call_host(host, |h| h.pane_list()).await,
+                                Some(_) => dispatch::call_host(host, |h| h.pane_list()).await,
                             };
                             let rows = result.map(|panes| target::rows(panes, &toplevel, own.as_deref()));
                             let _ = results.send(Done::Panes { token, rows });
@@ -1627,6 +1738,67 @@ async fn run(
                         }
                         publish(&mut state, next, &snapshots);
                     }
+                    Done::SendWaiting(waiting) => {
+                        next.send_waiting = waiting;
+                        publish(&mut state, next, &snapshots);
+                    }
+                    Done::Sent(finished) => {
+                        state.send_in_flight = false;
+                        state.nonce_counter = state.nonce_counter.max(finished.counter);
+                        if let Some(store) = finished.store {
+                            next.comments = Arc::new(store.comments().to_vec());
+                            state.store = Some(store);
+                        }
+                        state.send_seq += 1;
+                        next.send_seq = state.send_seq;
+                        next.send_waiting = false;
+                        match finished.outcome {
+                            Ok(outcome) => {
+                                if let Some(copy) = &outcome.copy {
+                                    state.copy_seq += 1;
+                                    next.copy_seq = state.copy_seq;
+                                    next.copy = Some(Arc::new(copy.clone()));
+                                }
+                                next.send_error = None;
+                                next.send_refusal = None;
+                                next.send_outcome = Some(outcome);
+                            }
+                            Err((message, refusal)) => {
+                                if let Some(copy) = finished.copy {
+                                    // Publish a successful copy even when its settlement failed.
+                                    state.copy_seq += 1;
+                                    next.copy_seq = state.copy_seq;
+                                    next.copy = Some(Arc::new(copy));
+                                }
+                                next.send_error = Some(message);
+                                next.send_refusal = Some(refusal);
+                                next.send_outcome = None;
+                            }
+                        }
+                        if let (Some(session), true) = (finished.adopt_session, finished.generation == state.selection_generation) {
+                            // Adopt the verified session only while the selection still matches.
+                            if let Some(Target::Pane { session: known, .. }) = next.target.as_mut() {
+                                *known = session;
+                            }
+                            state.target_write_pending = true;
+                            state.write_target(&next, &results_tx);
+                        }
+                        publish(&mut state, next, &snapshots);
+                        state.run_store_queue(&results_tx);
+                    }
+                    Done::Copied(outcome) => {
+                        state.copy_seq += 1;
+                        next.copy_seq = state.copy_seq;
+                        next.copy = Some(Arc::new(match outcome {
+                            Ok((out, counter)) => {
+                                state.nonce_counter = state.nonce_counter.max(counter);
+                                out
+                            }
+                            Err(notice) => dispatch::CopyOut { osc: None, notice, urgent: true },
+                        }));
+                        publish(&mut state, next, &snapshots);
+                    }
+
                     Done::StoreOpened(store, problems) | Done::StoreRefreshed(store, problems) => {
                         state.store_opened = true;
                         state.store_opening = false;
@@ -1647,7 +1819,7 @@ async fn run(
                             }
                         }
                         publish(&mut state, next, &snapshots);
-                        state.run_store_queue_comments(&results_tx);
+                        state.run_store_queue(&results_tx);
                     }
                     Done::Comment { token, store, outcome } => {
                         if let Some(store) = store {
@@ -1672,7 +1844,7 @@ async fn run(
                             state.write_target(&next, &results_tx);
                         }
                         publish(&mut state, next, &snapshots);
-                        state.run_store_queue_comments(&results_tx);
+                        state.run_store_queue(&results_tx);
                     }
                     Done::Target { generation, token, written } => {
                         // A newer pick owns its answer; an older answer reaches no picker.
@@ -6285,5 +6457,1374 @@ mod tests {
             git_out(p, &["status", "--porcelain=v1", "--", "new.txt"]).trim_end(),
             " A new.txt"
         );
+    }
+    fn sending_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        String,
+        Arc<host::Scripted>,
+    ) {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let host = host::Scripted::with_panes(vec![agent_pane(
+            "w4:p2",
+            "codex",
+            "idle",
+            Some("s1"),
+            &top,
+        )]);
+        (dir, state, top, host)
+    }
+
+    fn sending_config(
+        dir: &std::path::Path,
+        state: &std::path::Path,
+        host: Arc<host::Scripted>,
+    ) -> SessionConfig {
+        let mut config = test_config(dir, Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.to_path_buf());
+        config.host = Some(host);
+        config.socket_path = Some("/run/fake.sock".into());
+        config.nonce = Arc::new(|counter| format!("n{counter:05}"));
+        config
+    }
+
+    fn feedback(accepted: dispatch::Accepted) -> Command {
+        Command::Send(dispatch::SendRequest {
+            kind: dispatch::SendKind::Feedback,
+            accepted,
+        })
+    }
+
+    /// A session with a target and two pending comments, ready to send.
+    fn ready_to_send(handle: &EngineHandle) {
+        wait_for(handle, "rows", |s| !s.files.is_empty());
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 0,
+                target: pane_target("w4:p2", "codex", Some("s1")),
+            })
+            .unwrap();
+        wait_for(handle, "live", |s| {
+            s.target_state == TargetState::Live("idle".into())
+        });
+        handle.commands.send(pending(2, "first")).unwrap();
+        handle.commands.send(pending(1, "second")).unwrap();
+        wait_for(handle, "two pending", |s| {
+            s.comments.len() == 2 && s.comment_seq == 2
+        });
+    }
+
+    #[test]
+    fn a_send_claims_before_the_call_sends_once_without_wait_and_stamps_sent_with_the_destination()
+    {
+        let (dir, state, top, host) = sending_fixture();
+        let claimed_at_call = Arc::new(std::sync::Mutex::new(None));
+        {
+            let seen = claimed_at_call.clone();
+            let path = state.path().join("comments.json");
+            *host.on_prompt.lock().unwrap() = Some(Box::new(move || {
+                *seen.lock().unwrap() = Some(std::fs::read_to_string(&path).unwrap());
+            }));
+        }
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
+        ready_to_send(&handle);
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&handle, "sent", |s| s.send_seq == 1);
+        assert_eq!(s.send_error, None);
+        let outcome = s.send_outcome.clone().unwrap();
+        assert_eq!((outcome.items, outcome.unconfirmed), (2, false));
+        assert_eq!(
+            outcome.to,
+            target::Destination::Pane {
+                pane: "w4:p2".into(),
+                agent: "codex".into(),
+                session: Some(host::SessionRef {
+                    kind: "id".into(),
+                    value: "s1".into()
+                })
+            }
+        );
+        let prompts = host.prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].0, "w4:p2");
+        assert!(prompts[0].1.starts_with("> Inline review — 2 items."));
+        assert!(prompts[0].1.contains(&format!(
+            "] {top}/a.txt:2 (additions) [unstaged]\n> ─ first\n"
+        )));
+        assert!(prompts[0].1.contains("\"nonce\":\"n00001\""));
+        // The file already carried the claim when the host was called.
+        let at_call = claimed_at_call.lock().unwrap().clone().unwrap();
+        assert!(
+            at_call.contains("\"sending\"") && at_call.contains("n00001"),
+            "{at_call}"
+        );
+        for c in s.comments.iter() {
+            assert!(
+                matches!(&c.state, comments::CommentState::Sent(st) if st.nonce == "n00001" && matches!(&st.to, target::Destination::Pane { pane, .. } if pane == "w4:p2"))
+            );
+        }
+        // Nothing pending: a second Y is refused without a call.
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&handle, "nothing pending", |s| s.send_seq == 2);
+        assert_eq!(s.send_error.as_deref(), Some(dispatch::NOTICE_NO_PENDING));
+        assert_eq!(host.prompts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn every_gate_refuses_or_passes_as_the_table_says() {
+        let (dir, state, top, host) = sending_fixture();
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
+        ready_to_send(&handle);
+        let mut seq = 0;
+        let mut send = |accepted: dispatch::Accepted| -> Arc<Snapshot> {
+            handle.commands.send(feedback(accepted)).unwrap();
+            seq += 1;
+            wait_for(&handle, "answer", |s| s.send_seq == seq)
+        };
+        host.set_pane(agent_pane("w4:p2", "codex", "blocked", Some("s1"), &top));
+        assert!(send(dispatch::Accepted {
+            busy: true,
+            restarted: None
+        })
+        .send_error
+        .as_deref()
+        .unwrap()
+        .starts_with("codex is waiting for an approval in w4:p2"));
+        host.set_pane(agent_pane("w4:p2", "codex", "working", Some("s1"), &top));
+        let s = send(dispatch::Accepted::default());
+        assert!(s
+            .send_error
+            .as_deref()
+            .unwrap()
+            .starts_with("codex is working in w4:p2"));
+        assert_eq!(s.send_refusal, Some(dispatch::Refusal::Busy));
+        host.set_pane(agent_pane("w4:p2", "codex", "unknown", Some("s1"), &top));
+        assert!(send(dispatch::Accepted::default())
+            .send_error
+            .as_deref()
+            .unwrap()
+            .contains("unknown to the host"));
+
+        host.set_pane(agent_pane("w4:p2", "codex", "sleeping", Some("s1"), &top));
+        let s = send(dispatch::Accepted::default());
+        assert_eq!(
+            s.send_error.as_deref(),
+            Some("codex reports sleeping in w4:p2, a state this viewer does not know.")
+        );
+        assert_eq!(s.send_refusal, Some(dispatch::Refusal::Busy));
+        assert_eq!(host.prompts.lock().unwrap().len(), 0);
+        assert!(send(dispatch::Accepted {
+            busy: true,
+            restarted: None
+        })
+        .send_error
+        .is_none());
+        assert_eq!(host.prompts.lock().unwrap().len(), 1, "accepted, it sends");
+        host.set_pane(agent_pane("w4:p2", "codex", "idle", Some("s1"), &top));
+        handle.commands.send(pending(1, "again")).unwrap();
+        wait_for(&handle, "pending again", |s| {
+            s.comments.iter().any(|c| c.is_pending())
+        });
+        // A restart behind an accepted `working` is refused and shown.
+        host.set_pane(agent_pane("w4:p2", "codex", "working", Some("s2"), &top));
+        let s = send(dispatch::Accepted {
+            busy: true,
+            restarted: None,
+        });
+        assert!(s
+            .send_error
+            .as_deref()
+            .unwrap()
+            .contains("was restarted since you picked it"));
+        assert!(
+            matches!(&s.send_refusal, Some(dispatch::Refusal::Restarted(Some(sess))) if sess.value == "s2")
+        );
+        host.set_pane(agent_pane("w4:p2", "codex", "idle", Some("s2"), &top));
+        assert!(
+            send(dispatch::Accepted {
+                busy: false,
+                restarted: Some(Some(host::SessionRef {
+                    kind: "id".into(),
+                    value: "s9".into()
+                }))
+            })
+            .send_error
+            .is_some(),
+            "the wrong session is not the one the box showed"
+        );
+        host.set_pane(host::PaneRecord {
+            pane_id: "w4:p2".into(),
+            agent_status: Some("unknown".into()),
+            ..host::PaneRecord::default()
+        });
+        let s = send(dispatch::Accepted::default());
+        assert_eq!(
+            s.send_error.as_deref(),
+            Some("codex · w4:p2 is gone · pick a pane")
+        );
+        assert_eq!(s.send_refusal, Some(dispatch::Refusal::Other));
+        *host.list_failure.lock().unwrap() = Some(host::HostFailure::After("deadline".into()));
+        assert_eq!(
+            send(dispatch::Accepted::default()).send_error.as_deref(),
+            Some("could not verify w4:p2: deadline")
+        );
+        *host.list_failure.lock().unwrap() = None;
+
+        *host.answer_pane_get_with.lock().unwrap() =
+            Some(agent_pane("w4:p9", "codex", "idle", Some("s1"), &top));
+        assert_eq!(
+            send(dispatch::Accepted::default()).send_error.as_deref(),
+            Some("could not verify w4:p2: the host answered about w4:p9")
+        );
+        *host.answer_pane_get_with.lock().unwrap() = None;
+        assert_eq!(
+            host.prompts.lock().unwrap().len(),
+            1,
+            "nothing was sent by a refusal: only the accepted send above"
+        );
+        // The accepted restart sends, and the target record adopts the new session.
+        host.set_pane(agent_pane("w4:p2", "codex", "idle", Some("s2"), &top));
+        let s = send(dispatch::Accepted {
+            busy: false,
+            restarted: Some(Some(host::SessionRef {
+                kind: "id".into(),
+                value: "s2".into(),
+            })),
+        });
+        assert!(s.send_error.is_none(), "{:?}", s.send_error);
+        assert!(
+            matches!(&s.target, Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s2")
+        );
+        wait_cond(
+            "s2 remembered",
+            || matches!(target::load_targets(state.path()).0.get(&top), Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s2"),
+        );
+        wait_for(&handle, "live again", |s| {
+            s.target_state == TargetState::Live("idle".into())
+        });
+
+        host.set_pane(host::PaneRecord {
+            pane_id: "w4:p2".into(),
+            agent: Some("codex".into()),
+            agent_status: Some("idle".into()),
+            ..host::PaneRecord::default()
+        });
+        wait_for(&handle, "restarted again", |s| {
+            s.target_state == TargetState::Restarted("idle".into())
+        });
+        handle.commands.send(pending(1, "more")).unwrap();
+        wait_for(&handle, "pending again", |s| {
+            s.comments.iter().any(|c| c.is_pending())
+        });
+        assert!(matches!(
+            send(dispatch::Accepted::default()).send_refusal,
+            Some(dispatch::Refusal::Restarted(None))
+        ));
+        let s = send(dispatch::Accepted {
+            busy: false,
+            restarted: Some(None),
+        });
+        assert!(s.send_error.is_none(), "{:?}", s.send_error);
+        assert!(
+            matches!(&s.target, Some(Target::Pane { session: None, .. })),
+            "the record adopted the absence"
+        );
+        wait_cond("absence remembered", || {
+            matches!(
+                target::load_targets(state.path()).0.get(&top),
+                Some(Target::Pane { session: None, .. })
+            )
+        });
+        wait_for(&handle, "live without a session", |s| {
+            s.target_state == TargetState::Live("idle".into())
+        });
+    }
+
+    #[test]
+    fn a_send_time_check_adopts_the_session_a_sessionless_target_first_sees() {
+        let (dir, state, top, host) = sending_fixture();
+        let mut config = sending_config(dir.path(), state.path(), host.clone());
+        // The pick's refresh sees no session; only the send can learn s1.
+        host.set_pane(agent_pane("w4:p2", "codex", "idle", None, &top));
+        config.poll_interval = Duration::from_secs(3600);
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "rows", |s| !s.files.is_empty() && !s.refreshing);
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 1,
+                target: pane_target("w4:p2", "codex", None),
+            })
+            .unwrap();
+        wait_for(&handle, "picked and checked without a session", |s| {
+            s.target_token == Some(1)
+                && s.target_state == TargetState::Live("idle".into())
+                && !s.refreshing
+                && matches!(&s.target, Some(Target::Pane { session: None, .. }))
+        });
+        handle.commands.send(pending(2, "first")).unwrap();
+        wait_for(&handle, "pending", |s| s.comments.len() == 1);
+        host.set_pane(agent_pane("w4:p2", "codex", "idle", Some("s1"), &top));
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&handle, "sent", |s| s.send_seq == 1);
+        assert!(s.send_error.is_none(), "{:?}", s.send_error);
+        assert!(
+            matches!(&s.target, Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s1"),
+            "the send's check taught the record its session"
+        );
+        wait_cond(
+            "and the record was written with it",
+            || matches!(target::load_targets(state.path()).0.get(&top), Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s1"),
+        );
+        // The agent restarts: the next check reports a restart against s1 rather than adopting s2.
+        host.set_pane(agent_pane("w4:p2", "codex", "idle", Some("s2"), &top));
+        handle.commands.send(Command::Refresh).unwrap();
+        wait_for(&handle, "restarted", |s| {
+            s.target_state == TargetState::Restarted("idle".into())
+        });
+    }
+
+    #[test]
+    fn host_answers_settle_the_claim_each_their_way() {
+        let (dir, state, _top, host) = sending_fixture();
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
+        ready_to_send(&handle);
+        let state_of = |s: &Snapshot, i: usize| s.comments[i].state.clone();
+        // A definite refusal returns the records to Pending with the host's words.
+        host.prompt_results
+            .lock()
+            .unwrap()
+            .push(Err(host::HostFailure::Api {
+                code: "agent_not_ready".into(),
+                message: "agent is blocked".into(),
+            }));
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&handle, "refused", |s| s.send_seq == 1);
+        assert_eq!(s.send_error.as_deref(), Some("agent is blocked"));
+        assert!(s.comments.iter().all(|c| c.is_pending()));
+        // An uncertain outcome stamps Unconfirmed.
+        host.prompt_results
+            .lock()
+            .unwrap()
+            .push(Err(host::HostFailure::After("no reply".into())));
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&handle, "unconfirmed", |s| s.send_seq == 2);
+        assert!(s.send_error.is_none());
+        assert!(s.send_outcome.as_ref().unwrap().unconfirmed);
+        assert!(
+            matches!(state_of(&s, 0), comments::CommentState::Unconfirmed { stamp: st, .. } if st.nonce == "n00002")
+        );
+        // A retry that definitely fails restores the earlier Unconfirmed stamp, not Pending.
+        host.prompt_results
+            .lock()
+            .unwrap()
+            .push(Err(host::HostFailure::Before("connection refused".into())));
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&handle, "retry failed", |s| s.send_seq == 3);
+        assert!(s.send_error.is_some());
+        assert!(
+            matches!(state_of(&s, 0), comments::CommentState::Unconfirmed { stamp: st, .. } if st.nonce == "n00002"),
+            "{:?}",
+            state_of(&s, 0)
+        );
+        // A success after that is Sent under the newest nonce, both items.
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&handle, "sent", |s| s.send_seq == 4);
+        assert!(s
+            .comments
+            .iter()
+            .all(|c| matches!(&c.state, comments::CommentState::Sent(st) if st.nonce == "n00004")));
+        assert_eq!(host.prompts.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_success_reply_is_sent_whatever_happened_after_the_check() {
+        let (dir, state, top, host) = sending_fixture();
+        // The pane goes blocked the moment the prompt arrives: the host accepted it all the same.
+        {
+            let host2 = host.clone();
+            let top2 = top.clone();
+            *host.on_prompt.lock().unwrap() = Some(Box::new(move || {
+                host2.set_pane(agent_pane("w4:p2", "codex", "blocked", Some("s1"), &top2));
+            }));
+        }
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
+        ready_to_send(&handle);
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        // Wait for both conditions in the same snapshot.
+        let s = wait_for(&handle, "sent, and the chip follows the pane", |s| {
+            s.send_seq == 1 && s.target_state == TargetState::Live("blocked".into())
+        });
+        assert!(s.send_error.is_none());
+        assert!(s
+            .comments
+            .iter()
+            .all(|c| matches!(c.state, comments::CommentState::Sent(_))));
+
+        let calls = host.calls.lock().unwrap().clone();
+        let prompt_at = calls.iter().position(|c| c == "agent.prompt").unwrap();
+        assert!(
+            calls[..prompt_at].iter().any(|c| c == "pane.get"),
+            "{calls:?}"
+        );
+    }
+
+    /// A `send_gate` that holds the send on the blocking pool until `released`, counting arrivals in `waiting`.
+    fn gate_until(
+        released: &Arc<AtomicBool>,
+        waiting: &Arc<AtomicUsize>,
+    ) -> Arc<dyn Fn() + Send + Sync> {
+        let (released, waiting) = (released.clone(), waiting.clone());
+        Arc::new(move || {
+            waiting.fetch_add(1, Ordering::SeqCst);
+            while !released.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    }
+
+    #[test]
+    fn a_repick_during_the_claim_is_met_before_the_call() {
+        let (dir, state, top, host) = sending_fixture();
+        let mut config = sending_config(dir.path(), state.path(), host.clone());
+        let (released, waiting) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        config.send_gate = Some(gate_until(&released, &waiting));
+        let (_rt, handle) = start_from(config);
+        ready_to_send(&handle);
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        wait_cond("the claim is written", || {
+            waiting.load(Ordering::SeqCst) == 1
+        });
+        assert!(
+            comments::Store::open(Some(state.path().to_path_buf()), &top, now())
+                .0
+                .comments()
+                .iter()
+                .all(|c| matches!(c.state, comments::CommentState::Sending { .. }))
+        );
+        // The reviewer picks another target while the send sits between its claim and its call.
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 0,
+                target: Target::Clipboard,
+            })
+            .unwrap();
+        wait_for(&handle, "re-picked", |s| {
+            s.target_seq == 2 && s.target == Some(Target::Clipboard)
+        });
+        released.store(true, Ordering::SeqCst);
+        let s = wait_for(&handle, "refused", |s| s.send_seq == 1);
+        assert_eq!(
+            s.send_error.as_deref(),
+            Some("the target changed; press Y again")
+        );
+        assert!(
+            s.comments.iter().all(|c| c.is_pending()),
+            "the claim was undone: {:?}",
+            s.comments.iter().map(|c| &c.state).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            host.prompts.lock().unwrap().len(),
+            0,
+            "nothing went to the pane the reviewer left"
+        );
+    }
+
+    #[test]
+    fn a_repick_during_a_clipboard_request_records_and_copies_nothing() {
+        let (dir, state, top, host) = sending_fixture();
+        let mut config = sending_config(dir.path(), state.path(), host.clone());
+        let (released, waiting) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        config.send_gate = Some(gate_until(&released, &waiting));
+        let (_rt, handle) = start_from(config);
+        ready_to_send(&handle);
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 0,
+                target: Target::Clipboard,
+            })
+            .unwrap();
+        wait_for(&handle, "clipboard, diff ready", |s| {
+            s.target_state == TargetState::Clipboard && matches!(s.diff, DiffState::Ready(_))
+        });
+        handle
+            .commands
+            .send(Command::Send(dispatch::SendRequest {
+                kind: dispatch::SendKind::Review {
+                    scope: dispatch::ReviewScope::All,
+                },
+                accepted: Default::default(),
+            }))
+            .unwrap();
+        wait_cond("the request is recorded", || {
+            waiting.load(Ordering::SeqCst) == 1
+        });
+        assert_eq!(comments::load_requests(state.path(), &top).0.len(), 1);
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 0,
+                target: pane_target("w4:p2", "codex", Some("s1")),
+            })
+            .unwrap();
+        wait_for(&handle, "re-picked", |s| s.target_seq == 3);
+        released.store(true, Ordering::SeqCst);
+        let s = wait_for(&handle, "refused", |s| s.send_seq == 1);
+        assert_eq!(
+            s.send_error.as_deref(),
+            Some("the target changed; press @ again")
+        );
+        assert_eq!(s.copy_seq, 0, "nothing was copied");
+        assert_eq!(
+            comments::load_requests(state.path(), &top).0.len(),
+            0,
+            "the record was removed"
+        );
+        assert!(!state.path().join("clipboard.md").exists());
+    }
+
+    #[test]
+    fn a_copy_that_went_out_survives_a_failed_settlement() {
+        let (dir, state, _top, host) = sending_fixture();
+        let mut config = sending_config(dir.path(), state.path(), host.clone());
+        let (released, waiting) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        config.send_gate = Some(gate_until(&released, &waiting));
+        let (_rt, handle) = start_from(config);
+        ready_to_send(&handle);
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 0,
+                target: Target::Clipboard,
+            })
+            .unwrap();
+        wait_for(&handle, "clipboard", |s| {
+            s.target_state == TargetState::Clipboard
+        });
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        wait_cond("claimed", || waiting.load(Ordering::SeqCst) == 1);
+        // Fail both writes after claiming; the OSC sequence must survive.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        released.store(true, Ordering::SeqCst);
+        let s = wait_for(&handle, "answered", |s| s.send_seq == 1);
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(s.copy_seq, 1, "the copy rode on the answer");
+        assert!(
+            s.copy.as_ref().unwrap().osc.is_some(),
+            "the sequence survived the failed stamps"
+        );
+        match &s.send_error {
+            Some(error) => assert!(
+                error.starts_with("copied 2 comments") && error.contains("not marked sent"),
+                "{error}"
+            ),
+            None => assert!(s.send_outcome.as_ref().unwrap().copy.is_some()),
+        }
+    }
+
+    #[test]
+    fn c_still_copies_while_the_store_cannot_be_read() {
+        let (dir, state, _top, host) = sending_fixture();
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
+        ready_to_send(&handle);
+        // An unreadable store must still allow copying the in-memory comments.
+        use std::os::unix::fs::PermissionsExt;
+        let file = state.path().join("comments.json");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        handle
+            .commands
+            .send(Command::Copy(dispatch::CopyRequest {
+                what: dispatch::CopyWhat::Review,
+            }))
+            .unwrap();
+        let s = wait_for(&handle, "copied", |s| s.copy_seq == 1);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let copy = s.copy.as_ref().unwrap();
+        assert!(
+            copy.notice.starts_with("copied 2 comments"),
+            "{}",
+            copy.notice
+        );
+        assert!(copy.osc.is_some());
+    }
+
+    #[test]
+    fn a_second_send_in_flight_is_refused_and_a_claim_that_finds_nothing_sends_nothing() {
+        let (dir, state, top, host) = sending_fixture();
+        *host.prompt_delay.lock().unwrap() = Some(Duration::from_millis(600));
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
+        ready_to_send(&handle);
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&handle, "second refused", |s| s.send_seq == 1);
+        assert_eq!(s.send_error.as_deref(), Some(dispatch::NOTICE_IN_PROGRESS));
+        wait_for(&handle, "first sent", |s| {
+            s.send_seq == 2 && s.send_error.is_none()
+        });
+        // Keep the second snapshot stale so the claim must detect the competing send.
+        handle.commands.send(pending(2, "third")).unwrap();
+        wait_for(&handle, "third pending", |s| s.comments.len() == 3);
+        let state2 = state.path().to_path_buf();
+        let mut config = sending_config(dir.path(), &state2, host.clone());
+        config.nonce = Arc::new(|counter| format!("m{counter:05}"));
+        config.poll_interval = Duration::from_secs(3600);
+        let (_rt2, other) = start_from(config);
+        wait_for(&other, "shares the comments", |s| {
+            s.comments.len() == 3 && s.target.is_some()
+        });
+        *host.prompt_delay.lock().unwrap() = Some(Duration::from_millis(900));
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        wait_cond("the first claim is in the file", || {
+            comments::Store::open(Some(state.path().to_path_buf()), &top, now())
+                .0
+                .comments()
+                .iter()
+                .all(|c| !c.is_pending())
+        });
+        other
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&other, "nothing left", |s| s.send_seq == 1);
+        assert_eq!(s.send_error.as_deref(), Some(dispatch::NOTICE_NOTHING));
+        wait_for(&handle, "third sent", |s| {
+            s.send_seq == 3 && s.send_error.is_none()
+        });
+        assert_eq!(
+            host.prompts.lock().unwrap().len(),
+            2,
+            "one prompt per claim that held something"
+        );
+    }
+
+    #[test]
+    fn two_viewers_sending_to_one_pane_take_the_send_lock_in_turn() {
+        let (dir, state, _top, host) = sending_fixture();
+        *host.prompt_delay.lock().unwrap() = Some(Duration::from_millis(700));
+        let (_rt, a) = start_from(sending_config(dir.path(), state.path(), host.clone()));
+        ready_to_send(&a);
+        // A second worktree of the same user shares the state directory and the pane.
+        let dir2 = fixture();
+        let mut config = sending_config(dir2.path(), state.path(), host.clone());
+        config.nonce = Arc::new(|counter| format!("m{counter:05}"));
+        let (_rt2, b) = start_from(config);
+        wait_for(&b, "rows", |s| !s.files.is_empty());
+        b.commands
+            .send(Command::SetTarget {
+                token: 0,
+                target: pane_target("w4:p2", "codex", Some("s1")),
+            })
+            .unwrap();
+        wait_for(&b, "live", |s| {
+            s.target_state == TargetState::Live("idle".into())
+        });
+        b.commands.send(pending(2, "from b")).unwrap();
+        wait_for(&b, "pending", |s| s.comments.len() == 1);
+        a.commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        wait_cond("a reached the host while holding the send lock", || {
+            host.prompt_started.lock().unwrap().len() == 1
+        });
+        b.commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let waited = wait_for(&b, "b waits", |s| s.send_waiting);
+        assert!(waited.send_waiting);
+        wait_for(&a, "a sent", |s| s.send_seq == 1 && s.send_error.is_none());
+        let s = wait_for(&b, "b sent", |s| s.send_seq == 1);
+        assert!(s.send_error.is_none(), "{:?}", s.send_error);
+        assert!(!s.send_waiting);
+        let prompts = host.prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            prompts[0].1.contains("first") && prompts[1].1.contains("from b"),
+            "a's paste came first"
+        );
+        // Only the Enter margin makes the gap exceed the host's own delay.
+        let starts = host.prompt_started.lock().unwrap().clone();
+        assert_eq!(starts.len(), 2);
+        assert!(
+            starts[1].duration_since(starts[0]) >= Duration::from_millis(700 + 500),
+            "{:?}",
+            starts[1].duration_since(starts[0])
+        );
+    }
+
+    /// `dispatch::request_files` on a snapshot the test shapes: the three request paths the
+    /// session test does not reach.
+    #[tokio::test]
+    async fn request_files_reads_failed_selected_rows_keeps_unreadable_rows_and_pins_the_branch_base(
+    ) {
+        let dir = fixture();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let (late_tx, _late_rx) = unbounded_channel();
+        let ctx = |snapshot: Snapshot| dispatch::Context {
+            toplevel: top.clone(),
+            state_dir: None,
+            host: None,
+            host_wait: Duration::from_secs(1),
+            late: late_tx.clone(),
+            socket_path: None,
+            target: None,
+            worktree_renames: BTreeMap::new(),
+            generation: 0,
+            latest_generation: Arc::new(AtomicU64::new(0)),
+            nonce: Arc::new(|c| format!("n{c:05}")),
+            nonce_counter: 0,
+            snapshot: Arc::new(snapshot),
+            lane: Arc::new(Semaphore::new(1)),
+            clock: Arc::new(now),
+            send_gate: None,
+        };
+        let row = |path: &str| ChangedFile {
+            path: path.into(),
+            status: ChangedFileStatus::Modified,
+            staged: false,
+            insertions: None,
+            deletions: None,
+        };
+        // A selected row whose diff is `Failed` on screen is loaded by the task like the others.
+        let mut snapshot = Snapshot::empty(&top);
+        snapshot.repo = RepoState::Repo {
+            toplevel: top.clone(),
+            branch: Some("main".into()),
+            worktree: None,
+        };
+        snapshot.files = vec![row("a.txt"), row("b.txt")];
+        snapshot.selected = Some(FileKey::of(&snapshot.files[0]));
+        snapshot.diff = DiffState::Failed("boom".into());
+        let (lines, files) =
+            dispatch::request_files(&ctx(snapshot.clone()), &dispatch::ReviewScope::All)
+                .await
+                .unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            files[0].additions,
+            vec![(1, 2)],
+            "the failed selected row was read from disk"
+        );
+        // A row the loader cannot read is recorded with no ranges and still listed.
+        snapshot.files.push(row("vanished.txt"));
+        let (lines, files) =
+            dispatch::request_files(&ctx(snapshot.clone()), &dispatch::ReviewScope::All)
+                .await
+                .unwrap();
+        assert_eq!(lines[2].path, "vanished.txt");
+        assert!(files[2].additions.is_empty() && files[2].deletions.is_empty());
+        // Branch scope: the ranges and the record are against the merge-base the snapshot carries.
+        let head = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["-C", &top, "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        snapshot.scope = Scope::Branch;
+        snapshot.base = Some(Base {
+            requested: "refs/heads/main".into(),
+            commit: head.clone(),
+            merge_base: Some(head.clone()),
+            source: BaseSource::Default,
+        });
+        snapshot.files.truncate(2);
+        let (_, files) = dispatch::request_files(&ctx(snapshot), &dispatch::ReviewScope::All)
+            .await
+            .unwrap();
+        assert!(files.iter().all(|f| matches!(&f.comparison, comments::AnchorComparison::Branch { merge_base, label } if *merge_base == head && label == "main")));
+        assert_eq!(files[0].additions, vec![(1, 2)]);
+    }
+
+    #[test]
+    fn a_colliding_nonce_is_passed_over_and_the_bound_is_measured_on_the_encoded_line() {
+        let (dir, state, top, host) = sending_fixture();
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
+        ready_to_send(&handle);
+        // A retained record already carries the nonce the seam would make first.
+        let mut seeded = comments::Store::open(Some(state.path().to_path_buf()), &top, 1).0;
+        let mut earlier = seeded.comments()[0].clone();
+        earlier.id = comments::new_id();
+        earlier.text = "earlier".into();
+        earlier.state = comments::CommentState::Sent(comments::Stamp {
+            at: 1,
+            nonce: "n00001".into(),
+            item: 1,
+            to: target::Destination::clipboard(),
+        });
+        seeded
+            .transact(comments::Operation::Add(earlier), 1)
+            .unwrap();
+        handle.commands.send(Command::Refresh).unwrap();
+        wait_for(&handle, "seeded", |s| s.comments.len() == 3);
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&handle, "sent", |s| s.send_seq == 1);
+        assert!(s.send_error.is_none(), "{:?}", s.send_error);
+        let nonce = s
+            .comments
+            .iter()
+            .find(|c| c.text == "first")
+            .unwrap()
+            .stamp()
+            .unwrap()
+            .nonce
+            .clone();
+        assert_eq!(nonce, "n00002", "the retained nonce was passed over");
+        assert_eq!(
+            s.send_outcome.as_ref().unwrap().items,
+            2,
+            "the sent record was not claimed again"
+        );
+        // The bound counts the bytes the socket would carry, prefixes and escaping included.
+        let text = "x".repeat(dispatch::REQUEST_BOUND - 10);
+        assert!(dispatch::encoded_len("w4:p2", &text) > dispatch::REQUEST_BOUND);
+        assert!(dispatch::encoded_len("w4:p2", "> short") < 200);
+        let quoted = "\"".repeat(dispatch::REQUEST_BOUND / 4);
+        assert!(
+            dispatch::encoded_len("w4:p2", &quoted) > dispatch::REQUEST_BOUND / 2,
+            "escaping is counted"
+        );
+    }
+
+    #[test]
+    fn a_clipboard_send_is_sent_when_the_file_was_written_and_unconfirmed_when_only_the_sequence_went_out(
+    ) {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.nonce = Arc::new(|counter| format!("n{counter:05}"));
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "rows", |s| !s.files.is_empty());
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 0,
+                target: Target::Clipboard,
+            })
+            .unwrap();
+        wait_for(&handle, "clipboard", |s| s.target_seq == 1);
+        handle.commands.send(pending(2, "first")).unwrap();
+        wait_for(&handle, "pending", |s| s.comments.len() == 1);
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&handle, "copied", |s| s.send_seq == 1);
+        assert!(s.send_error.is_none());
+        let out = s.send_outcome.clone().unwrap();
+        assert!(
+            !out.unconfirmed
+                && out
+                    .copy
+                    .as_ref()
+                    .unwrap()
+                    .osc
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("\x1b]52;c;")
+        );
+        assert_eq!(s.copy_seq, 1);
+        assert!(std::fs::read_to_string(state.path().join("clipboard.md"))
+            .unwrap()
+            .starts_with("> Inline review — 1 item."));
+        assert!(
+            matches!(&s.comments[0].state, comments::CommentState::Sent(st) if st.to == target::Destination::clipboard())
+        );
+        // Without a state directory: the sequence alone, Unconfirmed.
+        let mut config = config_no_state(dir.path());
+        // The maker's second nonce is the first one again: the request must pass it over.
+        config.nonce = Arc::new(|counter| {
+            if counter == 2 {
+                "n00001".to_string()
+            } else {
+                format!("n{counter:05}")
+            }
+        });
+        let (_rt2, bare) = start_from(config);
+        wait_for(&bare, "rows, diff ready", |s| {
+            !s.files.is_empty() && matches!(s.diff, DiffState::Ready(_))
+        });
+        bare.commands
+            .send(Command::SetTarget {
+                token: 0,
+                target: Target::Clipboard,
+            })
+            .unwrap();
+        bare.commands.send(pending(2, "x")).unwrap();
+        wait_for(&bare, "pending", |s| s.comments.len() == 1);
+        bare.commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&bare, "unconfirmed copy", |s| s.send_seq == 1);
+        assert!(s.send_outcome.as_ref().unwrap().unconfirmed);
+        assert!(
+            matches!(&s.comments[0].state, comments::CommentState::Unconfirmed { stamp, .. } if stamp.nonce == "n00001")
+        );
+        assert!(s
+            .send_outcome
+            .as_ref()
+            .unwrap()
+            .copy
+            .as_ref()
+            .unwrap()
+            .osc
+            .is_some());
+        // Even without disk state, requests must skip nonces retained in memory.
+        bare.commands
+            .send(Command::Send(dispatch::SendRequest {
+                kind: dispatch::SendKind::Review {
+                    scope: dispatch::ReviewScope::All,
+                },
+                accepted: Default::default(),
+            }))
+            .unwrap();
+        let s = wait_for(&bare, "request copied", |s| s.send_seq == 2);
+        assert!(s.send_error.is_none(), "{:?}", s.send_error);
+        bare.commands.send(pending(1, "y")).unwrap();
+        wait_for(&bare, "pending again", |s| {
+            s.comments.iter().any(|c| c.is_pending())
+        });
+        bare.commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&bare, "sent again", |s| s.send_seq == 3);
+        assert!(s.comments.iter().any(|c| matches!(&c.state, comments::CommentState::Unconfirmed { stamp, .. } if stamp.nonce == "n00004")), "the request took n00003, not the stamped n00001: {:?}", s.comments.iter().map(|c| &c.state).collect::<Vec<_>>());
+        // Over the OSC limit with a writable directory: the file alone, no sequence, still Sent.
+        let wide = "字".repeat(comments::MAX_CHARS);
+        for _ in 0..30 {
+            handle.commands.send(pending(2, &wide)).unwrap();
+        }
+        wait_for(&handle, "thirty more", |s| {
+            s.comments.iter().filter(|c| c.is_pending()).count() == 30
+        });
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&handle, "file only", |s| s.send_seq == 2);
+        let out = s.send_outcome.clone().unwrap();
+        assert!(out.copy.as_ref().unwrap().osc.is_none() && !out.unconfirmed);
+        assert!(out
+            .copy
+            .as_ref()
+            .unwrap()
+            .notice
+            .contains("too long for the terminal's clipboard"));
+        assert!(s
+            .comments
+            .iter()
+            .all(|c| matches!(c.state, comments::CommentState::Sent(_))));
+        // A copy that reaches nothing must restore the previous stamps.
+        for _ in 0..30 {
+            bare.commands.send(pending(2, &wide)).unwrap();
+        }
+        let before = wait_for(&bare, "thirty pending", |s| {
+            s.comments.iter().filter(|c| c.is_pending()).count() == 30
+        });
+        let earlier = before.comments[0].stamp().unwrap().nonce.clone();
+        let answered = before.send_seq;
+        bare.commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&bare, "nothing could receive", |s| {
+            s.send_seq == answered + 1
+        });
+        assert!(
+            s.send_error
+                .as_deref()
+                .unwrap()
+                .starts_with("nothing could receive the copy: "),
+            "{:?}",
+            s.send_error
+        );
+        assert_eq!(s.comments.iter().filter(|c| c.is_pending()).count(), 30);
+        assert!(
+            matches!(&s.comments[0].state, comments::CommentState::Unconfirmed { stamp, .. } if stamp.nonce == earlier)
+        );
+    }
+
+    #[test]
+    fn copy_stamps_nothing_and_a_review_request_is_recorded_with_ranges_read_before_the_check() {
+        let (dir, state, top, host) = sending_fixture();
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
+        ready_to_send(&handle);
+        handle
+            .commands
+            .send(Command::Copy(dispatch::CopyRequest {
+                what: dispatch::CopyWhat::Review,
+            }))
+            .unwrap();
+        // Wait for both conditions in the same snapshot.
+        let s = wait_for(&handle, "copied, diff ready", |s| {
+            s.copy_seq == 1 && matches!(s.diff, DiffState::Ready(_))
+        });
+        assert!(s
+            .copy
+            .as_ref()
+            .unwrap()
+            .notice
+            .starts_with("copied 2 comments · also in "));
+        assert!(
+            s.comments.iter().all(|c| c.is_pending()),
+            "`c` claims nothing"
+        );
+
+        handle
+            .commands
+            .send(Command::Send(dispatch::SendRequest {
+                kind: dispatch::SendKind::Review {
+                    scope: dispatch::ReviewScope::All,
+                },
+                accepted: Default::default(),
+            }))
+            .unwrap();
+        let s = wait_for(&handle, "requested", |s| s.send_seq == 1);
+        assert!(s.send_error.is_none(), "{:?}", s.send_error);
+        let (requests, _) = comments::load_requests(state.path(), &top);
+        assert_eq!(requests.len(), 1);
+        // `-U3` context makes a.txt's one hunk span both lines; b.txt is one line.
+        let files: Vec<_> = requests[0]
+            .files
+            .iter()
+            .map(|f| (f.key.path.as_str(), f.additions.clone()))
+            .collect();
+        assert_eq!(files, [("a.txt", vec![(1, 2)]), ("b.txt", vec![(1, 1)])]);
+        // Read each rename side with its own source and retain both ranges.
+        let body: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.path().join("b.txt"), &body).unwrap();
+        git(dir.path(), &["add", "b.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "a longer b"]);
+        git(dir.path(), &["mv", "b.txt", "c.txt"]);
+        // The staged half carries an edit too, or it is a pure rename with no hunk to range.
+        std::fs::write(dir.path().join("c.txt"), format!("{body}more\n")).unwrap();
+        git(dir.path(), &["add", "c.txt"]);
+        std::fs::write(dir.path().join("c.txt"), format!("{body}more\nand more\n")).unwrap();
+        let status = Proc::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["status", "--porcelain=v1"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).contains("RM b.txt -> c.txt"),
+            "the fixture must be a staged rename with edits on both sides"
+        );
+        handle.commands.send(Command::Refresh).unwrap();
+        wait_for(&handle, "both halves listed", |s| {
+            s.files.iter().filter(|f| f.path == "c.txt").count() == 2
+        });
+        handle
+            .commands
+            .send(Command::Send(dispatch::SendRequest {
+                kind: dispatch::SendKind::Review {
+                    scope: dispatch::ReviewScope::All,
+                },
+                accepted: Default::default(),
+            }))
+            .unwrap();
+        let s = wait_for(&handle, "requested again", |s| s.send_seq == 2);
+        assert!(s.send_error.is_none(), "{:?}", s.send_error);
+        let (requests, _) = comments::load_requests(state.path(), &top);
+        let halves: Vec<_> = requests[1]
+            .files
+            .iter()
+            .filter(|f| f.key.path == "c.txt")
+            .map(|f| (f.key.staged, f.additions.clone()))
+            .collect();
+        assert_eq!(halves.len(), 2);
+        assert!(
+            halves.iter().all(|(_, ranges)| !ranges.is_empty()),
+            "{halves:?}"
+        );
+        assert_eq!(
+            requests[0].target,
+            target::Destination::Pane {
+                pane: "w4:p2".into(),
+                agent: "codex".into(),
+                session: Some(host::SessionRef {
+                    kind: "id".into(),
+                    value: "s1".into()
+                })
+            }
+        );
+        let prompts = host.prompts.lock().unwrap().clone();
+        assert!(prompts[0].1.starts_with(&format!("> Delegate a code review of these 2 changes:\n> unstaged diff (`git -C '{top}' diff`):\n> ─ a.txt ({top}/a.txt)\n> ─ b.txt ({top}/b.txt)\n>\n")));
+        assert!(prompts[0]
+            .1
+            .contains(&format!("\"nonce\":\"{}\"", requests[0].nonce)));
+
+        host.set_pane(agent_pane("w4:p2", "codex", "blocked", Some("s1"), &top));
+        handle
+            .commands
+            .send(Command::Send(dispatch::SendRequest {
+                kind: dispatch::SendKind::Review {
+                    scope: dispatch::ReviewScope::All,
+                },
+                accepted: Default::default(),
+            }))
+            .unwrap();
+        let s = wait_for(&handle, "refused", |s| s.send_seq == 3);
+        assert!(s
+            .send_error
+            .as_deref()
+            .unwrap()
+            .starts_with("codex is waiting for an approval"));
+        assert_eq!(comments::load_requests(state.path(), &top).0.len(), 2);
+        // `c` in the Request box records the request with a clipboard destination.
+        handle
+            .commands
+            .send(Command::Copy(dispatch::CopyRequest {
+                what: dispatch::CopyWhat::Request {
+                    scope: dispatch::ReviewScope::All,
+                },
+            }))
+            .unwrap();
+        wait_for(&handle, "request copied", |s| s.copy_seq == 2);
+        let (requests, _) = comments::load_requests(state.path(), &top);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].target, target::Destination::clipboard());
+        assert!(std::fs::read_to_string(state.path().join("clipboard.md"))
+            .unwrap()
+            .starts_with("> Delegate a code review"));
+    }
+
+    #[test]
+    fn a_late_host_answer_settles_the_unconfirmed_records_by_nonce() {
+        let (dir, state, _top, host) = sending_fixture();
+        let mut config = sending_config(dir.path(), state.path(), host.clone());
+        config.host_wait = Duration::from_millis(300);
+        *host.prompt_delay.lock().unwrap() = Some(Duration::from_millis(900));
+        let (_rt, handle) = start_from(config);
+        ready_to_send(&handle);
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&handle, "unconfirmed at the wait", |s| s.send_seq == 1);
+        assert!(s.send_outcome.as_ref().unwrap().unconfirmed);
+        assert!(s
+            .comments
+            .iter()
+            .all(|c| matches!(c.state, comments::CommentState::Unconfirmed { .. })));
+        // The host's yes arrives 600 ms later and is final.
+        wait_for(&handle, "settled late", |s| {
+            s.comments.iter().all(
+                |c| matches!(&c.state, comments::CommentState::Sent(st) if st.nonce == "n00001"),
+            )
+        });
+        // A late definite failure returns a record to what it was.
+        handle.commands.send(pending(2, "third")).unwrap();
+        wait_for(&handle, "third", |s| s.comments.len() == 3);
+        host.prompt_results
+            .lock()
+            .unwrap()
+            .push(Err(host::HostFailure::Api {
+                code: "agent_not_found".into(),
+                message: "gone".into(),
+            }));
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        wait_for(&handle, "unconfirmed again", |s| {
+            s.send_seq == 2 && s.send_outcome.as_ref().is_some_and(|o| o.unconfirmed)
+        });
+        wait_for(&handle, "returned to pending", |s| {
+            s.comments
+                .iter()
+                .any(|c| c.text == "third" && c.is_pending())
+        });
+    }
+
+    #[test]
+    fn a_call_that_outlives_the_wait_keeps_the_send_lock_until_it_answers() {
+        let (dir, state, _top, host) = sending_fixture();
+        let mut config = sending_config(dir.path(), state.path(), host.clone());
+        config.host_wait = Duration::from_millis(300);
+        *host.prompt_delay.lock().unwrap() = Some(Duration::from_millis(900));
+        let (_rt, a) = start_from(config);
+        ready_to_send(&a);
+        let dir2 = fixture();
+        let mut config = sending_config(dir2.path(), state.path(), host.clone());
+        config.nonce = Arc::new(|counter| format!("m{counter:05}"));
+        let (_rt2, b) = start_from(config);
+        wait_for(&b, "rows", |s| !s.files.is_empty());
+        b.commands
+            .send(Command::SetTarget {
+                token: 0,
+                target: pane_target("w4:p2", "codex", Some("s1")),
+            })
+            .unwrap();
+        wait_for(&b, "live", |s| {
+            s.target_state == TargetState::Live("idle".into())
+        });
+        b.commands.send(pending(2, "from b")).unwrap();
+        wait_for(&b, "pending", |s| s.comments.len() == 1);
+        a.commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        wait_for(&a, "a unconfirmed at the wait", |s| {
+            s.send_seq == 1 && s.send_outcome.as_ref().is_some_and(|o| o.unconfirmed)
+        });
+        // a's call is still running; b's send must wait for it, not paste into the same line.
+        b.commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        wait_for(&b, "b sent", |s| s.send_seq == 1 && s.send_error.is_none());
+        let starts = host.prompt_started.lock().unwrap().clone();
+        assert_eq!(starts.len(), 2);
+        assert!(
+            starts[1].duration_since(starts[0]) >= Duration::from_millis(900 + 500),
+            "{:?}",
+            starts[1].duration_since(starts[0])
+        );
+        wait_for(&a, "a settled late", |s| {
+            s.comments
+                .iter()
+                .all(|c| matches!(c.state, comments::CommentState::Sent(_)))
+        });
+    }
+
+    #[test]
+    fn an_oversized_review_is_refused_before_any_stamp_and_without_a_call() {
+        let (dir, state, _top, host) = sending_fixture();
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
+        ready_to_send(&handle);
+        // Fifty comments of 4,000 CJK characters are 600,000 bytes of text, over the 512 KiB bound.
+        let wide = "字".repeat(comments::MAX_CHARS);
+        for _ in 0..48 {
+            handle.commands.send(pending(2, &wide)).unwrap();
+        }
+        wait_for(&handle, "fifty", |s| s.comments.len() == 50);
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let s = wait_for(&handle, "refused", |s| s.send_seq == 1);
+        assert!(
+            s.send_error
+                .as_deref()
+                .unwrap()
+                .starts_with("review too large to send at once ("),
+            "{:?}",
+            s.send_error
+        );
+        assert!(
+            s.comments.iter().all(|c| c.is_pending()),
+            "nothing was stamped"
+        );
+        assert_eq!(
+            host.prompts.lock().unwrap().len(),
+            0,
+            "the host was not called"
+        );
+        // Long paths push the request over its bound without exceeding path limits.
+        let before = std::fs::read_to_string(state.path().join("requests.json")).ok();
+        let deep = (0..3).fold(dir.path().to_path_buf(), |p, i| {
+            p.join(format!("{i}{}", "d".repeat(229)))
+        });
+        std::fs::create_dir_all(&deep).unwrap();
+        for i in 0..350 {
+            std::fs::write(deep.join(format!("{i:03}.txt")), "x\n").unwrap();
+        }
+        handle.commands.send(Command::Refresh).unwrap();
+        wait_for(&handle, "the rows", |s| s.files.len() >= 350);
+        handle
+            .commands
+            .send(Command::Send(dispatch::SendRequest {
+                kind: dispatch::SendKind::Review {
+                    scope: dispatch::ReviewScope::All,
+                },
+                accepted: Default::default(),
+            }))
+            .unwrap();
+        let s = wait_for(&handle, "request refused", |s| s.send_seq == 2);
+        assert!(
+            s.send_error
+                .as_deref()
+                .unwrap()
+                .starts_with("review too large"),
+            "{:?}",
+            s.send_error
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.path().join("requests.json")).ok(),
+            before,
+            "a refused request was recorded"
+        );
+    }
+
+    fn config_no_state(dir: &std::path::Path) -> SessionConfig {
+        test_config(dir, Arc::new(AtomicBool::new(true)))
     }
 }
