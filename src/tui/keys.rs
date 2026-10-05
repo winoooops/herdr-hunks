@@ -23,6 +23,8 @@ pub enum KeyAction {
     PickBase,
     MarkReviewed,
     PickPane,
+    Finish,
+    RequestReview,
     Comment,
     CommentFile,
     Visual,
@@ -49,7 +51,7 @@ pub struct Binding {
     pub vimeflow: Option<&'static str>,
 }
 
-pub const RESERVED: &[&str] = &["y", "Y", "@", "c", "/"];
+pub const RESERVED: &[&str] = &["/"];
 
 pub const KEYS: &[Binding] = &[
     Binding {
@@ -221,6 +223,18 @@ pub const KEYS: &[Binding] = &[
         vimeflow: None,
     },
     Binding {
+        key: "Y",
+        label: "finish: send the review",
+        action: KeyAction::Finish,
+        vimeflow: Some("diff-review-finish"),
+    },
+    Binding {
+        key: "@",
+        label: "request a review",
+        action: KeyAction::RequestReview,
+        vimeflow: Some("diff-review-request"),
+    },
+    Binding {
         key: "g",
         label: "first row",
         action: KeyAction::First,
@@ -312,6 +326,11 @@ pub fn help_panel(popup: bool) -> Panel {
         cursor: None,
         offset: 0,
     };
+    panel.rows.extend([
+        Row::Note("in the Finish and Request boxes: Y confirm · A pick another pane · c copy · n cancel · f / a scope".into()),
+        Row::Note("in the editor: Enter save · ctrl+j newline · ctrl+h/l category · Esc cancel".into()),
+        Row::Note("y copies a selection made with v".into()),
+    ]);
     if popup {
         panel.rows.push(Row::Entry {
             label: "esc".into(),
@@ -351,8 +370,8 @@ mod tests {
                 assert_eq!(lookup(&KeyEvent::new(code, modifiers)), None);
             }
         }
-        assert_eq!(KEYS.len(), 35);
-        assert_eq!(help_panel(false).rows.len(), 35);
+        assert_eq!(KEYS.len(), 37);
+        assert_eq!(help_panel(false).rows.len(), 40);
     }
 
     #[test]

@@ -5,9 +5,12 @@ use crossterm::event::{
 
 use crate::engine::comments::{self, Anchor, AnchorComparison, Span as AnchorSpan};
 use crate::engine::nav::{self, Side, ViewMode};
+use crate::engine::{dispatch, Target, TargetState};
 use crate::engine::{Command, Comparison, DiffState, FileKey, Snapshot, NO_BASE_NOTICE};
 use crate::tui::keys::{self, KeyAction};
 use crate::tui::layout::clamp_scroll;
+use crate::tui::panes;
+use crate::tui::sanitize::sanitize;
 use crate::tui::state::{FilesPanel, ViewState};
 use crate::tui::view::{self, Action, Rendered};
 use crate::tui::{dialog, format};
@@ -73,6 +76,9 @@ pub fn handle_key(
     if state.confirm.is_some() {
         return confirm_key(state, key);
     }
+    if state.review_box.is_some() {
+        return box_key(state, snapshot, key);
+    }
     if state.editor.is_some() {
         let outcome = editor_key(state, snapshot, key);
         if outcome != Outcome::Inert {
@@ -98,9 +104,88 @@ pub fn handle_key(
     if state.popup && key.code == KeyCode::Esc && key.modifiers.is_empty() {
         return Outcome::Quit;
     }
+    if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
+        if let (DiffState::Ready(diff), Some(visual), Some(cursor)) =
+            (&snapshot.diff, &state.visual, state.cursor)
+        {
+            if std::sync::Arc::ptr_eq(diff, &visual.diff) {
+                if let Some((side, start, end)) = review::selection(diff, visual, cursor) {
+                    let text = review::selection_text(diff, side, start, end);
+                    state.visual = None;
+                    return Outcome::Engine(Command::Copy(dispatch::CopyRequest {
+                        what: dispatch::CopyWhat::Selection(text),
+                    }));
+                }
+            }
+        }
+        return Outcome::Inert;
+    }
     match action {
         Some(action) => apply_action(state, snapshot, action, width),
         None => Outcome::Inert,
+    }
+}
+
+fn box_key(state: &mut ViewState, snapshot: &Snapshot, key: KeyEvent) -> Outcome {
+    let Some(b) = state.review_box.as_mut() else {
+        return Outcome::Inert;
+    };
+    if b.pending.is_some() {
+        return Outcome::Inert;
+    }
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, KeyModifiers::NONE) => {
+            state.review_box = None;
+            Outcome::Redraw
+        }
+        (KeyCode::Char('Y'), KeyModifiers::SHIFT | KeyModifiers::NONE) => {
+            if !b.drawn {
+                return Outcome::Inert;
+            }
+            match b.submit(snapshot) {
+                Some(command) => {
+                    b.pending = Some(snapshot.send_seq);
+                    Outcome::Engine(command)
+                }
+                None => Outcome::Inert,
+            }
+        }
+        (KeyCode::Char('A'), KeyModifiers::SHIFT | KeyModifiers::NONE)
+            if b.offers(snapshot).pick =>
+        {
+            let return_to = match b.kind {
+                review::BoxKind::Finish => panes::ReturnTo::Finish,
+                review::BoxKind::Request => panes::ReturnTo::Request(b.scope.clone()),
+            };
+            state.review_box = None;
+            state.panes_token += 1;
+            state.panes = Some(panes::PanePicker::open(state.panes_token, return_to));
+            Outcome::Engine(Command::LoadPanes(state.panes_token))
+        }
+        (KeyCode::Char('c'), KeyModifiers::NONE) if b.offers(snapshot).copy => {
+            let command = b.copy();
+            state.review_box = None;
+            Outcome::Engine(command)
+        }
+        (KeyCode::Char('f'), KeyModifiers::NONE) if b.kind == review::BoxKind::Request => {
+            if let Some(key) = snapshot.selected.clone() {
+                let scope = dispatch::ReviewScope::File(key);
+                if b.scope_available(snapshot, &scope) {
+                    b.scope = scope;
+                    return Outcome::Redraw;
+                }
+            }
+            Outcome::Inert
+        }
+        (KeyCode::Char('a'), KeyModifiers::NONE) if b.kind == review::BoxKind::Request => {
+            if b.scope_available(snapshot, &dispatch::ReviewScope::All) {
+                b.scope = dispatch::ReviewScope::All;
+                Outcome::Redraw
+            } else {
+                Outcome::Inert
+            }
+        }
+        _ => Outcome::Inert,
     }
 }
 
@@ -580,6 +665,46 @@ fn act(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction, width: u16
         | DeleteFileComment => {
             return comment_key(state, snapshot, action);
         }
+        Finish | RequestReview => {
+            let kind = if action == Finish {
+                review::BoxKind::Finish
+            } else {
+                review::BoxKind::Request
+            };
+            if action == Finish && review::counts(snapshot) == (0, 0, 0) {
+                state.notify(dispatch::NOTICE_NO_PENDING);
+                return Outcome::Redraw;
+            }
+            // Nothing to review: the box says so with `n` alone (10.4), whatever the target; no picker.
+            if action == RequestReview && snapshot.files.is_empty() {
+                state.review_box = Some(review::ReviewBox::request(snapshot));
+                return Outcome::Redraw;
+            }
+            match (&snapshot.target, &snapshot.target_state) {
+                (None, _) | (Some(_), TargetState::Left | TargetState::Gone) => {
+                    if let Some(Target::Pane { agent, pane, .. }) = &snapshot.target {
+                        state.notify(format!(
+                            "{} · {} is gone · pick a pane",
+                            sanitize(agent),
+                            sanitize(pane)
+                        ));
+                    }
+                    let return_to = if action == Finish {
+                        panes::ReturnTo::Finish
+                    } else {
+                        panes::ReturnTo::Request(dispatch::ReviewScope::All)
+                    };
+                    state.panes_token += 1;
+                    state.panes = Some(panes::PanePicker::open(state.panes_token, return_to));
+                    return Outcome::Engine(Command::LoadPanes(state.panes_token));
+                }
+                _ => {}
+            }
+            state.review_box = Some(match kind {
+                review::BoxKind::Finish => review::ReviewBox::finish(),
+                review::BoxKind::Request => review::ReviewBox::request(snapshot),
+            });
+        }
         PickPane => {
             state.panes_token += 1;
             state.panes = Some(crate::tui::panes::PanePicker::open(
@@ -810,7 +935,7 @@ pub fn handle_mouse(
         return Outcome::Inert;
     }
     // The box has to be answered: no click or wheel reaches anything under it.
-    if state.confirm.is_some() {
+    if state.confirm.is_some() || state.review_box.is_some() {
         return Outcome::Inert;
     }
     if let Some(editor) = state.editor.as_mut() {
@@ -1420,7 +1545,10 @@ pub(crate) mod tests {
         );
         assert_eq!((st.help_offset, st.offset, st.cursor), (3, 0, Some(0)));
         while handle_mouse(&mut st, &snap, &background, wheel) != Outcome::Inert {}
-        assert_eq!(st.help_offset, KEYS.len() - 6);
+        assert_eq!(
+            st.help_offset,
+            dialog::line_count(&keys::help_panel(false), 40) - 6
+        );
         let sheet = render(&snap, &st, 40, 12);
         assert!(sheet.plain().iter().any(|line| line.contains("quit")));
         assert!(sheet.hits.is_empty());
@@ -1432,7 +1560,10 @@ pub(crate) mod tests {
             handle_mouse(&mut st, &snap, &background, up),
             Outcome::Redraw
         );
-        assert_eq!(st.help_offset, KEYS.len() - 9);
+        assert_eq!(
+            st.help_offset,
+            dialog::line_count(&keys::help_panel(false), 40) - 9
+        );
         while handle_key(&mut st, &snap, key("k"), 40) != Outcome::Inert {}
         assert_eq!(st.help_offset, 0);
         for close in [
@@ -3471,5 +3602,443 @@ pub(crate) mod tests {
             panic!()
         };
         assert_eq!(diff.targets[st.cursor.unwrap()].side, Side::Additions);
+    }
+
+    pub(crate) fn pane_target() -> Target {
+        Target::Pane {
+            pane: "w4:p2".into(),
+            socket: "/s".into(),
+            agent: "codex".into(),
+            session: None,
+            title: "demo".into(),
+        }
+    }
+    #[test]
+    fn y_opens_the_finish_box_and_sends_what_it_showed() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        snap.target = Some(pane_target());
+        snap.target_state = crate::engine::TargetState::Live("idle".into());
+        handle_key(&mut st, &snap, key("Y"), 120);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some(dispatch::NOTICE_NO_PENDING)
+        );
+        snap.comments = std::sync::Arc::new(vec![comment_at(&anchor_on(&snap, 10), "p", 1)]);
+        handle_key(&mut st, &snap, key("Y"), 120);
+        assert!(st.review_box.is_some());
+        assert_eq!(
+            handle_key(&mut st, &snap, key("Y"), 120),
+            Outcome::Inert,
+            "not drawn yet"
+        );
+        st.review_box.as_mut().unwrap().drawn = true;
+        let outcome = handle_key(&mut st, &snap, key("Y"), 120);
+        assert!(
+            matches!(outcome, Outcome::Engine(Command::Send(dispatch::SendRequest { kind: dispatch::SendKind::Feedback, accepted })) if accepted == dispatch::Accepted::default())
+        );
+        assert_eq!(
+            handle_key(&mut st, &snap, key("Y"), 120),
+            Outcome::Inert,
+            "a second Y while pending"
+        );
+        // A refusal keeps the box open, relabelled; the next Y accepts it.
+        snap.send_seq = 1;
+        snap.send_error = Some(
+            "codex is working in w4:p2; the review would queue behind its current turn.".into(),
+        );
+        snap.send_refusal = Some(dispatch::Refusal::Busy);
+        st.observe(&snap);
+        let b = st.review_box.as_ref().unwrap();
+        assert_eq!(b.offers(&snap).y, Some("send anyway"));
+        let outcome = handle_key(&mut st, &snap, key("Y"), 120);
+        assert!(matches!(outcome, Outcome::Engine(Command::Send(r)) if r.accepted.busy));
+        // Success closes it with the notice.
+        snap.send_seq = 2;
+        snap.send_error = None;
+        snap.send_refusal = None;
+        snap.send_outcome = Some(dispatch::SendOutcome {
+            kind: dispatch::SendKind::Feedback,
+            items: 1,
+            to: crate::engine::Destination::Pane {
+                pane: "w4:p2".into(),
+                agent: "codex".into(),
+                session: None,
+            },
+            unconfirmed: false,
+            copy: None,
+        });
+        st.observe(&snap);
+        assert!(st.review_box.is_none());
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("sent 1 item to codex · w4:p2")
+        );
+    }
+
+    #[test]
+    fn a_pick_made_for_the_finish_box_returns_to_it_without_sending() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        snap.target = None;
+        snap.target_state = crate::engine::TargetState::Unverified;
+        snap.comments = std::sync::Arc::new(vec![comment_at(&anchor_on(&snap, 10), "p", 1)]);
+        assert_eq!(
+            handle_key(&mut st, &snap, key("Y"), 120),
+            Outcome::Engine(Command::LoadPanes(1))
+        );
+        assert!(st.review_box.is_none() && st.panes.is_some());
+        // Y again while the rows load: inert in the picker (typed as a filter character, harmless).
+        handle_key(&mut st, &snap, key("Y"), 120);
+        snap.panes = Some(std::sync::Arc::new(Vec::new()));
+        snap.panes_seq = 1;
+        st.observe(&snap);
+        st.panes.as_mut().unwrap().input.clear();
+        st.panes.as_mut().unwrap().retarget(&snap);
+        assert!(matches!(
+            handle_key(&mut st, &snap, key("Enter"), 120),
+            Outcome::Engine(Command::SetTarget {
+                target: crate::engine::Target::Clipboard,
+                ..
+            })
+        ));
+        snap.target = Some(crate::engine::Target::Clipboard);
+        snap.target_state = crate::engine::TargetState::Clipboard;
+        snap.target_seq = 1;
+        snap.target_token = Some(1);
+        st.observe(&snap);
+        assert!(st.panes.is_none());
+        let b = st.review_box.as_ref().expect("the box reopened");
+        assert_eq!(
+            (b.kind, b.pending),
+            (review::BoxKind::Finish, None),
+            "nothing was sent by the pick"
+        );
+        assert_eq!(b.offers(&snap).y, Some("copy"));
+    }
+
+    #[test]
+    fn a_comment_answer_and_a_send_answer_in_a_row_both_speak() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        // Two answers before a key: the second shows at once, the first waits, then speaks.
+        snap.comment_seq = 1;
+        snap.comment_error = Some(comments::NOTICE_CAP.to_string());
+        snap.comment_refused = true;
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some(comments::NOTICE_CAP)
+        );
+        snap.send_seq = 1;
+        snap.send_error = Some("could not verify w4:p2: deadline".to_string());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("could not verify w4:p2: deadline")
+        );
+        // An unrelated snapshot cannot displace the unread answer.
+        snap.refreshing = !snap.refreshing;
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("could not verify w4:p2: deadline")
+        );
+        // Read (a key clears it): the displaced warning is back; read again: nothing more.
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some(comments::NOTICE_CAP),
+            "the first answer was not lost"
+        );
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert!(st.notice.is_none());
+    }
+
+    #[test]
+    fn a_box_whose_target_goes_away_becomes_the_picker_and_asks_for_rows() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        snap.target = Some(pane_target());
+        snap.target_state = crate::engine::TargetState::Live("idle".into());
+        snap.comments = std::sync::Arc::new(vec![comment_at(&anchor_on(&snap, 10), "p", 1)]);
+        assert_eq!(handle_key(&mut st, &snap, key("Y"), 120), Outcome::Redraw);
+        assert!(st.review_box.is_some());
+        // A vanished target opens a picker that asks for rows.
+        snap.target_state = crate::engine::TargetState::Gone;
+        st.observe(&snap);
+        assert!(st.review_box.is_none());
+        assert!(matches!(
+            st.panes.as_ref().map(|p| &p.return_to),
+            Some(crate::tui::panes::ReturnTo::Finish)
+        ));
+        assert_eq!(st.pending_command.take(), Some(Command::LoadPanes(1)));
+        assert_eq!(st.pending_command.take(), None, "sent once");
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("codex · w4:p2 is gone · pick a pane")
+        );
+        // Observed again with the picker open, nothing happens twice.
+        st.observe(&snap);
+        assert_eq!(st.pending_command, None);
+        assert_eq!(st.panes_token, 1);
+    }
+
+    #[test]
+    fn the_request_box_scopes_with_f_and_a_and_c_copies_without_claiming() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        snap.target = Some(pane_target());
+        snap.target_state = crate::engine::TargetState::Live("idle".into());
+        snap.files.push(crate::git::ChangedFile {
+            path: "b.rs".into(),
+            status: crate::git::ChangedFileStatus::Modified,
+            staged: false,
+            insertions: None,
+            deletions: None,
+        });
+        snap.selected = Some(FileKey {
+            path: "a.rs".into(),
+            staged: false,
+            untracked: false,
+        });
+        handle_key(&mut st, &snap, key("@"), 120);
+        let b = st.review_box.as_ref().unwrap();
+        assert_eq!(b.scope, dispatch::ReviewScope::All);
+        handle_key(&mut st, &snap, key("f"), 120);
+        assert!(
+            matches!(&st.review_box.as_ref().unwrap().scope, dispatch::ReviewScope::File(k) if k.path == "a.rs")
+        );
+        handle_key(&mut st, &snap, key("a"), 120);
+        assert_eq!(
+            st.review_box.as_ref().unwrap().scope,
+            dispatch::ReviewScope::All
+        );
+        // A pick made from a file-scoped box returns to a file-scoped box.
+        handle_key(&mut st, &snap, key("f"), 120);
+        assert_eq!(
+            handle_key(&mut st, &snap, key("A"), 120),
+            Outcome::Engine(Command::LoadPanes(1))
+        );
+        assert!(
+            matches!(st.panes.as_ref().map(|p| &p.return_to), Some(crate::tui::panes::ReturnTo::Request(dispatch::ReviewScope::File(k))) if k.path == "a.rs")
+        );
+        snap.panes = Some(std::sync::Arc::new(Vec::new()));
+        snap.panes_seq = 1;
+        st.observe(&snap);
+        st.panes.as_mut().unwrap().input.clear();
+        st.panes.as_mut().unwrap().retarget(&snap);
+        assert!(matches!(
+            handle_key(&mut st, &snap, key("Enter"), 120),
+            Outcome::Engine(Command::SetTarget {
+                target: crate::engine::Target::Clipboard,
+                ..
+            })
+        ));
+        snap.target = Some(crate::engine::Target::Clipboard);
+        snap.target_state = crate::engine::TargetState::Clipboard;
+        snap.target_seq = 1;
+        snap.target_token = Some(1);
+        st.observe(&snap);
+        assert!(
+            matches!(&st.review_box.as_ref().expect("the box reopened").scope, dispatch::ReviewScope::File(k) if k.path == "a.rs"),
+            "the pick kept the scope"
+        );
+        snap.target = Some(pane_target());
+        snap.target_state = crate::engine::TargetState::Live("idle".into());
+        handle_key(&mut st, &snap, key("a"), 120);
+        let outcome = handle_key(&mut st, &snap, key("c"), 120);
+        assert!(matches!(
+            outcome,
+            Outcome::Engine(Command::Copy(dispatch::CopyRequest {
+                what: dispatch::CopyWhat::Request {
+                    scope: dispatch::ReviewScope::All
+                }
+            }))
+        ));
+        assert!(st.review_box.is_none());
+        // Gone target: @ opens the picker with the notice (the second picker of this test).
+        snap.target_state = crate::engine::TargetState::Gone;
+        assert_eq!(
+            handle_key(&mut st, &snap, key("@"), 120),
+            Outcome::Engine(Command::LoadPanes(2))
+        );
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("codex · w4:p2 is gone · pick a pane")
+        );
+        handle_key(&mut st, &snap, key("Esc"), 120);
+        // An empty review offers only cancellation.
+        snap.files.clear();
+        snap.target = None;
+        snap.target_state = crate::engine::TargetState::Unverified;
+        assert_eq!(handle_key(&mut st, &snap, key("@"), 120), Outcome::Redraw);
+        assert!(st.panes.is_none());
+        let b = st.review_box.as_ref().expect("the box opened");
+        let panel = b.panel(&snap, 60);
+        assert_eq!((panel.rows.len(), panel.footer.as_str()), (1, "n cancel"));
+        assert_eq!(handle_key(&mut st, &snap, key("A"), 120), Outcome::Inert);
+        assert_eq!(handle_key(&mut st, &snap, key("c"), 120), Outcome::Inert);
+        assert_eq!(handle_key(&mut st, &snap, key("n"), 120), Outcome::Redraw);
+        assert!(st.review_box.is_none());
+    }
+
+    #[test]
+    fn y_copies_a_selection_and_n_means_no_in_a_box_and_next_file_outside() {
+        let (mut snap, mut st) = review_setup(&[(10, " ++ ")]);
+        assert_eq!(
+            handle_key(&mut st, &snap, key("n"), 120),
+            Outcome::Engine(Command::SelectNext)
+        );
+        handle_key(&mut st, &snap, key("v"), 120);
+        handle_key(&mut st, &snap, key("j"), 120);
+        let outcome = handle_key(&mut st, &snap, key("y"), 120);
+        assert!(
+            matches!(outcome, Outcome::Engine(Command::Copy(dispatch::CopyRequest { what: dispatch::CopyWhat::Selection(text) })) if text == "line +\nline +"),
+            "the fixture's added lines read `line +`"
+        );
+        assert!(st.visual.is_none());
+        snap.comments = std::sync::Arc::new(vec![comment_at(&anchor_on(&snap, 10), "p", 1)]);
+        handle_key(&mut st, &snap, key("Y"), 120);
+        assert_eq!(handle_key(&mut st, &snap, key("n"), 120), Outcome::Redraw);
+        assert!(st.review_box.is_none());
+        // A copy answer speaks once, with the engine's notice.
+        snap.copy_seq = 1;
+        snap.copy = Some(std::sync::Arc::new(dispatch::CopyOut {
+            osc: Some("\x1b]52;c;AA==\x07".into()),
+            notice: "copied selection · also in ~/x/clipboard.md".into(),
+            urgent: false,
+        }));
+        st.observe(&snap);
+        assert_eq!(st.pending_copy.as_deref(), Some("\x1b]52;c;AA==\x07"));
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("copied selection · also in ~/x/clipboard.md")
+        );
+    }
+
+    #[test]
+    fn the_boxes_are_modal_for_the_mouse_too() {
+        for request in [false, true] {
+            let (mut snap, mut st) = review_setup(&[(10, &"+".repeat(80))]);
+            snap.comments = std::sync::Arc::new(vec![comment_at(&anchor_on(&snap, 10), "p", 1)]);
+            st.files_panel = FilesPanel::Shown;
+            let background = render(&snap, &st, 120, 24);
+            handle_key(&mut st, &snap, key(if request { "@" } else { "Y" }), 120);
+            assert!(st.review_box.is_some());
+            let offset = st.offset;
+            let cursor = st.cursor;
+            for hit in background
+                .hits
+                .iter()
+                .filter(|hit| matches!(hit.action, Action::SelectFile(_)))
+            {
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::ScrollDown,
+                    MouseEventKind::ScrollUp,
+                ] {
+                    assert_eq!(
+                        handle_mouse(
+                            &mut st,
+                            &snap,
+                            &background,
+                            MouseEvent {
+                                kind,
+                                column: hit.x0,
+                                row: hit.y,
+                                modifiers: KeyModifiers::NONE
+                            }
+                        ),
+                        Outcome::Inert
+                    );
+                }
+            }
+            for k in ["j", "?", "s", "i", "v", "q", "y", "/", "@"] {
+                assert_eq!(
+                    handle_key(&mut st, &snap, key(k), 120),
+                    Outcome::Inert,
+                    "{k}"
+                );
+            }
+            assert_eq!((st.offset, st.cursor), (offset, cursor));
+            assert_eq!(handle_key(&mut st, &snap, key("Esc"), 120), Outcome::Redraw);
+            assert!(st.review_box.is_none());
+        }
+    }
+
+    #[test]
+    fn a_copy_beside_a_send_answer_is_written_once_and_speaks_through_the_send() {
+        for error in [false, true] {
+            let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+            let copy = dispatch::CopyOut {
+                osc: Some("\x1b]52;c;AA==\x07".into()),
+                notice: "copied review".into(),
+                urgent: false,
+            };
+            st.warn("unread warning");
+            snap.send_seq = 1;
+            snap.copy_seq = 1;
+            snap.copy = Some(std::sync::Arc::new(copy.clone()));
+            if error {
+                snap.send_error = Some("copied, but could not record".into());
+            } else {
+                snap.send_outcome = Some(dispatch::SendOutcome {
+                    kind: dispatch::SendKind::Feedback,
+                    items: 1,
+                    to: crate::engine::Destination::clipboard(),
+                    unconfirmed: true,
+                    copy: Some(copy),
+                });
+            }
+            st.observe(&snap);
+            assert_eq!(
+                st.pending_copy.take().as_deref(),
+                Some("\x1b]52;c;AA==\x07")
+            );
+            assert_eq!(
+                st.notice.as_ref().map(|n| (n.text.as_str(), n.urgent)),
+                Some(if error {
+                    ("copied, but could not record", false)
+                } else {
+                    ("copied review", true)
+                })
+            );
+            st.observe(&snap);
+            assert!(st.pending_copy.is_none());
+            handle_key(&mut st, &snap, key("j"), 120);
+            assert_eq!(
+                st.notice.as_ref().map(|n| n.text.as_str()),
+                Some("unread warning")
+            );
+            handle_key(&mut st, &snap, key("j"), 120);
+            assert!(
+                st.notice.is_none(),
+                "the copy did not queue a duplicate notice"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_request_stays_cancel_only_when_a_target_goes_away() {
+        for gone in [TargetState::Left, TargetState::Gone] {
+            let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+            snap.target = Some(pane_target());
+            snap.target_state = TargetState::Live("idle".into());
+            snap.files.clear();
+            handle_key(&mut st, &snap, key("@"), 120);
+            assert!(st.review_box.is_some());
+            snap.target_state = gone;
+            st.observe(&snap);
+            assert!(
+                st.review_box.is_some(),
+                "an empty review still offers n alone"
+            );
+            assert!(st.panes.is_none() && st.pending_command.is_none());
+            assert_eq!(
+                st.review_box.as_ref().unwrap().panel(&snap, 60).footer,
+                "n cancel"
+            );
+            st.review_box = None;
+            st.notify("previous answer");
+            handle_key(&mut st, &snap, key("@"), 120);
+            assert!(st.review_box.is_some() && st.panes.is_none());
+            assert!(st.pending_command.is_none());
+        }
     }
 }

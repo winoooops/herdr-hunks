@@ -72,6 +72,7 @@ impl Hit {
             && state.picker.is_none()
             && state.panes.is_none()
             && state.confirm.is_none()
+            && state.review_box.is_none()
             && state.editor.is_none()
             && state
                 .hover
@@ -745,6 +746,7 @@ pub fn body_is_drawn(state: &ViewState, snapshot: &Snapshot, columns: u16, heigh
         && state.picker.is_none()
         && state.panes.is_none()
         && state.confirm.is_none()
+        && state.review_box.is_none()
         && (matches!(&snapshot.diff, DiffState::Ready(_))
             || snapshot.files.is_empty()
             || state.editor.is_some())
@@ -895,6 +897,12 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
     if snapshot.scope == Scope::Worktree {
         hints.extend(["s stage", "d discard", "D file"]);
     }
+    let (pending, _, _) = review::counts(snapshot);
+    let finish = format!("Y finish ({pending})");
+    if pending > 0 {
+        hints.push(&finish);
+    }
+    hints.push("@ request");
     hints.extend(["? help", "q quit"]);
     while width(&hints.join("  ")) > usize::from(columns) {
         // Keep help and quit until the other hints have gone.
@@ -1027,6 +1035,79 @@ pub fn render(snapshot: &Snapshot, state: &ViewState, columns: u16, height: u16)
             .into_iter()
             .enumerate()
         {
+            let background = &lines[y + 1];
+            let mut line = clip_line(background, 0, x);
+            line.extend(overlay);
+            let right = x + usize::from(panel_width);
+            line.extend(clip_line(background, right, usize::from(columns) - right));
+            lines[y + 1] = line;
+        }
+        hits.clear();
+    }
+    if let Some(b) = &state.review_box {
+        let panel_width = columns.min(72);
+        let panel = b.panel(snapshot, panel_width);
+        let panel_height =
+            (dialog::line_count(&panel, panel_width) + 4).min(usize::from(height) - 2) as u16;
+        let x = usize::from((columns - panel_width) / 2);
+        let scope = match panel.rows.first() {
+            Some(dialog::Row::Text(text)) if b.offers(snapshot).scope_line => Some(text.as_str()),
+            _ => None,
+        };
+        for (y, mut overlay) in dialog::render(&panel, panel_width, panel_height)
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(scope) = scope {
+                let inner = usize::from(panel_width) - 4;
+                if y > 0 && y <= scope.len().div_ceil(inner) {
+                    let start = (y - 1) * inner;
+                    let f = scope.find("f this file").unwrap();
+                    let a = scope.find("a all changes").unwrap();
+                    let file_available = snapshot.selected.as_ref().is_some_and(|key| {
+                        b.scope_available(
+                            snapshot,
+                            &crate::engine::dispatch::ReviewScope::File(key.clone()),
+                        )
+                    });
+                    for (from, to, selected, enabled) in [
+                        (
+                            f,
+                            f + "f this file".len(),
+                            matches!(b.scope, crate::engine::dispatch::ReviewScope::File(_)),
+                            file_available,
+                        ),
+                        (
+                            a,
+                            scope.len(),
+                            b.scope == crate::engine::dispatch::ReviewScope::All,
+                            true,
+                        ),
+                    ] {
+                        let from = from.max(start);
+                        let to = to.min(start + inner);
+                        if from < to {
+                            let col = 3 + from - start;
+                            let mut styled = clip_line(&overlay, 0, col);
+                            let mut words = clip_line(&overlay, col, to - from);
+                            for word in &mut words {
+                                word.style.reverse = selected;
+                                if !enabled {
+                                    word.style.role = Role::Label;
+                                }
+                            }
+                            styled.extend(words);
+                            let right = col + to - from;
+                            styled.extend(clip_line(
+                                &overlay,
+                                right,
+                                usize::from(panel_width) - right,
+                            ));
+                            overlay = styled;
+                        }
+                    }
+                }
+            }
             let background = &lines[y + 1];
             let mut line = clip_line(background, 0, x);
             line.extend(overlay);
@@ -1224,7 +1305,7 @@ mod tests {
         let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Shown, true);
         st.help_open = true;
         st.help_offset = 18;
-        let full_height = keys::KEYS.len() as u16 + 7;
+        let full_height = dialog::line_count(&keys::help_panel(false), 60) as u16 + 7;
         for (columns, height) in [(40, 10), (61, 12), (120, full_height)] {
             st.resize(columns, body_height(&st, &snap, height));
             st.reconcile(&snap);
@@ -1603,9 +1684,14 @@ mod tests {
         st.help_open = true;
         for popup in [false, true] {
             st.popup = popup;
-            let text = render(&snap, &st, 120, keys::KEYS.len() as u16 + 7)
-                .plain()
-                .join("\n");
+            let text = render(
+                &snap,
+                &st,
+                120,
+                dialog::line_count(&keys::help_panel(popup), 60) as u16 + 7,
+            )
+            .plain()
+            .join("\n");
             assert_eq!(
                 text.lines()
                     .any(|l| l.contains("esc") && l.contains("close") && !l.contains("closes")),
@@ -2474,6 +2560,176 @@ mod tests {
             if editing {
                 assert!(output.iter().any(|s| s.contains('_')));
             }
+        }
+    }
+
+    #[test]
+    fn the_finish_box_is_drawn_for_each_row_of_the_table() {
+        use crate::engine::{Target, TargetState};
+        use crate::tui::input::tests::pane_target;
+        for (state, text, keys) in [
+            (
+                TargetState::Live("idle".into()),
+                "Send 2 comments across 1 file to codex · w4:p2?",
+                vec!["Y send", "A pick another pane", "c copy", "n cancel"],
+            ),
+            (
+                TargetState::Live("blocked".into()),
+                "codex is waiting for an approval in w4:p2.",
+                vec!["A pick another pane", "c copy", "n cancel"],
+            ),
+            (
+                TargetState::NoHost,
+                "No host: this viewer runs outside herdr.",
+                vec!["c copy", "n cancel"],
+            ),
+            (
+                TargetState::Clipboard,
+                "Copy 2 comments across 1 file to the clipboard?",
+                vec!["Y copy", "A pick another pane", "n cancel"],
+            ),
+        ] {
+            let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+            snap.target = Some(if state == TargetState::Clipboard {
+                Target::Clipboard
+            } else {
+                pane_target()
+            });
+            snap.target_state = state;
+            snap.comments = std::sync::Arc::new(vec![
+                comment_at(&anchor_on(&snap, 11), "one", 1),
+                comment_at(&anchor_on(&snap, 11), "two", 2),
+            ]);
+            st.review_box = Some(review::ReviewBox::finish());
+            st.reconcile(&snap);
+            let r = render(&snap, &st, 72, 24);
+            let plain = r.plain().join("\n");
+            assert!(plain.contains("┌ Finish"), "{plain}");
+            assert!(plain.contains(text), "{plain}");
+            for key in keys {
+                assert!(plain.contains(key), "{plain}");
+            }
+            if snap.target_state == TargetState::NoHost
+                || snap.target_state == TargetState::Live("blocked".into())
+            {
+                assert!(!plain.contains("Y send"));
+            }
+            assert!(r.hits.is_empty());
+            assert!(!body_is_drawn(&st, &snap, 72, 24));
+            let b = st.review_box.as_ref().unwrap();
+            assert!(b.fits(&snap, 72, 24));
+            assert!(!b.fits(&snap, 39, 24) && !b.fits(&snap, 72, 9));
+            assert_eq!(
+                render(&snap, &st, 39, 10).plain(),
+                vec!["terminal too small"]
+            );
+            assert!(render(&snap, &st, 40, 10)
+                .plain()
+                .iter()
+                .any(|line| line.contains("n cancel")));
+        }
+    }
+
+    #[test]
+    fn the_request_box_draws_its_scope_line_in_three_shapes() {
+        use crate::engine::dispatch::ReviewScope;
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        snap.selected = Some(FileKey {
+            path: "a.rs".into(),
+            staged: false,
+            untracked: false,
+        });
+        snap.files.push(ChangedFile {
+            path: "b.rs".into(),
+            status: ChangedFileStatus::Modified,
+            staged: false,
+            insertions: None,
+            deletions: None,
+        });
+        st.review_box = Some(review::ReviewBox::request(&snap));
+        for columns in [40, 72] {
+            for scope in [
+                ReviewScope::All,
+                ReviewScope::File(snap.selected.clone().unwrap()),
+            ] {
+                st.review_box.as_mut().unwrap().scope = scope.clone();
+                let r = render(&snap, &st, columns, 24);
+                assert!(r.plain().join("\n").contains("Scope  f this file"));
+                let scope_rows = "Scope  f this file   a all changes (2)"
+                    .len()
+                    .div_ceil(usize::from(columns) - 4);
+                let selected: String = r.lines[2..2 + scope_rows]
+                    .iter()
+                    .flatten()
+                    .filter(|span| span.style.reverse)
+                    .map(|span| span.text.as_str())
+                    .collect();
+                assert_eq!(
+                    selected,
+                    if scope == ReviewScope::All {
+                        "a all changes (2)"
+                    } else {
+                        "f this file"
+                    }
+                );
+                for line in &r.lines {
+                    assert_eq!(
+                        line.iter().map(|span| width(&span.text)).sum::<usize>(),
+                        usize::from(columns)
+                    );
+                }
+            }
+        }
+        snap.files.truncate(1);
+        st.review_box = Some(review::ReviewBox::request(&snap));
+        assert!(!render(&snap, &st, 72, 24)
+            .plain()
+            .join("\n")
+            .contains("Scope"));
+        snap.diff = DiffState::Loading;
+        let r = render(&snap, &st, 72, 24);
+        assert!(r
+            .plain()
+            .join("\n")
+            .contains("Scope  f this file   a all changes (1)"));
+        assert!(r.lines[2].iter().any(|span| span.text == "f this file"
+            && span.style.role == Role::Label
+            && !span.style.reverse));
+        snap.files.clear();
+        let plain = render(&snap, &st, 72, 24).plain().join("\n");
+        assert!(plain.contains("nothing to review") && plain.contains("n cancel"));
+        assert!(!plain.contains("Scope") && !plain.contains("Y copy") && !plain.contains("c copy"));
+    }
+
+    #[test]
+    fn the_footer_offers_y_finish_with_the_pending_count() {
+        let (mut snap, st) = review_setup(&[(10, " + ")]);
+        let footer = render(&snap, &st, 200, 24).plain().pop().unwrap();
+        assert!(footer.contains("@ request") && !footer.contains("Y finish"));
+        snap.comments = std::sync::Arc::new(vec![
+            comment_at(&anchor_on(&snap, 11), "one", 1),
+            comment_at(&anchor_on(&snap, 11), "two", 2),
+        ]);
+        let footer = render(&snap, &st, 200, 24).plain().pop().unwrap();
+        assert!(footer.contains("Y finish (2)") && footer.contains("@ request"));
+        let footer = render(&snap, &st, 40, 10).plain().pop().unwrap();
+        assert!(footer.contains("? help") && footer.contains("q quit"));
+        assert!(!footer.contains("Y finish") && !footer.contains("@ request"));
+    }
+
+    #[test]
+    fn the_key_sheet_lists_the_new_rows() {
+        let (snap, mut st) = review_setup(&[(10, " + ")]);
+        st.help_open = true;
+        let plain = render(&snap, &st, 72, 80).plain().join("\n");
+        for text in [
+            "finish: send the review",
+            "request a review",
+            "in the Finish and Request boxes:",
+            "in the editor: Enter save",
+            "y copies a selection made with v",
+        ] {
+            assert!(plain.contains(text), "{text}: {plain}");
         }
     }
 }

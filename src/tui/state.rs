@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::engine::nav::{self, Side, ViewMode};
-use crate::engine::{DiffState, LoadedDiff, Snapshot};
+use crate::engine::{Command, DiffState, LoadedDiff, Snapshot, Target, TargetState};
 use crate::tui::layout::{clamp_scroll, ensure_visible, reanchor, LineSpan};
 use crate::tui::rows::{self, EditorAnchor, EditorPlace, Row, Rows};
 use crate::tui::{cards, review};
@@ -72,6 +72,11 @@ pub struct ViewState {
     pub visual: Option<crate::tui::review::Visual>,
     pub orphan: Option<usize>,
     pub comment_token: u64,
+    pub review_box: Option<review::ReviewBox>,
+    /// The OSC 52 sequence the shell takes once before the next frame.
+    pub pending_copy: Option<String>,
+    /// A command from observe, drained by the shell once.
+    pub pending_command: Option<Command>,
 
     pub pick_token: u64,
     pub socket_path: Option<String>,
@@ -89,6 +94,8 @@ pub struct ViewState {
     notice_kind: NoticeKind,
     seen_target_seq: u64,
     seen_comment_seq: u64,
+    seen_send_seq: u64,
+    seen_copy_seq: u64,
     deferred: VecDeque<String>,
     seen_mark_seq: u64,
     seen_action_seq: u64,
@@ -124,6 +131,9 @@ impl ViewState {
             visual: None,
             orphan: None,
             comment_token: 0,
+            review_box: None,
+            pending_copy: None,
+            pending_command: None,
             pick_token: 0,
             socket_path: None,
             refs_token: 0,
@@ -137,6 +147,8 @@ impl ViewState {
             notice_kind: NoticeKind::Other,
             seen_target_seq: 0,
             seen_comment_seq: 0,
+            seen_send_seq: 0,
+            seen_copy_seq: 0,
             deferred: VecDeque::new(),
             seen_mark_seq: 0,
             seen_action_seq: 0,
@@ -317,9 +329,20 @@ impl ViewState {
         if let Some(picker) = &mut self.panes {
             picker.observe(snapshot);
             if picker.done {
-                if let crate::tui::panes::ReturnTo::Editor(anchor) = &picker.return_to {
-                    if snapshot.target.is_some() {
-                        self.editor = Some(review::Editor::new(anchor.clone()));
+                if snapshot.target.is_some() {
+                    match &picker.return_to {
+                        crate::tui::panes::ReturnTo::Editor(anchor) => {
+                            self.editor = Some(review::Editor::new(anchor.clone()))
+                        }
+                        crate::tui::panes::ReturnTo::Finish => {
+                            self.review_box = Some(review::ReviewBox::finish())
+                        }
+                        crate::tui::panes::ReturnTo::Request(scope) => {
+                            let mut b = review::ReviewBox::request(snapshot);
+                            b.scope = scope.clone();
+                            self.review_box = Some(b);
+                        }
+                        crate::tui::panes::ReturnTo::Nothing => {}
                     }
                 }
                 self.panes = None;
@@ -352,6 +375,85 @@ impl ViewState {
                 } else {
                     self.editor = None;
                 }
+            }
+        }
+        let send_answered = snapshot.send_seq != self.seen_send_seq;
+        if send_answered {
+            self.seen_send_seq = snapshot.send_seq;
+            let answered_box = self
+                .review_box
+                .as_ref()
+                .is_some_and(|b| b.pending.is_some_and(|p| snapshot.send_seq > p));
+            match (&snapshot.send_error, &snapshot.send_outcome) {
+                (Some(error), _) if answered_box => {
+                    if let Some(b) = self.review_box.as_mut() {
+                        b.refuse(
+                            error.clone(),
+                            snapshot
+                                .send_refusal
+                                .clone()
+                                .unwrap_or(crate::engine::dispatch::Refusal::Other),
+                        );
+                    }
+                }
+                (Some(error), _) => {
+                    self.displace_urgent();
+                    self.notify(crate::tui::sanitize::sanitize(error));
+                }
+                (None, Some(outcome)) => {
+                    self.review_box = None;
+                    let (text, urgent) = crate::tui::review::outcome_notice(outcome, snapshot);
+                    self.displace_urgent();
+                    if urgent {
+                        self.warn(text)
+                    } else {
+                        self.notify(text)
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+        let copy_answered = snapshot.copy_seq != self.seen_copy_seq;
+        if copy_answered {
+            self.seen_copy_seq = snapshot.copy_seq;
+            if let Some(copy) = &snapshot.copy {
+                self.pending_copy = copy.osc.clone();
+                if !send_answered {
+                    self.displace_urgent();
+                    if copy.urgent {
+                        self.warn(copy.notice.clone())
+                    } else {
+                        self.notify(copy.notice.clone())
+                    }
+                }
+            }
+        }
+        if let (
+            Some(b),
+            Some(Target::Pane { agent, pane, .. }),
+            TargetState::Left | TargetState::Gone,
+        ) = (&self.review_box, &snapshot.target, &snapshot.target_state)
+        {
+            if b.pending.is_none() && !b.offers(snapshot).nothing {
+                let return_to = match b.kind {
+                    crate::tui::review::BoxKind::Finish => crate::tui::panes::ReturnTo::Finish,
+                    crate::tui::review::BoxKind::Request => {
+                        crate::tui::panes::ReturnTo::Request(b.scope.clone())
+                    }
+                };
+                self.review_box = None;
+                self.displace_urgent();
+                self.notify(format!(
+                    "{} · {} is gone · pick a pane",
+                    crate::tui::sanitize::sanitize(agent),
+                    crate::tui::sanitize::sanitize(pane)
+                ));
+                self.panes_token += 1;
+                self.panes = Some(crate::tui::panes::PanePicker::open(
+                    self.panes_token,
+                    return_to,
+                ));
+                self.pending_command = Some(Command::LoadPanes(self.panes_token));
             }
         }
         let mut answered_mark = false;
@@ -402,7 +504,8 @@ impl ViewState {
         {
             self.pending_action = None;
         }
-        let answered_now = answered_target || answered_mark || answered_action;
+        let answered_now =
+            answered_target || answered_mark || answered_action || send_answered || copy_answered;
         // Warn only for the pair the engine conclusively classified.
         let rewritten = snapshot.mark.as_ref().and_then(|mark| {
             let at = mark.classified_at.clone()?;

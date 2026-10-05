@@ -14,6 +14,8 @@ pub const CLIPBOARD_ROW: &str = "✂ clipboard · copy the review instead of sen
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnTo {
     Nothing,
+    Finish,
+    Request(crate::engine::dispatch::ReviewScope),
     Editor(crate::engine::comments::Anchor),
 }
 

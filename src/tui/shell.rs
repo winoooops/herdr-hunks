@@ -147,12 +147,19 @@ fn run_terminal(
         }
         while let Ok(next) = handle.snapshots.try_recv() {
             state.observe(&next);
+            if let Some(command) = state.pending_command.take() {
+                let _ = handle.commands.send(command);
+            }
+            if let Some(osc) = state.pending_copy.take() {
+                write_copy(&mut io::stdout(), &osc)?;
+            }
             snapshot = next;
             dirty = true;
         }
         if dirty {
             let mut drew_body = false;
             let mut box_fits = false;
+            let mut review_fits = false;
             terminal.draw(|frame| {
                 let area = frame.area();
                 width = area.width;
@@ -164,6 +171,10 @@ fn run_terminal(
                     .confirm
                     .as_ref()
                     .is_some_and(|c| c.fits(width, area.height));
+                review_fits = state
+                    .review_box
+                    .as_ref()
+                    .is_some_and(|b| b.fits(&snapshot, width, area.height));
                 let lines: Vec<_> = rendered
                     .lines
                     .iter()
@@ -186,6 +197,9 @@ fn run_terminal(
             // A box the frame clipped is drawn but not confirmable (spec 9.3).
             if let Some(confirm) = state.confirm.as_mut() {
                 confirm.drawn = box_fits;
+            }
+            if let Some(b) = state.review_box.as_mut() {
+                b.drawn = review_fits;
             }
             dirty = false;
         }
@@ -218,6 +232,12 @@ fn run_terminal(
         }
     }
     Ok(())
+}
+
+/// The OSC 52 write of spec 10.4: raw bytes between frames; the terminal does not answer.
+fn write_copy(out: &mut impl Write, osc: &str) -> io::Result<()> {
+    out.write_all(osc.as_bytes())?;
+    out.flush()
 }
 
 /// The caller must initialize the process environment before starting any threads.
@@ -479,5 +499,32 @@ mod tests {
             disable < leave && leave < show && show < message,
             "{output}"
         );
+    }
+
+    #[test]
+    fn write_copy_emits_exactly_the_osc_sequence_and_flushes() {
+        #[derive(Default)]
+        struct Output {
+            bytes: Vec<u8>,
+            flushed: bool,
+        }
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushed = true;
+                Ok(())
+            }
+        }
+        let osc = "\x1b]52;c;dGVzdA==\x07";
+        let mut output = Output::default();
+        write_copy(&mut output, osc).unwrap();
+        assert_eq!(output.bytes, osc.as_bytes());
+        assert!(output.flushed);
+        let mut bytes = Vec::new();
+        write_copy(&mut bytes, osc).unwrap();
+        assert_eq!(bytes, osc.as_bytes());
     }
 }
