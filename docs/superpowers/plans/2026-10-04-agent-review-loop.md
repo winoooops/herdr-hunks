@@ -10274,3 +10274,5 @@ set, since the diff cursor they would act on is hidden (`s` and `d` tested on an
 review stopped here: fourteen rounds, 22 → 17 → 17 → 13 → 14 → 11 → 12 → 10 → 7 → 5 → 6 → 6 →
 5 → 3 findings, the last three rounds mostly follow-ups to earlier fixes and the last one
 without a structural item.
+
+<!-- codex-reviewed: 2026-10-05T11:00:21Z -->
