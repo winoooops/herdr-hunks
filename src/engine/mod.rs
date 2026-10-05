@@ -8,9 +8,11 @@ pub mod marks;
 pub mod nav;
 pub mod sections;
 pub mod session;
+pub mod target;
 pub mod types;
 pub mod worktree;
 pub use session::{spawn, EngineHandle, SessionConfig};
+pub use target::{Destination, PaneRow, Target, TargetState};
 pub use types::*;
 
 /// D3. The frozen tree spawns git itself, so policy is process-wide.

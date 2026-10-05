@@ -252,6 +252,12 @@ pub fn run(path: PathBuf) -> i32 {
     session.state_dir = config::state_dir(lookup);
     session.host = engine::host::from_env();
     session.socket_path = std::env::var("HERDR_SOCKET_PATH").ok();
+    session.opener_pane = std::env::var("HERDR_HUNKS_OPENER_PANE")
+        .ok()
+        .filter(|p| engine::target::is_pane_id(p));
+    session.own_pane = std::env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|p| engine::target::is_pane_id(p));
     let handle = engine::spawn(runtime.handle(), session);
     install_panic_hook();
     let result = run_terminal(&handle, &config, notice, &path);

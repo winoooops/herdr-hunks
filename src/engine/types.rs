@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::engine::nav::{targets_for_diff, unified_order, Target};
+use crate::engine::target::{PaneRow, TargetState};
 use crate::git::{ChangedFile, ChangedFileStatus, FileDiff, GetGitDiffResponse};
 
 pub const MAX_DIFF_LINES: usize = 200_000;
@@ -309,6 +310,19 @@ pub struct Snapshot {
     pub action_error: Option<String>,
     /// Whether any `apply` form ran for the answered `Act`.
     pub action_applied: bool,
+    /// The pane or clipboard a review goes to; `None` until one is chosen (spec 10.2).
+    pub target: Option<crate::engine::target::Target>,
+    /// The last check's answer; `NoHost` with no target and no host, `Unverified` with no target and a host.
+    pub target_state: TargetState,
+    /// Bumped once per answered target write; `target_error` is that answer.
+    pub target_seq: u64,
+    pub target_error: Option<String>,
+    /// The pick token this write answers; `None` for a comment or check's write.
+    pub target_token: Option<u64>,
+    /// The pane picker's rows under the opening's token, as `refs` are for the base picker.
+    pub panes: Option<Arc<Vec<PaneRow>>>,
+    pub panes_seq: u64,
+    pub panes_error: Option<String>,
 }
 
 impl Snapshot {
@@ -344,6 +358,14 @@ impl Snapshot {
             action_seq: 0,
             action_error: None,
             action_applied: false,
+            target: None,
+            target_state: TargetState::Unverified,
+            target_seq: 0,
+            target_error: None,
+            target_token: None,
+            panes: None,
+            panes_seq: 0,
+            panes_error: None,
         }
     }
 }
@@ -364,6 +386,13 @@ pub enum Command {
     LoadRefs(u64),
     /// Run the apply forms of spec 9.2 for this confirmed action; answered on `action_seq`.
     Act(Action),
+    /// Answer with the agent panes and this opening's token on the snapshot (spec 10.2).
+    LoadPanes(u64),
+    /// Remember the target and echo this pick's token; the next refresh verifies it.
+    SetTarget {
+        token: u64,
+        target: crate::engine::target::Target,
+    },
     Shutdown,
 }
 

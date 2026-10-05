@@ -8,7 +8,8 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Semaphore;
 
 use super::base::{self, MarkRecord, ResolveInputs};
-use super::host;
+use super::host::{self, SessionRef};
+use super::target::{self, PaneRow, Target, TargetState};
 use super::{
     actions, branch, gitver, marks, worktree, Action, Base, BaseSource, Command, Comparison,
     DiffState, FileKey, LoadedDiff, Mark, MarkState, PreImage, QuickBase, RepoState, Scope,
@@ -46,6 +47,14 @@ pub struct SessionConfig {
     pub host: Option<Arc<dyn host::HostClient>>,
     /// `HERDR_SOCKET_PATH` as the shell read it; a remembered target names the socket it was picked on.
     pub socket_path: Option<String>,
+    /// The pane that opened the viewer, from `HERDR_HUNKS_OPENER_PANE`.
+    pub opener_pane: Option<String>,
+    /// The viewer's own split pane, from `HERDR_PANE_ID`.
+    pub own_pane: Option<String>,
+    /// Test hook: a pick's target write consumes one permit before taking the state lock.
+    pub pick_write_gate: Option<Arc<Semaphore>>,
+    /// Test hook for target writes made by comments or checks.
+    pub target_write_gate: Option<Arc<Semaphore>>,
 }
 
 pub struct EngineHandle {
@@ -61,6 +70,12 @@ pub struct EngineHandle {
     pub head_samples: Arc<AtomicUsize>,
     /// Test hook: pre-image readings taken by diff tasks, two per worktree-scope diff.
     pub pre_images: Arc<AtomicUsize>,
+    /// Test hook: pane checks made by refreshes.
+    pub target_checks: Arc<AtomicUsize>,
+    /// Test hook: target writes waiting at a gate.
+    pub target_writes_waiting: Arc<AtomicUsize>,
+    /// Test hook: target writes finished, including superseded writes.
+    pub target_writes_done: Arc<AtomicUsize>,
 }
 
 struct FrozenWatcher {
@@ -101,6 +116,10 @@ impl SessionConfig {
             status_delay: None,
             host: None,
             socket_path: None,
+            opener_pane: None,
+            own_pane: None,
+            pick_write_gate: None,
+            target_write_gate: None,
         }
     }
 }
@@ -176,6 +195,13 @@ struct Job {
     toplevel: Option<String>,
     /// K6's lane: no diff task reads git while a form runs.
     lane: Arc<Semaphore>,
+    generation: u64,
+    target: Option<(Target, u64)>,
+    resolve_target: Option<Option<String>>,
+    host: Option<Arc<dyn host::HostClient>>,
+    socket_path: Option<String>,
+    state_dir: Option<PathBuf>,
+    checks: Arc<AtomicUsize>,
 }
 
 type Marked = (Mark, BTreeSet<String>, Result<(), String>, Option<String>);
@@ -242,6 +268,25 @@ struct State {
     /// The first diff after an attempted action skips the unchanged shortcut.
     fresh_arc_pending: bool,
     action_seq: u64,
+    /// How the published target was chosen; an opener preselection is written on the first comment.
+    target_source: Option<target::Source>,
+    /// Advanced by every pick; older checks and sends are superseded.
+    selection_generation: u64,
+    latest_selection: Arc<AtomicU64>,
+    target_seq: u64,
+    /// The first refresh loads `targets.json` and asks about the opener; later ones only re-verify.
+    target_unresolved: bool,
+    /// A pick or comment must write the in-memory record back to disk.
+    target_write_pending: bool,
+    write_tickets: Arc<AtomicU64>,
+    pick_write_gate: Option<Arc<Semaphore>>,
+    target_checks: Arc<AtomicUsize>,
+    target_writes_waiting: Arc<AtomicUsize>,
+    target_writes_done: Arc<AtomicUsize>,
+    config_opener: Option<String>,
+    own_pane: Option<String>,
+    host: Option<Arc<dyn host::HostClient>>,
+    socket_path: Option<String>,
 }
 
 fn comparison_of(snapshot: &Snapshot) -> Comparison {
@@ -291,6 +336,15 @@ fn markable(
 }
 
 enum Done {
+    Target {
+        generation: u64,
+        token: Option<u64>,
+        written: Result<(), String>,
+    },
+    Panes {
+        token: u64,
+        rows: Result<Vec<PaneRow>, host::HostFailure>,
+    },
     GitCheck(Result<gitver::GitVersion, gitver::GitCheckError>),
     Watcher(Result<(), String>),
     Status {
@@ -304,6 +358,10 @@ enum Done {
         change: Option<Change>,
         /// The carried action's result and whether a form ran; `None` without an action.
         acted: Option<(Result<(), String>, bool)>,
+        /// The selection generation, check result and any session learned.
+        target_check: Option<(u64, Option<TargetState>, Option<SessionRef>)>,
+        /// The first refresh's resolution under the generation it was started for: the target it found and how.
+        target_found: Option<(u64, Option<(Target, target::Source)>)>,
     },
     Diff {
         generation: u64,
@@ -523,6 +581,66 @@ async fn load_rows(
     })
 }
 
+/// A blocking host call bounded by `ENGINE_WAIT` (spec 10.6).
+async fn call_host<T: Send + 'static>(
+    host: Option<Arc<dyn host::HostClient>>,
+    call: impl FnOnce(&dyn host::HostClient) -> Result<T, host::HostFailure> + Send + 'static,
+) -> Result<T, host::HostFailure> {
+    let Some(host) = host else {
+        return Err(host::HostFailure::NoHost(
+            "no host: HERDR_SOCKET_PATH is unset".into(),
+        ));
+    };
+    let handle = tokio::task::spawn_blocking(move || call(host.as_ref()));
+    match tokio::time::timeout(host::ENGINE_WAIT, handle).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => Err(host::HostFailure::After(format!("host call failed: {e}"))),
+        Err(_) => Err(host::HostFailure::After(
+            "the host did not answer in time".into(),
+        )),
+    }
+}
+
+/// Resolve the remembered target, then an agent opener, then nothing (spec 10.2).
+async fn resolve_target(
+    job: &Job,
+    toplevel: &str,
+    opener: Option<&str>,
+) -> Option<(Target, target::Source)> {
+    if let Some(dir) = &job.state_dir {
+        let (targets, problem) = target::load_targets(dir);
+        if let Some(problem) = problem {
+            base::note_problem(dir, &problem);
+        }
+        if let Some(target) = targets.get(toplevel) {
+            return Some((target.clone(), target::Source::Remembered));
+        }
+    }
+    let (opener, socket) = (opener?, job.socket_path.clone()?);
+    if !target::is_pane_id(opener) {
+        return None;
+    }
+    let pane = opener.to_string();
+    let record = call_host(job.host.clone(), move |h| h.pane_get(&pane))
+        .await
+        .ok()?;
+    // A reply about another pane preselects nothing: the id typed into the environment is the one asked about.
+    if record.pane_id != opener {
+        return None;
+    }
+    let agent = record.agent.clone()?;
+    Some((
+        Target::Pane {
+            pane: record.pane_id,
+            socket,
+            agent,
+            session: record.agent_session,
+            title: record.title.unwrap_or_default(),
+        },
+        target::Source::Opener,
+    ))
+}
+
 async fn run_job(job: Job) -> Done {
     // The forms run before the status read, so the rows published with the answer are git's after it.
     let acted = match (&job.change, &job.toplevel) {
@@ -563,6 +681,38 @@ async fn run_job(job: Job) -> Done {
         ),
         _ => None,
     };
+    let toplevel = response
+        .as_ref()
+        .ok()
+        .map(|r| r.repo_root.clone())
+        .filter(|t| !t.is_empty());
+    let target_found = match (&job.resolve_target, &toplevel) {
+        (Some(opener), Some(toplevel)) => Some((
+            job.generation,
+            resolve_target(&job, toplevel, opener.as_deref()).await,
+        )),
+        _ => None,
+    };
+    let checked = match (&job.target, &target_found) {
+        // A resolved target is published before its next refresh verifies it.
+        (_, Some((_, Some((Target::Pane { .. }, _))))) => None,
+        (Some((target @ Target::Pane { pane, .. }, generation)), _) => {
+            job.checks.fetch_add(1, Ordering::SeqCst);
+            let fresh = call_host(job.host.clone(), {
+                let pane = pane.clone();
+                move |h| h.pane_get(&pane)
+            })
+            .await;
+            let checked = target::compare(target, job.socket_path.as_deref(), &fresh);
+            // Only an accepted reply about this live pane can teach its session.
+            let adopted = match (&checked, &fresh) {
+                (Some(TargetState::Live(_)), Ok(record)) => target::adopted_session(target, record),
+                _ => None,
+            };
+            Some((*generation, checked, adopted))
+        }
+        _ => None,
+    };
     // Only agreeing samples can make an empty list markable.
     let confirmed = match (&sampled, base::read_head(&job.cwd).await) {
         (Ok(first), Ok(second)) if *first == second => first.clone(),
@@ -577,6 +727,8 @@ async fn run_job(job: Job) -> Done {
         loaded,
         change: job.change,
         acted,
+        target_found,
+        target_check: checked,
     }
 }
 
@@ -659,6 +811,18 @@ impl State {
                 _ => None,
             },
             lane: self.diff_lane.clone(),
+            generation: self.selection_generation,
+            target: self
+                .snapshot
+                .target
+                .clone()
+                .filter(|t| matches!(t, Target::Pane { .. }))
+                .map(|t| (t, self.selection_generation)),
+            resolve_target: self.target_unresolved.then(|| self.config_opener.clone()),
+            host: self.host.clone(),
+            socket_path: self.socket_path.clone(),
+            state_dir: self.inputs.state_dir.clone(),
+            checks: self.target_checks.clone(),
         };
         let results = results.clone();
         tokio::spawn(async move {
@@ -787,7 +951,7 @@ fn fingerprint(s: &Snapshot) -> String {
         DiffState::Ready(d) => format!("ready:{:p}", Arc::as_ptr(d)),
     };
     format!(
-        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{}",
+        "{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}",
         s.repo,
         serde_json::to_string(&s.files).unwrap_or_default(),
         s.selected,
@@ -814,7 +978,15 @@ fn fingerprint(s: &Snapshot) -> String {
         s.quick.as_ref().map(Arc::as_ptr),
         s.action_seq,
         s.action_error,
-        s.action_applied
+        s.action_applied,
+        s.target,
+        s.target_state,
+        s.target_seq,
+        s.target_error,
+        s.target_token,
+        s.panes.as_ref().map(Arc::as_ptr),
+        s.panes_seq,
+        s.panes_error,
     )
 }
 
@@ -911,6 +1083,9 @@ async fn run(
     diffs_discarded: Arc<AtomicUsize>,
     head_samples: Arc<AtomicUsize>,
     pre_images: Arc<AtomicUsize>,
+    target_checks: Arc<AtomicUsize>,
+    target_writes_waiting: Arc<AtomicUsize>,
+    target_writes_done: Arc<AtomicUsize>,
 ) {
     let mut state = State {
         snapshot: Snapshot::empty(&config.path.to_string_lossy()),
@@ -949,6 +1124,21 @@ async fn run(
         acted: None,
         fresh_arc_pending: false,
         action_seq: 0,
+        target_source: None,
+        selection_generation: 0,
+        latest_selection: Arc::new(AtomicU64::new(0)),
+        target_seq: 0,
+        target_unresolved: true,
+        target_write_pending: false,
+        write_tickets: Arc::new(AtomicU64::new(0)),
+        pick_write_gate: config.pick_write_gate.clone(),
+        target_checks,
+        target_writes_waiting,
+        target_writes_done,
+        config_opener: config.opener_pane.clone(),
+        own_pane: config.own_pane.clone(),
+        host: config.host.clone(),
+        socket_path: config.socket_path.clone(),
     };
     let path = match config.path.canonicalize() {
         Ok(path) if path.is_dir() => path,
@@ -1062,6 +1252,70 @@ async fn run(
                             publish(&mut state, next, &snapshots);
                             state.request_status(&cwd, false, &results_tx, &refreshes);
                         }
+                    }
+                    Command::SetTarget { token, target } => {
+                        state.selection_generation += 1;
+                        // The number the send task and the write guard compare with, stored before anything can read it.
+                        state.latest_selection.store(state.selection_generation, Ordering::SeqCst);
+                        state.target_source = Some(target::Source::Picked);
+                        let mut next = state.snapshot.clone();
+                        next.target = Some(target.clone());
+                        next.target_state = match (&target, &state.host) {
+                            (Target::Clipboard, _) => TargetState::Clipboard,
+                            (_, None) => TargetState::NoHost,
+                            _ => TargetState::Unverified,
+                        };
+                        publish(&mut state, next, &snapshots);
+                        let toplevel = match &state.snapshot.repo {
+                            RepoState::Repo { toplevel, .. } => Some(toplevel.clone()),
+                            _ => None,
+                        };
+                        let dir = state.inputs.state_dir.clone();
+                        let results = results_tx.clone();
+                        let generation = state.selection_generation;
+                        // Every target write takes the next ticket; only the latest ticket's write lands.
+                        let (ticket, tickets) = (state.write_tickets.fetch_add(1, Ordering::SeqCst) + 1, state.write_tickets.clone());
+                        let (gate, done) = (state.pick_write_gate.clone(), state.target_writes_done.clone());
+                        let waiting = state.target_writes_waiting.clone();
+                        tokio::spawn(async move {
+                            // The test seam for a pick's write: it waits here while a test lets another write land.
+                            if let Some(gate) = gate {
+                                waiting.fetch_add(1, Ordering::SeqCst);
+                                gate.acquire().await.expect("gate").forget();
+                                waiting.fetch_sub(1, Ordering::SeqCst);
+                            }
+                            let written = match (dir, toplevel) {
+                                (Some(dir), Some(toplevel)) => tokio::task::spawn_blocking(move || {
+                                    // Skipped, not failed, when a newer write was requested meanwhile: that one carries the newest record.
+                                    target::save_target_if(&dir, &toplevel, &target, ticket, &tickets).map(|_| ()).map_err(|e| e.to_string())
+                                })
+                                .await
+                                .unwrap_or_else(|e| Err(e.to_string())),
+                                (None, _) => Err("no state directory".to_string()),
+                                (_, None) => Err("not a git repository".to_string()),
+                            };
+                            done.fetch_add(1, Ordering::SeqCst);
+                            let _ = results.send(Done::Target { generation, token: Some(token), written });
+                        });
+                        // The new target is checked by the refresh this asks for.
+                        state.request_status(&cwd, false, &results_tx, &refreshes);
+                    }
+                    Command::LoadPanes(token) => {
+                        let toplevel = match &state.snapshot.repo {
+                            RepoState::Repo { toplevel, .. } => toplevel.clone(),
+                            _ => cwd.clone(),
+                        };
+                        let own = state.own_pane.clone();
+                        let host = state.host.clone();
+                        let results = results_tx.clone();
+                        tokio::spawn(async move {
+                            let result = match host {
+                                None => Ok(Vec::new()),
+                                Some(_) => call_host(host, |h| h.pane_list()).await,
+                            };
+                            let rows = result.map(|panes| target::rows(panes, &toplevel, own.as_deref()));
+                            let _ = results.send(Done::Panes { token, rows });
+                        });
                     }
                     Command::LoadRefs(token) => {
                         let toplevel = match &state.snapshot.repo {
@@ -1188,6 +1442,31 @@ async fn run(
                         }
                         publish(&mut state, next, &snapshots);
                     }
+                    Done::Target { generation, token, written } => {
+                        // A newer pick owns its answer; an older answer reaches no picker.
+                        if generation != state.selection_generation {
+                            continue;
+                        }
+                        state.target_seq += 1;
+                        next.target_seq = state.target_seq;
+                        next.target_token = token;
+                        next.target_error = written.err().map(|e| format!("target not remembered: {e}"));
+                        // A later record write retries any failure.
+                        state.target_write_pending |= next.target_error.is_some();
+                        publish(&mut state, next, &snapshots);
+                    }
+                    Done::Panes { token, rows } => {
+                        if token > next.panes_seq {
+                            let (rows, error) = match rows {
+                                Ok(rows) => (rows, None),
+                                Err(failure) => (Vec::new(), Some(format!("could not list panes: {}", failure.message()))),
+                            };
+                            next.panes = Some(Arc::new(rows));
+                            next.panes_error = error;
+                            next.panes_seq = token;
+                            publish(&mut state, next, &snapshots);
+                        }
+                    }
                     Done::Refs { token, result, quick } => {
                         if token > next.refs_seq {
                             let (refs, overflow) = result.unwrap_or_default();
@@ -1204,7 +1483,7 @@ async fn run(
                         next.watcher_error = result.err();
                         publish(&mut state, next, &snapshots);
                     }
-                    Done::Status { response, head, head_seen, head_sampled, confirmed, loaded, change, acted } => {
+                    Done::Status { response, head, head_seen, head_sampled, confirmed, loaded, change, acted, target_found, target_check } => {
                         state.status_in_flight = false;
                         state.in_flight_mark = None;
                         if let (Some(Change::Act(act)), Some((result, applied))) = (&change, &acted) {
@@ -1217,6 +1496,36 @@ async fn run(
                                 state.acted = Some(act.action.diff.clone());
                                 state.fresh_arc_pending = true;
                             }
+                        }
+                        if let Some((generation, found)) = target_found {
+                            state.target_unresolved = false;
+                            // A pick made while the first refresh ran wins over what it resolved.
+                            if let (Some((target, source)), true) = (found, generation == state.selection_generation) {
+                                next.target = Some(target.clone());
+                                state.target_source = Some(source);
+                                // Published unverified; the next refresh's check answers for it.
+                                next.target_state = match (&target, &state.host) {
+                                    (Target::Clipboard, _) => TargetState::Clipboard,
+                                    (Target::Pane { .. }, None) => TargetState::NoHost,
+                                    _ => TargetState::Unverified,
+                                };
+                            }
+                        }
+                        if let Some((generation, checked, adopted)) = target_check {
+                            if generation == state.selection_generation {
+                                if let Some(checked) = checked {
+                                    next.target_state = checked;
+                                }
+                                if let (Some(session), Some(Target::Pane { session: known @ None, .. })) = (adopted, next.target.as_mut()) {
+                                    // Learned from the host; written with the record's next write (a pick or a comment).
+                                    *known = Some(session);
+                                    state.target_write_pending = true;
+                                }
+                            }
+                        }
+                        if next.target.is_none() {
+                            // 10.2's chip precedence: host absence outranks target absence.
+                            next.target_state = if state.host.is_none() { TargetState::NoHost } else { TargetState::Unverified };
                         }
                         // The rows may only claim a commit the refresh bracketed: the opening
                         // sample alone would let rows loaded across a move name a commit whose
@@ -1468,6 +1777,9 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
     let diffs_discarded = Arc::new(AtomicUsize::new(0));
     let head_samples = Arc::new(AtomicUsize::new(0));
     let pre_images = Arc::new(AtomicUsize::new(0));
+    let target_checks = Arc::new(AtomicUsize::new(0));
+    let target_writes_waiting = Arc::new(AtomicUsize::new(0));
+    let target_writes_done = Arc::new(AtomicUsize::new(0));
     runtime.spawn(run(
         config,
         commands_rx,
@@ -1477,6 +1789,9 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
         diffs_discarded.clone(),
         head_samples.clone(),
         pre_images.clone(),
+        target_checks.clone(),
+        target_writes_waiting.clone(),
+        target_writes_done.clone(),
     ));
     EngineHandle {
         commands,
@@ -1486,6 +1801,9 @@ pub fn spawn(runtime: &tokio::runtime::Handle, config: SessionConfig) -> EngineH
         diffs_discarded,
         head_samples,
         pre_images,
+        target_checks,
+        target_writes_waiting,
+        target_writes_done,
     }
 }
 
@@ -1630,6 +1948,530 @@ mod tests {
             DiffState::Ready(d) => Some(d),
             _ => None,
         }
+    }
+
+    fn agent_pane(
+        id: &str,
+        agent: &str,
+        status: &str,
+        session: Option<&str>,
+        cwd: &str,
+    ) -> host::PaneRecord {
+        host::PaneRecord {
+            pane_id: id.into(),
+            agent: Some(agent.into()),
+            agent_status: Some(status.into()),
+            agent_session: session.map(|v| host::SessionRef {
+                kind: "id".into(),
+                value: v.into(),
+            }),
+            cwd: Some(cwd.into()),
+            ..host::PaneRecord::default()
+        }
+    }
+
+    fn pane_target(id: &str, agent: &str, session: Option<&str>) -> Target {
+        Target::Pane {
+            pane: id.into(),
+            socket: "/run/fake.sock".into(),
+            agent: agent.into(),
+            session: session.map(|v| host::SessionRef {
+                kind: "id".into(),
+                value: v.into(),
+            }),
+            title: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_target_is_written_published_unverified_and_then_checked_every_refresh() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let host = host::Scripted::with_panes(vec![agent_pane(
+            "w4:p2",
+            "codex",
+            "idle",
+            Some("s1"),
+            &top,
+        )]);
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.host = Some(host.clone());
+        config.socket_path = Some("/run/fake.sock".into());
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "rows", |s| !s.files.is_empty());
+        assert_eq!(
+            handle.target_checks.load(Ordering::SeqCst),
+            0,
+            "no target, no check"
+        );
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 0,
+                target: pane_target("w4:p2", "codex", Some("s1")),
+            })
+            .unwrap();
+        // Wait for both the write and the check in one predicate.
+        let s = wait_for(&handle, "the pick answered and checked", |s| {
+            s.target_seq == 1
+                && s.target.is_some()
+                && s.target_state == TargetState::Live("idle".into())
+        });
+        assert!(s.target_error.is_none());
+        let (targets, _) = target::load_targets(state.path());
+        assert!(matches!(targets.get(&top), Some(Target::Pane { pane, .. }) if pane == "w4:p2"));
+        // The table changes; the next refresh sees it.
+        host.set_pane(agent_pane("w4:p2", "codex", "blocked", Some("s1"), &top));
+        wait_for(&handle, "blocked", |s| {
+            s.target_state == TargetState::Live("blocked".into())
+        });
+        host.set_pane(agent_pane("w4:p2", "codex", "idle", Some("s2"), &top));
+        wait_for(&handle, "restarted", |s| {
+            s.target_state == TargetState::Restarted("idle".into())
+        });
+        host.set_pane(host::PaneRecord {
+            pane_id: "w4:p2".into(),
+            agent_status: Some("unknown".into()),
+            ..host::PaneRecord::default()
+        });
+        wait_for(&handle, "left", |s| s.target_state == TargetState::Left);
+        host.remove_pane("w4:p2");
+        wait_for(&handle, "gone", |s| s.target_state == TargetState::Gone);
+        // Failed checks do not publish a new target state.
+        *host.list_failure.lock().unwrap() = Some(host::HostFailure::After("deadline".into()));
+        let before = handle.target_checks.load(Ordering::SeqCst);
+        wait_cond("two more checks", || {
+            handle.target_checks.load(Ordering::SeqCst) >= before + 2
+        });
+        assert!(
+            handle
+                .snapshots
+                .try_iter()
+                .all(|s| s.target_state == TargetState::Gone),
+            "a failed check changed the state"
+        );
+        *host.list_failure.lock().unwrap() = Some(host::HostFailure::NoHost("socket gone".into()));
+        wait_for(&handle, "no host", |s| {
+            s.target_state == TargetState::NoHost
+        });
+    }
+
+    #[test]
+    fn a_clipboard_target_needs_no_host_and_a_pane_target_without_one_is_no_host() {
+        let dir = fixture();
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = None;
+        let (_rt, handle) = start_from(config);
+        let s = wait_for(&handle, "rows without a host", |s| {
+            !s.files.is_empty() && s.target_state == TargetState::NoHost
+        });
+        assert!(s.target.is_none());
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 0,
+                target: Target::Clipboard,
+            })
+            .unwrap();
+        let s = wait_for(&handle, "clipboard", |s| s.target_seq == 1);
+        assert_eq!(
+            (s.target.clone(), s.target_state.clone()),
+            (Some(Target::Clipboard), TargetState::Clipboard)
+        );
+        assert_eq!(
+            s.target_error.as_deref(),
+            Some("target not remembered: no state directory")
+        );
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 0,
+                target: pane_target("w4:p2", "codex", None),
+            })
+            .unwrap();
+        let s = wait_for(&handle, "pane without host", |s| s.target_seq == 2);
+        assert_eq!(s.target_state, TargetState::NoHost);
+    }
+
+    #[test]
+    fn a_remembered_target_beats_the_opener_and_the_opener_is_not_written() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let host = host::Scripted::with_panes(vec![
+            agent_pane("w4:p1", "claude", "idle", Some("c1"), &top),
+            agent_pane("w4:p2", "codex", "idle", Some("s1"), &top),
+        ]);
+        // Nothing remembered: the opener pane is preselected, unwritten.
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.host = Some(host.clone());
+        config.socket_path = Some("/run/fake.sock".into());
+        config.opener_pane = Some("w4:p1".into());
+        let (rt, handle) = start_from(config);
+        let s = wait_for(&handle, "opener preselected", |s| s.target.is_some());
+        assert!(
+            matches!(&s.target, Some(Target::Pane { pane, agent, .. }) if pane == "w4:p1" && agent == "claude")
+        );
+        wait_for(&handle, "live", |s| {
+            matches!(s.target_state, TargetState::Live(_))
+        });
+        assert!(
+            target::load_targets(state.path()).0.is_empty(),
+            "the opener was written"
+        );
+        drop(handle);
+        drop(rt);
+        // Remembered: it wins over the opener.
+        target::save_target(
+            state.path(),
+            &top,
+            &pane_target("w4:p2", "codex", Some("s1")),
+        )
+        .unwrap();
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.host = Some(host.clone());
+        config.socket_path = Some("/run/fake.sock".into());
+        config.opener_pane = Some("w4:p1".into());
+        let (_rt, handle) = start_from(config);
+        let s = wait_for(&handle, "remembered target", |s| s.target.is_some());
+        assert!(matches!(&s.target, Some(Target::Pane { pane, .. }) if pane == "w4:p2"));
+        // An opener that runs a shell is nothing.
+        let shell_host = host::Scripted::with_panes(vec![host::PaneRecord {
+            pane_id: "w4:p1".into(),
+            ..host::PaneRecord::default()
+        }]);
+        let empty_state = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(empty_state.path().to_path_buf());
+        config.host = Some(shell_host);
+        config.socket_path = Some("/run/fake.sock".into());
+        config.opener_pane = Some("w4:p1".into());
+        let (_rt, handle) = start_from(config);
+        let s = wait_for(&handle, "rows", |s| !s.files.is_empty() && !s.refreshing);
+        assert!(s.target.is_none());
+        assert_eq!(
+            s.target_state,
+            TargetState::Unverified,
+            "no target and a host: the chip reads no agent"
+        );
+    }
+
+    #[test]
+    fn a_check_answered_after_a_repick_is_dropped() {
+        let dir = fixture();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let host = host::Scripted::with_panes(vec![agent_pane(
+            "w4:p2",
+            "codex",
+            "idle",
+            Some("s1"),
+            &top,
+        )]);
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.host = Some(host.clone());
+        config.socket_path = Some("/run/fake.sock".into());
+        config.poll_interval = Duration::from_secs(3600);
+        // Holds every refresh after its status read, so a check is in flight when the re-pick lands.
+        config.status_delay = Some(Duration::from_millis(400));
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "rows", |s| !s.files.is_empty() && !s.refreshing);
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 0,
+                target: pane_target("w4:p2", "codex", Some("s1")),
+            })
+            .unwrap();
+        wait_for(&handle, "live", |s| {
+            s.target_state == TargetState::Live("idle".into())
+        });
+        // The agent restarts and the reviewer picks the same pane again while a check runs.
+        host.set_pane(agent_pane("w4:p2", "codex", "idle", Some("s2"), &top));
+        handle.commands.send(Command::Refresh).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 0,
+                target: pane_target("w4:p2", "codex", Some("s2")),
+            })
+            .unwrap();
+        let s = wait_for(&handle, "re-pick answered", |s| s.target_seq == 2);
+        assert_eq!(s.target_state, TargetState::Unverified);
+        let s = wait_for(&handle, "its own check", |s| {
+            s.target_state != TargetState::Unverified
+        });
+        assert_eq!(
+            s.target_state,
+            TargetState::Live("idle".into()),
+            "the stale check marked the new pick restarted"
+        );
+    }
+
+    #[test]
+    fn an_opener_reply_about_another_pane_preselects_nothing() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let host = host::Scripted::with_panes(vec![agent_pane(
+            "w4:p2",
+            "codex",
+            "idle",
+            Some("s1"),
+            &top,
+        )]);
+        // The opener is w4:p2; the host answers about w4:p9, an agent pane too.
+        *host.answer_pane_get_with.lock().unwrap() =
+            Some(agent_pane("w4:p9", "claude", "idle", Some("s9"), &top));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.host = Some(host.clone());
+        config.socket_path = Some("/run/fake.sock".into());
+        config.opener_pane = Some("w4:p2".into());
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "rows", |s| !s.files.is_empty());
+        wait_cond("the opener was asked about", || {
+            host.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| *c == "pane.get")
+                .count()
+                >= 1
+        });
+        // The next pane listing publishes the resolved target.
+        handle.commands.send(Command::LoadPanes(1)).unwrap();
+        let s = wait_for(&handle, "a snapshot after the resolution", |s| {
+            s.panes_seq == 1
+        });
+        assert_eq!(
+            s.target, None,
+            "a reply about w4:p9 preselected it for an opener in w4:p2"
+        );
+        assert!(!target::load_targets(state.path()).0.contains_key(&top));
+    }
+
+    #[test]
+    fn a_reply_about_another_pane_teaches_the_target_nothing() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        // The remembered record has no session; the host answers every `pane.get` about another pane.
+        target::save_target(state.path(), &top, &pane_target("w4:p2", "codex", None)).unwrap();
+        let host = host::Scripted::with_panes(vec![agent_pane(
+            "w4:p2",
+            "codex",
+            "idle",
+            Some("s1"),
+            &top,
+        )]);
+        *host.answer_pane_get_with.lock().unwrap() =
+            Some(agent_pane("w4:p9", "codex", "idle", Some("s9"), &top));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.host = Some(host.clone());
+        config.socket_path = Some("/run/fake.sock".into());
+        let (_rt, handle) = start_from(config);
+        wait_for(
+            &handle,
+            "resolved",
+            |s| matches!(&s.target, Some(Target::Pane { pane, .. }) if pane == "w4:p2"),
+        );
+        wait_cond("two replies about the other pane", || {
+            handle.target_checks.load(Ordering::SeqCst) >= 2
+        });
+        *host.answer_pane_get_with.lock().unwrap() = None;
+        // No earlier snapshot may have learned another pane's state or session.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no check about this pane was published"
+            );
+            let Ok(s) = handle.snapshots.try_recv() else {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            };
+            if s.target_state == TargetState::Live("idle".into()) {
+                assert!(
+                    matches!(&s.target, Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s1"),
+                    "learned from its own reply"
+                );
+                break;
+            }
+            assert_eq!(
+                s.target_state,
+                TargetState::Unverified,
+                "a reply about w4:p9 gave w4:p2 a state"
+            );
+            assert!(
+                matches!(&s.target, Some(Target::Pane { session: None, .. })),
+                "a reply about w4:p9 gave w4:p2 a session"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pick_answered_after_a_newer_pick_is_dropped() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let host = host::Scripted::with_panes(vec![agent_pane(
+            "w4:p2",
+            "codex",
+            "idle",
+            Some("s1"),
+            &top,
+        )]);
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.host = Some(host.clone());
+        config.socket_path = Some("/run/fake.sock".into());
+        // Release the older pick first; its superseded answer must reach no picker.
+        let gate = Arc::new(Semaphore::new(0));
+        config.pick_write_gate = Some(gate.clone());
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "rows", |s| !s.files.is_empty());
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 1,
+                target: pane_target("w4:p2", "codex", Some("s1")),
+            })
+            .unwrap();
+        wait_for(&handle, "first pick published", |s| {
+            matches!(&s.target, Some(Target::Pane { .. }))
+        });
+        wait_cond("the first pick is gated", || {
+            handle.target_writes_waiting.load(Ordering::SeqCst) == 1
+        });
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 2,
+                target: Target::Clipboard,
+            })
+            .unwrap();
+        wait_for(&handle, "second pick published", |s| {
+            s.target == Some(Target::Clipboard)
+        });
+        wait_cond("both picks are gated", || {
+            handle.target_writes_waiting.load(Ordering::SeqCst) == 2
+        });
+        gate.add_permits(1);
+        wait_cond("the older write ran", || {
+            handle.target_writes_done.load(Ordering::SeqCst) == 1
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        while let Ok(s) = handle.snapshots.try_recv() {
+            assert_eq!(s.target_seq, 0, "an older pick's answer reached the picker");
+        }
+        gate.add_permits(1);
+        let s = wait_for(&handle, "the newer pick answered", |s| s.target_seq == 1);
+        assert_eq!(
+            (s.target.clone(), s.target_error.clone(), s.target_token),
+            (Some(Target::Clipboard), None, Some(2))
+        );
+        assert_eq!(
+            target::load_targets(state.path()).0.get(&top),
+            Some(&Target::Clipboard)
+        );
+    }
+
+    #[test]
+    fn load_panes_lists_agent_panes_in_groups_and_drops_stale_tokens() {
+        let dir = fixture();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let host = host::Scripted::with_panes(vec![
+            host::PaneRecord {
+                pane_id: "w1:p1".into(),
+                cwd: Some(top.clone()),
+                ..host::PaneRecord::default()
+            },
+            agent_pane("w1:p2", "codex", "idle", None, "/elsewhere"),
+            agent_pane("w1:p3", "claude", "working", None, &format!("{top}/src")),
+            agent_pane("w1:p9", "kimi", "idle", None, &top),
+        ]);
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.host = Some(host.clone());
+        config.socket_path = Some("/run/fake.sock".into());
+        config.own_pane = Some("w1:p9".into());
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "rows", |s| !s.files.is_empty());
+        handle.commands.send(Command::LoadPanes(7)).unwrap();
+        let s = wait_for(&handle, "panes", |s| s.panes_seq == 7);
+        let ids: Vec<_> = s
+            .panes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|r| r.record.pane_id.clone())
+            .collect();
+        assert_eq!(ids, ["w1:p3", "w1:p2"]);
+        assert!(s.panes_error.is_none());
+        // A failure names its reason and keeps the answer flowing.
+        *host.list_failure.lock().unwrap() = Some(host::HostFailure::After("deadline".into()));
+        handle.commands.send(Command::LoadPanes(8)).unwrap();
+        let s = wait_for(&handle, "failure", |s| s.panes_seq == 8);
+        assert_eq!(
+            s.panes_error.as_deref(),
+            Some("could not list panes: deadline")
+        );
+        assert!(s.panes.as_ref().unwrap().is_empty());
+        // An older token's reply never overwrites a newer opening.
+        *host.list_failure.lock().unwrap() = None;
+        handle.commands.send(Command::LoadPanes(3)).unwrap();
+        handle.commands.send(Command::LoadPanes(9)).unwrap();
+        let s = wait_for(&handle, "newest", |s| s.panes_seq == 9);
+        assert_eq!(s.panes.as_ref().unwrap().len(), 2);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(handle.snapshots.try_iter().all(|s| s.panes_seq == 9));
+        // No host: an empty list, no error; the picker then offers the clipboard alone.
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.host = None;
+        let (_rt2, handle2) = start_from(config);
+        handle2.commands.send(Command::LoadPanes(1)).unwrap();
+        let s = wait_for(&handle2, "no host panes", |s| s.panes_seq == 1);
+        assert!(s.panes.as_ref().unwrap().is_empty() && s.panes_error.is_none());
     }
 
     #[test]
