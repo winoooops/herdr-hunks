@@ -388,6 +388,7 @@ pub fn build(
         .unwrap_or(0);
     let plain = rows;
     let mut after: Vec<Vec<Row>> = vec![Vec::new(); plain.len()];
+    let mut orphans = orphans.to_vec();
     for comment in comments {
         if let Some(row) = attach_row(diff, &row_of_target, &comment.anchor) {
             let target = anchor_target(diff, &comment.anchor);
@@ -400,6 +401,12 @@ pub fn build(
                         line,
                     }),
             );
+        } else if comment.is_editable()
+            && comment.anchor.key == diff.key
+            && matches!(comment.anchor.comparison, AnchorComparison::Branch { .. })
+                == matches!(diff.comparison, Comparison::Branch { .. })
+        {
+            orphans.push(comment);
         }
     }
     let mut rows = Vec::with_capacity(plain.len());
@@ -418,7 +425,7 @@ pub fn build(
         row_of_target,
         orphan_tops: Vec::new(),
     };
-    append_orphans(&mut rows, orphans, card_width.max(MIN_WIDTH));
+    append_orphans(&mut rows, &orphans, card_width.max(MIN_WIDTH));
     splice_editor(&mut rows, Some(diff), editor);
     rows
 }
@@ -707,6 +714,58 @@ mod tests {
             .rows
             .iter()
             .any(|r| matches!(r, Row::Card { id, target: None, .. } if id == "o")));
+    }
+
+    #[test]
+    fn editable_comments_on_missing_lines_join_the_orphans() {
+        let diff = loaded(&[(10, 10, &[('+', "a"), ('+', "b"), ('+', "c")])]);
+        let mut missing = comment("m", &diff.key, Side::Additions, 999, Span::Line);
+        let mut gone = missing.clone();
+        gone.id = "g".into();
+        gone.anchor.key.path = "gone.rs".into();
+        for state in [
+            CommentState::Pending,
+            CommentState::Unconfirmed {
+                stamp: stamp(),
+                before: Vec::new(),
+            },
+        ] {
+            missing.state = state;
+            for mode in [ViewMode::Unified, ViewMode::Split] {
+                let rows = build(&diff, mode, &[&missing], &[], 80, None);
+                let top = rows.rows.len() - 3;
+                assert_eq!(rows.orphan_tops, [(top, missing.id.clone())]);
+                assert!(matches!(rows.rows[top - 1], Row::Orphans { count: 1 }));
+                assert!(matches!(
+                    &rows.rows[top],
+                    Row::Card { target: None, line: CardLine::Top { title, .. }, .. }
+                        if title == &format!("src/f.rs:999 · Bug · {}", cards::state_word(&missing.state))
+                ));
+
+                let rows = build(&diff, mode, &[&missing], &[&gone], 80, None);
+                assert_eq!(
+                    rows.orphan_tops
+                        .iter()
+                        .map(|(_, id)| id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["g", "m"]
+                );
+                assert_eq!(
+                    rows.rows
+                        .iter()
+                        .filter(|r| matches!(r, Row::Orphans { count: 2 }))
+                        .count(),
+                    1
+                );
+            }
+        }
+        missing.state = CommentState::Sent(stamp());
+        let rows = build(&diff, ViewMode::Unified, &[&missing], &[], 80, None);
+        assert!(rows.orphan_tops.is_empty());
+        assert!(!rows
+            .rows
+            .iter()
+            .any(|r| matches!(r, Row::Card { .. } | Row::Orphans { .. })));
     }
 
     #[test]

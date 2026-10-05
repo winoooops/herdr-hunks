@@ -637,11 +637,11 @@ impl ViewState {
             editor.clone(),
         ));
         let orphans = rows::orphans(&snapshot.comments, snapshot);
-        if self.orphan.is_some_and(|i| i >= orphans.len()) {
-            self.orphan = None;
-        }
         let card_width = cards::card_width(usize::from(body_width), self.mode);
         let Some(diff) = diff else {
+            if self.orphan.is_some_and(|i| i >= orphans.len()) {
+                self.orphan = None;
+            }
             self.rows = if !orphans.is_empty() || editor.is_some() {
                 Some(rows::orphans_only(&orphans, card_width, editor.as_ref()))
             } else {
@@ -675,6 +675,9 @@ impl ViewState {
             card_width,
             editor.as_ref(),
         );
+        if self.orphan.is_some_and(|i| i >= rows.orphan_tops.len()) {
+            self.orphan = None;
+        }
 
         if !same_file {
             self.offset = 0;

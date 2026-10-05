@@ -786,6 +786,20 @@ fn act(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction, width: u16
 
 fn move_cursor(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction) -> Outcome {
     use KeyAction::*;
+    if (state.orphan.is_some() || state.cursor.is_none())
+        && matches!(action, HalfPageDown | HalfPageUp)
+    {
+        let Some(rows) = &state.rows else {
+            return Outcome::Inert;
+        };
+        let step = state.body_height as isize;
+        return scroll(
+            &mut state.offset,
+            if action == HalfPageDown { step } else { -step },
+            rows.rows.len(),
+            state.body_height,
+        );
+    }
     let orphan_count = state.rows.as_ref().map_or(0, |r| r.orphan_tops.len());
     if let Some(index) = state.orphan {
         match action {
@@ -3367,6 +3381,89 @@ pub(crate) mod tests {
         handle_key(&mut st, &snap, key("k"), 120);
         assert_eq!(st.orphan, None);
         let _ = last;
+    }
+
+    #[test]
+    fn a_missing_line_comment_is_reachable_editable_and_deletable() {
+        let (mut snap, mut st) = review_setup(&[(10, "+++")]);
+        let missing = comment_at(&anchor_on(&snap, 999), "missing hunk", 1);
+        snap.comments = std::sync::Arc::new(vec![missing.clone()]);
+        st.reconcile(&snap);
+        handle_key(&mut st, &snap, key("G"), 120);
+        assert_eq!(handle_key(&mut st, &snap, key("j"), 120), Outcome::Redraw);
+        st.reconcile(&snap);
+        assert_eq!(st.orphan, Some(0));
+        assert_eq!(handle_key(&mut st, &snap, key("u"), 120), Outcome::Redraw);
+        st.reconcile(&snap);
+        assert_eq!(
+            st.editor.as_ref().map(|e| e.text.as_str()),
+            Some("missing hunk")
+        );
+        assert_eq!(st.orphan, Some(0));
+        handle_key(&mut st, &snap, key("Esc"), 120);
+        st.reconcile(&snap);
+        assert_eq!(st.orphan, Some(0));
+        assert!(matches!(
+            handle_key(&mut st, &snap, key("x"), 120),
+            Outcome::Engine(Command::DeleteComment { seen }) if seen.id == missing.id
+        ));
+    }
+
+    #[test]
+    fn page_keys_scroll_a_tall_orphan_without_losing_its_cursor() {
+        for ready in [false, true] {
+            let (mut snap, mut st) = review_setup(if ready { &[(10, "+++")] } else { &[] });
+            let mut comment = comment_at(&anchor_on(&snap, 999), &["line"; 100].join("\n"), 1);
+            comment.anchor.key.path = "gone.rs".into();
+            snap.comments = std::sync::Arc::new(vec![comment]);
+            if !ready {
+                snap.files.clear();
+                snap.diff = DiffState::Idle;
+            }
+            st.resize(120, 20);
+            st.reconcile(&snap);
+            handle_key(&mut st, &snap, key("G"), 120);
+            assert_eq!(handle_key(&mut st, &snap, key("j"), 120), Outcome::Redraw);
+            assert_eq!((st.offset, st.orphan), (0, Some(0)));
+            let down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+            let up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+            let height = usize::from(st.body_height);
+            for (key, pages) in [
+                (down, 1),
+                (down, 2),
+                (up, 1),
+                (key("ctrl+d"), 2),
+                (key("ctrl+u"), 1),
+            ] {
+                assert_eq!(handle_key(&mut st, &snap, key, 120), Outcome::Redraw);
+                st.reconcile(&snap);
+                assert_eq!(
+                    (st.offset, st.orphan),
+                    (pages * height, Some(0)),
+                    "ready={ready}, key={key:?}"
+                );
+            }
+            let end = st.rows.as_ref().unwrap().rows.len() - height;
+            for (key, limit) in [
+                (down, end),
+                (up, 0),
+                (key("ctrl+d"), end),
+                (key("ctrl+u"), 0),
+            ] {
+                while st.offset != limit {
+                    let next = if limit == 0 {
+                        st.offset.saturating_sub(height)
+                    } else {
+                        (st.offset + height).min(end)
+                    };
+                    assert_eq!(handle_key(&mut st, &snap, key, 120), Outcome::Redraw);
+                    st.reconcile(&snap);
+                    assert_eq!((st.offset, st.orphan), (next, Some(0)));
+                }
+                assert_eq!(handle_key(&mut st, &snap, key, 120), Outcome::Inert);
+                assert_eq!((st.offset, st.orphan), (limit, Some(0)));
+            }
+        }
     }
 
     #[test]
