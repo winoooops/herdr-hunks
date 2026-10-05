@@ -77,7 +77,7 @@ src/tui/shell.rs             SessionConfig wiring (host, opener, socket, nonce);
                              copy_seq (Tasks 2, 8)
 tests/support/mod.rs         the fake host: pane.list, agent.prompt, agent_status/agent_session on panes,
                              scripted failures and delays, recorded requests (Task 1)
-tests/readonly_guarantee.rs  the review-loop recording test: fake host, the three methods, the file list (Task 9)
+tests/review_loop_guarantee.rs  NEW: the review-loop recording test: fake host, the three methods, the file list (Task 9)
 tests/e2e_real_herdr.rs      A, the no-agent picker, a clipboard send (Task 9)
 README.md, .zh-CN, .ja       "Review loop" section (Task 9)
 AGENTS.md                    the first rule, the reserved-key line, the state-file list (Task 9)
@@ -254,6 +254,19 @@ Append to `src/herdr/client.rs`'s test module. Each test starts a real listener 
         let took = started.elapsed();
         // A per-call socket timeout alone would run on for 2 s × 22 bytes.
         assert!(took < DEADLINE + Duration::from_secs(1), "{took:?}");
+    }
+
+    #[test]
+    fn a_server_that_never_reads_fails_the_write_at_the_deadline() {
+        // The kernel's socket buffer absorbs a small request; a four-megabyte one blocks the writer
+        // until the peer reads, and the peer never does.
+        let (_dir, client) = server(|_stream| std::thread::sleep(Duration::from_secs(8)));
+        let big = "x".repeat(4 << 20);
+        let started = Instant::now();
+        let error = client.request("agent.prompt", json!({ "target": "w1:p2", "text": big })).unwrap_err();
+        assert!(matches!(error, HerdrClientError::Write(_)), "{error:?}");
+        let took = started.elapsed();
+        assert!(took >= DEADLINE && took < DEADLINE + Duration::from_secs(1), "{took:?}");
     }
 
     #[test]
@@ -476,7 +489,7 @@ The byte-at-a-time read is deliberate: a `BufReader` would hold its own timeout 
 - [ ] **Step 4: Run the client tests**
 
 Run: `cargo test --locked --lib herdr::client`
-Expected: all six pass (the two captured-fixture tests, the four new ones); the two deadline tests take about five seconds each.
+Expected: all seven pass (the two captured-fixture tests, the five new ones); the three deadline tests take about five seconds each.
 
 - [ ] **Step 5: The trait, the production wrapper and the scripted host**
 
@@ -603,10 +616,17 @@ impl HostClient for HerdrHost {
     }
 
     fn agent_prompt(&self, pane: &str, text: &str) -> Result<(), HostFailure> {
-        self.client
+        let response = self
+            .client
             .request("agent.prompt", json!({ "target": pane, "text": text }))
-            .map(|_| ())
-            .map_err(classify)
+            .map_err(classify)?;
+        // The envelope the host documents: `{"id", "result": {"type": "agent_prompted", ...}}`. Anything
+        // else arrived after the line was written and proves nothing: uncertain, never success.
+        if response["result"].is_object() && response["result"]["type"].as_str().is_some() {
+            Ok(())
+        } else {
+            Err(HostFailure::After(format!("agent.prompt reply not understood: {response}")))
+        }
     }
 }
 
@@ -783,10 +803,11 @@ The session tests build `SessionConfig` as a struct literal in `start` (`src/eng
     }
 
     fn start(dir: &std::path::Path, allow: Arc<AtomicBool>) -> (tokio::runtime::Runtime, EngineHandle) {
-        start_with(test_config(dir, allow))
+        start_from(test_config(dir, allow))
     }
 
-    fn start_with(config: SessionConfig) -> (tokio::runtime::Runtime, EngineHandle) {
+    // `start_with` and `wait_until` already exist in this module with other signatures; these are new names.
+    fn start_from(config: SessionConfig) -> (tokio::runtime::Runtime, EngineHandle) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -797,7 +818,7 @@ The session tests build `SessionConfig` as a struct literal in `start` (`src/eng
     }
 ```
 
-Every existing test keeps calling `start`; the new tests of Tasks 2-5 call `start_with(test_config(..))` after setting `host`, `state_dir` and the other seams (the helper is `test_config`, not `config`, because those tests bind a local named `config` and a local shadows a function of the same name). The session tests also hold nineteen other complete `SessionConfig { .. }` literals (`grep -n 'SessionConfig {' src/engine/session.rs`): give each one `..SessionConfig::production(dir.to_path_buf())` as its last line (struct update syntax, with `dir` being whatever path that literal uses), so every field this plan adds defaults there without further edits. `tests/readonly_guarantee.rs` and `tests/hunk_actions.rs` use `production` already, so nothing changes there.
+Every existing test keeps calling `start`; the new tests of Tasks 2-5 call `start_from(test_config(..))` after setting `host`, `state_dir` and the other seams (the helper is `test_config`, not `config`, because those tests bind a local named `config` and a local shadows a function of the same name; it is `start_from`, not `start_with`, because the module already has a four-argument `start_with`). The session tests also hold nineteen other complete `SessionConfig { .. }` literals (`grep -n 'SessionConfig {' src/engine/session.rs`): give each one `..SessionConfig::production(dir.to_path_buf())` as its last line (struct update syntax, with `dir` being whatever path that literal uses), so every field this plan adds defaults there without further edits. `tests/readonly_guarantee.rs` and `tests/hunk_actions.rs` use `production` already, so nothing changes there.
 
 - [ ] **Step 7: The fake host learns the three methods**
 
@@ -810,7 +831,7 @@ In `tests/support/mod.rs`, teach `FakeHerdr` the two new methods and the failure
     silent: Arc<AtomicBool>,
 ```
 
-and in the match on the method, before `_ =>`:
+`silent` keeps the accepted stream open, unanswered, for six seconds (longer than the client's deadline) rather than dropping it, so what is tested is the deadline, not an EOF; `reply_raw: Arc<Mutex<Option<serde_json::Value>>>` makes the fake answer every request with the given JSON verbatim (an envelope the client must not mistake for success), with `pub fn reply_raw(&self, value: Option<serde_json::Value>)` to set and clear it. In the match on the method, before `_ =>`:
 
 ```rust
                                 "pane.list" => Ok(serde_json::json!({
@@ -827,7 +848,7 @@ and in the match on the method, before `_ =>`:
                                 },
 ```
 
-Before writing the reply: `if silent_flag.load(Ordering::Relaxed) { continue; }` (the stream drops unanswered) and `if let Some(delay) = *delay.lock().unwrap() { std::thread::sleep(delay); }`. Public controls:
+Before writing the reply: `if silent_flag.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_secs(6)); continue; }` (the stream stays open and unanswered past the client's deadline, then drops), `if let Some(raw) = raw_reply.lock().unwrap().clone() { write raw as the whole reply line; continue; }`, and `if let Some(delay) = *delay.lock().unwrap() { std::thread::sleep(delay); }`. Public controls:
 
 ```rust
     pub fn fail_prompt(&self, code: &str, message: &str) { *self.prompt_failure.lock().unwrap() = Some(serde_json::json!({ "code": code, "message": message })); }
@@ -863,8 +884,16 @@ fn the_host_client_speaks_the_three_methods_over_the_socket() {
     );
     fake.clear_prompt_failure();
     fake.go_silent(true);
+    let started = std::time::Instant::now();
     assert!(matches!(host.agent_prompt("w1:p2", "x"), Err(HostFailure::After(_))));
+    assert!(started.elapsed() >= herdr_hunks::herdr::client::DEADLINE, "the silent host held the stream open and the deadline decided");
     fake.go_silent(false);
+    // A reply the client cannot understand after writing is uncertain, never a success.
+    fake.reply_raw(Some(serde_json::json!({})));
+    assert!(matches!(host.agent_prompt("w1:p2", "x"), Err(HostFailure::After(_))));
+    fake.reply_raw(Some(serde_json::Value::Null));
+    assert!(matches!(host.agent_prompt("w1:p2", "x"), Err(HostFailure::After(_))));
+    fake.reply_raw(None);
     assert!(matches!(host.pane_get("w9:p9"), Err(HostFailure::Api { code, .. }) if code == "pane_not_found"));
     fake.stop();
     // The socket file is gone: NoHost, not a phase.
@@ -1476,10 +1505,10 @@ Expected: five pass. The interfaces block above gains `pub fn adopted_session(ta
 
 - [ ] **Step 5: Snapshot, commands and the session: the tests**
 
-Add to `src/engine/session.rs`'s tests, using Task 1's `config`/`start_with` and `host::Scripted`, and one more helper beside `wait_for`, for conditions no snapshot announces (a counter, a file), because `wait_for`'s predicate runs only when a snapshot arrives and an unchanged state is never republished:
+Add to `src/engine/session.rs`'s tests, using Task 1's `test_config`/`start_from` and `host::Scripted`, and one more helper beside `wait_for`, for conditions no snapshot announces (a counter, a file), because `wait_for`'s predicate runs only when a snapshot arrives and an unchanged state is never republished (the module already has a `wait_until<T>` with another shape; this one is `wait_cond`):
 
 ```rust
-    fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
+    fn wait_cond(what: &str, mut check: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if check() {
@@ -1525,7 +1554,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         config.state_dir = Some(state.path().to_path_buf());
         config.host = Some(host.clone());
         config.socket_path = Some("/run/fake.sock".into());
-        let (_rt, handle) = start_with(config);
+        let (_rt, handle) = start_from(config);
         wait_for(&handle, "rows", |s| !s.files.is_empty());
         assert_eq!(handle.target_checks.load(Ordering::SeqCst), 0, "no target, no check");
         handle.commands.send(Command::SetTarget(pane_target("w4:p2", "codex", Some("s1")))).unwrap();
@@ -1550,7 +1579,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         // snapshot does, because an unchanged state is never republished) and nothing new arrives.
         *host.list_failure.lock().unwrap() = Some(host::HostFailure::After("deadline".into()));
         let before = handle.target_checks.load(Ordering::SeqCst);
-        wait_until("two more checks", || handle.target_checks.load(Ordering::SeqCst) >= before + 2);
+        wait_cond("two more checks", || handle.target_checks.load(Ordering::SeqCst) >= before + 2);
         assert!(handle.snapshots.try_iter().all(|s| s.target_state == TargetState::Gone), "a failed check changed the state");
         *host.list_failure.lock().unwrap() = Some(host::HostFailure::NoHost("socket gone".into()));
         wait_for(&handle, "no host", |s| s.target_state == TargetState::NoHost);
@@ -1561,7 +1590,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         let dir = fixture();
         let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.state_dir = None;
-        let (_rt, handle) = start_with(config);
+        let (_rt, handle) = start_from(config);
         wait_for(&handle, "rows", |s| !s.files.is_empty());
         let s = wait_for(&handle, "no target, no host", |s| s.target_state == TargetState::NoHost);
         assert!(s.target.is_none());
@@ -1589,7 +1618,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         config.host = Some(host.clone());
         config.socket_path = Some("/run/fake.sock".into());
         config.opener_pane = Some("w4:p1".into());
-        let (rt, handle) = start_with(config);
+        let (rt, handle) = start_from(config);
         let s = wait_for(&handle, "opener preselected", |s| s.target.is_some());
         assert!(matches!(&s.target, Some(Target::Pane { pane, agent, .. }) if pane == "w4:p1" && agent == "claude"));
         wait_for(&handle, "live", |s| matches!(s.target_state, TargetState::Live(_)));
@@ -1603,7 +1632,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         config.host = Some(host.clone());
         config.socket_path = Some("/run/fake.sock".into());
         config.opener_pane = Some("w4:p1".into());
-        let (_rt, handle) = start_with(config);
+        let (_rt, handle) = start_from(config);
         let s = wait_for(&handle, "remembered target", |s| s.target.is_some());
         assert!(matches!(&s.target, Some(Target::Pane { pane, .. }) if pane == "w4:p2"));
         // An opener that runs a shell is nothing.
@@ -1614,7 +1643,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         config.host = Some(shell_host);
         config.socket_path = Some("/run/fake.sock".into());
         config.opener_pane = Some("w4:p1".into());
-        let (_rt, handle) = start_with(config);
+        let (_rt, handle) = start_from(config);
         let s = wait_for(&handle, "rows", |s| !s.files.is_empty() && !s.refreshing);
         assert!(s.target.is_none());
         assert_eq!(s.target_state, TargetState::Unverified, "no target and a host: the chip reads no agent");
@@ -1631,7 +1660,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         config.poll_interval = Duration::from_secs(3600);
         // Holds every refresh after its status read, so a check is in flight when the re-pick lands.
         config.status_delay = Some(Duration::from_millis(400));
-        let (_rt, handle) = start_with(config);
+        let (_rt, handle) = start_from(config);
         wait_for(&handle, "rows", |s| !s.files.is_empty() && !s.refreshing);
         handle.commands.send(Command::SetTarget(pane_target("w4:p2", "codex", Some("s1")))).unwrap();
         wait_for(&handle, "live", |s| s.target_state == TargetState::Live("idle".into()));
@@ -1660,7 +1689,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         config.host = Some(host.clone());
         config.socket_path = Some("/run/fake.sock".into());
         config.own_pane = Some("w1:p9".into());
-        let (_rt, handle) = start_with(config);
+        let (_rt, handle) = start_from(config);
         wait_for(&handle, "rows", |s| !s.files.is_empty());
         handle.commands.send(Command::LoadPanes(7)).unwrap();
         let s = wait_for(&handle, "panes", |s| s.panes_seq == 7);
@@ -1684,7 +1713,7 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         // No host: an empty list, no error; the picker then offers the clipboard alone.
         let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.host = None;
-        let (_rt2, handle2) = start_with(config);
+        let (_rt2, handle2) = start_from(config);
         handle2.commands.send(Command::LoadPanes(1)).unwrap();
         let s = wait_for(&handle2, "no host panes", |s| s.panes_seq == 1);
         assert!(s.panes.as_ref().unwrap().is_empty() && s.panes_error.is_none());
@@ -1698,11 +1727,11 @@ Expected: compile errors (`Command::SetTarget`, `Snapshot.target`, `EngineHandle
 
 - [ ] **Step 7: Types**
 
-In `src/engine/types.rs`, import `use crate::engine::target::{PaneRow, Target, TargetState};` and add to `Snapshot`, after `action_applied`:
+In `src/engine/types.rs`, `nav::Target` is already imported (it types `LoadedDiff.targets`), so the review target is written by path there: `use crate::engine::target::{PaneRow, TargetState};` and `crate::engine::target::Target` in the field; `engine/mod.rs`'s `pub use target::Target` is what everyone else imports. Add to `Snapshot`, after `action_applied`:
 
 ```rust
     /// The pane or clipboard a review goes to; `None` until one is chosen (spec 10.2).
-    pub target: Option<Target>,
+    pub target: Option<crate::engine::target::Target>,
     /// The last check's answer; `NoHost` with no target and no host, `Unverified` with no target and a host.
     pub target_state: TargetState,
     /// Bumped once per answered `SetTarget`; `target_error` is that answer.
@@ -2140,8 +2169,7 @@ mod tests {
         a.transact(Operation::Edit { id: "u1".into(), category: Category::Bug, text: "maybe not".into(), seen: unconfirmed.clone() }, 10).unwrap();
         let edited = a.comments().iter().find(|c| c.id == "u1").unwrap().clone();
         assert_eq!((edited.text.as_str(), edited.is_pending()), ("maybe not", true));
-        a.settle(10, "abc123", Settlement::Sent).unwrap();
-        assert!(a.comments().iter().find(|c| c.id == "u1").unwrap().is_pending(), "the late success found no record under its nonce");
+        // (Task 5's settlement test proves a late success for `abc123` then settles nothing.)
         a.transact(Operation::Delete { id: "u1".into(), seen: edited }, 11).unwrap();
         assert!(a.comments().iter().all(|c| c.id != "u1"));
     }
@@ -2261,6 +2289,23 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_expiry_write_on_load_still_shows_the_loaded_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        store.transact(Operation::Add(comment("fine", "kept", 1)), 1_000).unwrap();
+        let mut stale = comment("stale", "x", 2);
+        stale.state = CommentState::Sending { stamp: Stamp { at: 900, ..stamp("aaaaaa") }, before: None };
+        store.transact(Operation::Add(stale), 1_000).unwrap();
+        // Opened later, the expiry must be written; when it cannot be, the records are still shown.
+        let mut reopened = Store::open_for_tests_with_failing_writes(dir.path(), "/repo", 1_100);
+        assert_eq!(reopened.comments().len(), 2, "a failed expiry write hid the loaded comments");
+        assert!(matches!(reopened.comments()[1].state, CommentState::Sending { .. }), "shown as the file holds it");
+        reopened.fail_writes_for_tests(false);
+        reopened.refresh(1_101);
+        assert!(matches!(reopened.comments()[1].state, CommentState::Unconfirmed { .. }));
+    }
+
+    #[test]
     fn a_moved_mtime_is_reread_and_a_still_one_is_not() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = open(dir.path());
@@ -2282,6 +2327,11 @@ mod tests {
         store.transact(Operation::Add(comment("b", "x", 2)), 2).unwrap();
         assert_eq!(store.comments().len(), 2);
         assert_eq!(store.journal_len(), 0, "there is nothing to journal: nothing could ever be written");
+        // A stale edit (the record changed since) is refused here as it is on disk.
+        let seen_then = comment("a", "x", 1);
+        store.transact(Operation::Edit { id: "a".into(), category: Category::Bug, text: "first edit".into(), seen: seen_then.clone() }, 3).unwrap();
+        assert_eq!(store.transact(Operation::Edit { id: "a".into(), category: Category::Bug, text: "stale".into(), seen: seen_then }, 4).unwrap_err(), "No comment selected.");
+        assert_eq!(store.comments()[0].text, "first edit");
     }
 
     #[test]
@@ -2884,6 +2934,9 @@ impl Store {
         };
         // The other worktrees' arrays, kept for this write and for the next claim or settlement's.
         self.others = all.clone();
+        // What the file holds, kept if the write below fails: a store that cannot persist an expiry
+        // must still show the comments it read.
+        let loaded = comments.clone();
         let mut changed = false;
         let mut dropped = None;
         let mut kept_journal = Vec::new();
@@ -2911,18 +2964,26 @@ impl Store {
         };
         changed |= expire(&mut comments, now);
         if changed {
-            #[cfg(test)]
-            if self.fail_writes {
-                return Err(TxError::Io(format!("{COMMENTS_FILE}: write failed (test)")));
+            let written = (|| -> Result<(), TxError> {
+                #[cfg(test)]
+                if self.fail_writes {
+                    return Err(TxError::Io(format!("{COMMENTS_FILE}: write failed (test)")));
+                }
+                all.insert(
+                    self.toplevel.clone(),
+                    serde_json::to_value(&comments).map_err(|e| TxError::Io(e.to_string()))?,
+                );
+                let tmp = dir.join(format!("{COMMENTS_FILE}.{}.tmp", std::process::id()));
+                std::fs::write(&tmp, serde_json::to_vec_pretty(&all).unwrap_or_default())
+                    .map_err(|e| TxError::Io(format!("{COMMENTS_FILE}: {e}")))?;
+                std::fs::rename(&tmp, &path).map_err(|e| TxError::Io(format!("{COMMENTS_FILE}: {e}")))
+            })();
+            if let Err(e) = written {
+                // The screen shows what the file holds, never a change the file does not.
+                self.comments = loaded;
+                self.mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                return Err(e);
             }
-            all.insert(
-                self.toplevel.clone(),
-                serde_json::to_value(&comments).map_err(|e| TxError::Io(e.to_string()))?,
-            );
-            let tmp = dir.join(format!("{COMMENTS_FILE}.{}.tmp", std::process::id()));
-            std::fs::write(&tmp, serde_json::to_vec_pretty(&all).unwrap_or_default())
-                .map_err(|e| TxError::Io(format!("{COMMENTS_FILE}: {e}")))?;
-            std::fs::rename(&tmp, &path).map_err(|e| TxError::Io(format!("{COMMENTS_FILE}: {e}")))?;
         }
         self.journal = kept_journal;
         self.mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
@@ -2945,9 +3006,13 @@ impl Store {
     /// with the notice when the operation was refused or could not be written (then journaled).
     pub fn transact(&mut self, op: Operation, now: u64) -> Result<Option<String>, String> {
         if self.state_dir.is_none() {
-            // The array is the store: nothing can ever be written, so nothing is journaled.
+            // The array is the store: nothing can ever be written, so nothing is journaled; the
+            // refusal rules are the persisted store's.
             let first = self.comments.is_empty();
-            apply(&mut self.comments, &op)?;
+            let applied = apply(&mut self.comments, &op)?;
+            if !applied {
+                return Err("No comment selected.".to_string());
+            }
             return if first && op.is_add() {
                 Err("comments not remembered: no state directory".to_string())
             } else {
@@ -3037,6 +3102,14 @@ impl Store {
         self.reads
     }
 
+    /// `open` with the write failure injected before the first read, for the startup case.
+    #[cfg(test)]
+    pub fn open_for_tests_with_failing_writes(state_dir: &Path, toplevel: &str, now: u64) -> Self {
+        let mut store = Self { state_dir: Some(state_dir.to_path_buf()), toplevel: toplevel.to_string(), comments: Vec::new(), journal: Vec::new(), journal_reason: None, others: BTreeMap::new(), mtime: None, reads: 0, fail_writes: true };
+        let _ = store.locked(|store| store.read_and_apply(None, now));
+        store
+    }
+
     #[cfg(test)]
     pub fn fail_writes_for_tests(&mut self, fail: bool) {
         self.fail_writes = fail;
@@ -3098,10 +3171,13 @@ pub fn record_request(state_dir: &Path, toplevel: &str, record: &RequestRecord) 
     }
     reuse::with_lock(state_dir, || {
         let path = state_dir.join(REQUESTS_FILE);
-        let mut all: BTreeMap<String, Vec<serde_json::Value>> = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
+        // A missing file is an empty map; a file that cannot be read aborts the write, or the rename
+        // would replace every worktree's records with this one's.
+        let mut all: BTreeMap<String, Vec<serde_json::Value>> = match std::fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => return Err(e),
+            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+        };
         // Malformed records of this worktree are rewritten out; other worktrees' arrays are kept as read.
         let (mut mine, _) = load_requests(state_dir, toplevel);
         mine.push(record.clone());
@@ -3170,10 +3246,11 @@ pub fn write_clipboard(state_dir: &Path, text: &str) -> std::io::Result<PathBuf>
 pub fn remove_request(state_dir: &Path, toplevel: &str, nonce: &str) -> std::io::Result<()> {
     reuse::with_lock(state_dir, || {
         let path = state_dir.join(REQUESTS_FILE);
-        let mut all: BTreeMap<String, Vec<serde_json::Value>> = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
+        let mut all: BTreeMap<String, Vec<serde_json::Value>> = match std::fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => return Err(e),
+            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+        };
         let (mine, _) = load_requests(state_dir, toplevel);
         let kept: Vec<_> = mine.into_iter().filter(|r| r.nonce != nonce).map(|r| serde_json::to_value(r).unwrap_or_default()).collect();
         all.insert(toplevel.to_string(), kept);
@@ -3308,15 +3385,28 @@ Write it as one arm per command that builds an `Operation` and calls a shared me
             return;
         };
         let (toplevel, generation, latest) = (toplevel.clone(), self.selection_generation, self.latest_selection.clone());
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = target::save_target_if(&dir, &toplevel, &target, generation, &latest) {
-                base::note_problem(&dir, &format!("targets.json: {e}"));
+        let (gate, waiting, done) = (self.target_write_gate.clone(), self.target_writes_waiting.clone(), self.target_writes_done.clone());
+        tokio::spawn(async move {
+            // The test seam: a write waits here while a test lets a newer pick land first.
+            if let Some(gate) = gate {
+                waiting.fetch_add(1, Ordering::SeqCst);
+                gate.acquire().await.expect("gate").forget();
             }
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = target::save_target_if(&dir, &toplevel, &target, generation, &latest) {
+                    base::note_problem(&dir, &format!("targets.json: {e}"));
+                }
+                done.fetch_add(1, Ordering::SeqCst);
+            })
+            .await
+            .ok();
         });
     }
 ```
 
-The regression for it is this task's, because it needs the comment command and the write; it sits in `session.rs`'s tests with the three below. Its race is made, not hoped for: the comment that triggers the adoption's write lands, then the test takes the state lock itself, so that write (and the re-pick's) queue on the lock; when the lock drops, the adoption's write finds the generation moved on and skips, which removing the guard would turn into a failure of the last assertion (the comment's own write never waits on the lock the test holds, because it already happened; the orchestrator should see this test fail with `save_target` in place of `save_target_if`):
+`SessionConfig.target_write_gate: Option<Arc<Semaphore>>` (`None` in production) and two `EngineHandle` counters, `target_writes_waiting` and `target_writes_done`, are the seams; with the guard replaced by a plain `save_target`, the test fails on its last assertion every time, because the old write is held until after the new pick's own write.
+
+The regression for it is this task's, because it needs the comment command and the write; it sits in `session.rs`'s tests with the three below. Its race is made, not hoped for: the adoption's write is held at a seam while the re-pick lands and writes, then released, so it is always the later writer and only the generation guard stops it (the orchestrator should see this test fail with `save_target` in place of `save_target_if`):
 
 ```rust
     #[test]
@@ -3331,22 +3421,21 @@ The regression for it is this task's, because it needs the comment command and t
         config.state_dir = Some(state.path().to_path_buf());
         config.host = Some(host.clone());
         config.socket_path = Some("/run/fake.sock".into());
-        let (_rt, handle) = start_with(config);
+        // The seam: a target write started by `write_target` waits for a permit before it takes the lock.
+        let gate = Arc::new(Semaphore::new(0));
+        config.target_write_gate = Some(gate.clone());
+        let (_rt, handle) = start_from(config);
         wait_for(&handle, "adopted in memory", |s| matches!(&s.target, Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s1"));
-        // The adoption's write is started by a comment, then held at the state lock while a re-pick
-        // lands; released, it must find the newer generation under the lock and skip itself.
-        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(state.path().join("split-panes.lock")).unwrap();
-        use std::os::unix::io::AsRawFd;
+        // The adoption's write is started by a comment and held at the seam while a re-pick lands;
+        // released, it must find the newer generation under the lock and skip itself.
         handle.commands.send(pending(2, "x")).unwrap();
         wait_for(&handle, "comment", |s| s.comment_seq == 1);
-        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
-        // Everything that writes targets.json from here on waits for the lock, the adoption's write included.
+        wait_cond("the adoption's write is waiting at the gate", || handle.target_writes_waiting.load(Ordering::SeqCst) == 1);
         handle.commands.send(Command::SetTarget(Target::Clipboard)).unwrap();
-        wait_for(&handle, "re-picked in memory", |s| s.target == Some(Target::Clipboard));
-        drop(lock);
-        wait_for(&handle, "re-pick answered", |s| s.target_seq == 1 && s.target_error.is_none());
-        wait_until("the file settles", || target::load_targets(state.path()).0.get(&top) == Some(&Target::Clipboard));
-        std::thread::sleep(Duration::from_millis(300));
+        wait_for(&handle, "re-pick answered", |s| s.target_seq == 1 && s.target == Some(Target::Clipboard) && s.target_error.is_none());
+        assert_eq!(target::load_targets(state.path()).0.get(&top), Some(&Target::Clipboard));
+        gate.add_permits(1);
+        wait_cond("the adoption's write ran", || handle.target_writes_done.load(Ordering::SeqCst) == 1);
         assert_eq!(target::load_targets(state.path()).0.get(&top), Some(&Target::Clipboard), "an older write replaced the newer pick");
     }
 ```
@@ -3409,10 +3498,10 @@ The refresh: `run_job` cannot carry the store (it lives on `State`), so on every
         let state = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.state_dir = Some(state.path().to_path_buf());
-        let (_rt, a) = start_with(config);
+        let (_rt, a) = start_from(config);
         let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.state_dir = Some(state.path().to_path_buf());
-        let (_rt2, b) = start_with(config);
+        let (_rt2, b) = start_from(config);
         wait_for(&a, "rows", |s| !s.files.is_empty());
         wait_for(&b, "rows", |s| !s.files.is_empty());
         a.commands.send(pending(2, "floor division")).unwrap();
@@ -3456,7 +3545,7 @@ The refresh: `run_job` cannot carry the store (it lives on `State`), so on every
         assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
         let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.state_dir = Some(state.path().to_path_buf());
-        let (_rt, handle) = start_with(config);
+        let (_rt, handle) = start_from(config);
         wait_for(&handle, "rows", |s| !s.files.is_empty());
         handle.commands.send(pending(2, "early")).unwrap();
         std::thread::sleep(Duration::from_millis(300));
@@ -3502,7 +3591,7 @@ The refresh: `run_job` cannot carry the store (it lives on `State`), so on every
         std::fs::write(state.path().join("comments.json"), serde_json::json!({ top.as_str(): [stale] }).to_string()).unwrap();
         let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.state_dir = Some(state.path().to_path_buf());
-        let (_rt, handle) = start_with(config);
+        let (_rt, handle) = start_from(config);
         let s = wait_for(&handle, "unconfirmed", |s| matches!(s.comments.first().map(|c| &c.state), Some(comments::CommentState::Unconfirmed { .. })));
         assert_eq!(s.comments[0].stamp().unwrap().nonce, "abcdef");
     }
@@ -4153,6 +4242,14 @@ Add to `comments.rs`'s tests:
         store.settle(1_017, "ddd444", Settlement::Sent).unwrap();
         assert!(matches!(by_id(&store, "p2"), CommentState::Sent(s) if s.nonce == "ddd444" && s.item == 1));
         assert!(matches!(by_id(&store, "u1"), CommentState::Sent(s) if s.nonce == "ccc333"), "a sent record is never claimed again");
+        // An unconfirmed record that was edited is pending again under its new text; a late success
+        // for its old nonce finds no record and settles nothing.
+        let mut unsure = comment("e1", "old text", 17);
+        unsure.state = CommentState::Unconfirmed { stamp: stamp("ggg777"), before: None };
+        store.transact(Operation::Add(unsure.clone()), 1_017).unwrap();
+        store.transact(Operation::Edit { id: "e1".into(), category: Category::Bug, text: "new text".into(), seen: unsure }, 1_017).unwrap();
+        store.settle(1_017, "ggg777", Settlement::Sent).unwrap();
+        assert!(by_id(&store, "e1").is_pending_state(), "the late success must not mark the new text sent");
         // A failed settlement write leaves the array as the file has it.
         store.transact(Operation::Add(comment("p3", "later", 18)), 1_018).unwrap();
         store.claim(1_018, &to, &fixed("fff666"), &mut 0, &ok, |_, _| Ok(String::new())).unwrap();
@@ -4512,7 +4609,7 @@ fn comparison_of(snapshot: &Snapshot) -> comments::AnchorComparison {
 
 /// One file of a review request: its prompt line and its ranges, the diff loaded when it is not the
 /// one on screen (spec 10.4 "Request review"), under the diff lane, one row after another.
-async fn request_files(ctx: &Context, scope: &ReviewScope) -> Result<(Vec<prompt::RequestLine>, Vec<RequestFile>), String> {
+pub async fn request_files(ctx: &Context, scope: &ReviewScope) -> Result<(Vec<prompt::RequestLine>, Vec<RequestFile>), String> {
     let snapshot = &ctx.snapshot;
     let comparison = comparison_of(snapshot);
     let ready = match &snapshot.diff {
@@ -5373,7 +5470,7 @@ The three `Done` arms:
                 *seen.lock().unwrap() = Some(std::fs::read_to_string(&path).unwrap());
             }));
         }
-        let (_rt, handle) = start_with(sending_config(dir.path(), state.path(), host.clone()));
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
         ready_to_send(&handle);
         handle.commands.send(feedback(dispatch::Accepted::default())).unwrap();
         let s = wait_for(&handle, "sent", |s| s.send_seq == 1);
@@ -5403,7 +5500,7 @@ The three `Done` arms:
     #[test]
     fn every_gate_refuses_or_passes_as_the_table_says() {
         let (dir, state, top, host) = sending_fixture();
-        let (_rt, handle) = start_with(sending_config(dir.path(), state.path(), host.clone()));
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
         ready_to_send(&handle);
         let mut seq = 0;
         let mut send = |accepted: dispatch::Accepted| -> Arc<Snapshot> {
@@ -5439,7 +5536,7 @@ The three `Done` arms:
         let s = send(dispatch::Accepted { busy: false, restarted: Some(Some(host::SessionRef { kind: "id".into(), value: "s2".into() })) });
         assert!(s.send_error.is_none(), "{:?}", s.send_error);
         assert!(matches!(&s.target, Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s2"));
-        wait_until("s2 remembered", || matches!(target::load_targets(state.path()).0.get(&top), Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s2"));
+        wait_cond("s2 remembered", || matches!(target::load_targets(state.path()).0.get(&top), Some(Target::Pane { session: Some(sess), .. }) if sess.value == "s2"));
         wait_for(&handle, "live again", |s| s.target_state == TargetState::Live("idle".into()));
         // A restart into an agent that reports no session is accepted as that absence, and adopted as it.
         host.set_pane(host::PaneRecord { pane_id: "w4:p2".into(), agent: Some("codex".into()), agent_status: Some("idle".into()), ..host::PaneRecord::default() });
@@ -5450,14 +5547,14 @@ The three `Done` arms:
         let s = send(dispatch::Accepted { busy: false, restarted: Some(None) });
         assert!(s.send_error.is_none(), "{:?}", s.send_error);
         assert!(matches!(&s.target, Some(Target::Pane { session: None, .. })), "the record adopted the absence");
-        wait_until("absence remembered", || matches!(target::load_targets(state.path()).0.get(&top), Some(Target::Pane { session: None, .. })));
+        wait_cond("absence remembered", || matches!(target::load_targets(state.path()).0.get(&top), Some(Target::Pane { session: None, .. })));
         wait_for(&handle, "live without a session", |s| s.target_state == TargetState::Live("idle".into()));
     }
 
     #[test]
     fn host_answers_settle_the_claim_each_their_way() {
         let (dir, state, _top, host) = sending_fixture();
-        let (_rt, handle) = start_with(sending_config(dir.path(), state.path(), host.clone()));
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
         ready_to_send(&handle);
         let state_of = |s: &Snapshot, i: usize| s.comments[i].state.clone();
         // A definite refusal returns the records to Pending with the host's words.
@@ -5497,7 +5594,7 @@ The three `Done` arms:
                 host2.set_pane(agent_pane("w4:p2", "codex", "blocked", Some("s1"), &top2));
             }));
         }
-        let (_rt, handle) = start_with(sending_config(dir.path(), state.path(), host.clone()));
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
         ready_to_send(&handle);
         handle.commands.send(feedback(dispatch::Accepted::default())).unwrap();
         let s = wait_for(&handle, "sent", |s| s.send_seq == 1);
@@ -5512,27 +5609,29 @@ The three `Done` arms:
 
     #[test]
     fn a_second_send_in_flight_is_refused_and_a_claim_that_finds_nothing_sends_nothing() {
-        let (dir, state, _top, host) = sending_fixture();
+        let (dir, state, top, host) = sending_fixture();
         *host.prompt_delay.lock().unwrap() = Some(Duration::from_millis(600));
-        let (_rt, handle) = start_with(sending_config(dir.path(), state.path(), host.clone()));
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
         ready_to_send(&handle);
         handle.commands.send(feedback(dispatch::Accepted::default())).unwrap();
         handle.commands.send(feedback(dispatch::Accepted::default())).unwrap();
         let s = wait_for(&handle, "second refused", |s| s.send_seq == 1);
         assert_eq!(s.send_error.as_deref(), Some(dispatch::NOTICE_IN_PROGRESS));
         wait_for(&handle, "first sent", |s| s.send_seq == 2 && s.send_error.is_none());
-        // Two sessions on one worktree: the second finds every comment claimed by the first.
+        // Two sessions on one worktree: the second finds every comment claimed by the first. The second
+        // never refreshes (an hour's poll, no watcher events), so its snapshot still shows the comments
+        // pending when it sends, and the conflict is met in the claim, not in the command's early check.
+        handle.commands.send(pending(2, "third")).unwrap();
+        wait_for(&handle, "third pending", |s| s.comments.len() == 3);
         let state2 = state.path().to_path_buf();
         let mut config = sending_config(dir.path(), &state2, host.clone());
         config.nonce = Arc::new(|counter| format!("m{counter:05}"));
-        let (_rt2, other) = start_with(config);
-        wait_for(&other, "shares the comments", |s| s.comments.len() == 2 && s.target.is_some());
-        handle.commands.send(pending(2, "third")).unwrap();
-        wait_for(&handle, "third pending", |s| s.comments.len() == 3);
-        wait_for(&other, "other sees the third", |s| s.comments.len() == 3);
+        config.poll_interval = Duration::from_secs(3600);
+        let (_rt2, other) = start_from(config);
+        wait_for(&other, "shares the comments", |s| s.comments.len() == 3 && s.target.is_some());
         *host.prompt_delay.lock().unwrap() = Some(Duration::from_millis(900));
         handle.commands.send(feedback(dispatch::Accepted::default())).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
+        wait_cond("the first claim is in the file", || comments::Store::open(Some(state.path().to_path_buf()), &top, now()).0.comments().iter().all(|c| !c.is_pending()));
         other.commands.send(feedback(dispatch::Accepted::default())).unwrap();
         let s = wait_for(&other, "nothing left", |s| s.send_seq == 1);
         assert_eq!(s.send_error.as_deref(), Some(dispatch::NOTICE_NOTHING));
@@ -5544,13 +5643,13 @@ The three `Done` arms:
     fn two_viewers_sending_to_one_pane_take_the_send_lock_in_turn() {
         let (dir, state, _top, host) = sending_fixture();
         *host.prompt_delay.lock().unwrap() = Some(Duration::from_millis(700));
-        let (_rt, a) = start_with(sending_config(dir.path(), state.path(), host.clone()));
+        let (_rt, a) = start_from(sending_config(dir.path(), state.path(), host.clone()));
         ready_to_send(&a);
         // A second worktree of the same user shares the state directory and the pane.
         let dir2 = fixture();
         let mut config = sending_config(dir2.path(), state.path(), host.clone());
         config.nonce = Arc::new(|counter| format!("m{counter:05}"));
-        let (_rt2, b) = start_with(config);
+        let (_rt2, b) = start_from(config);
         wait_for(&b, "rows", |s| !s.files.is_empty());
         b.commands.send(Command::SetTarget(pane_target("w4:p2", "codex", Some("s1")))).unwrap();
         wait_for(&b, "live", |s| s.target_state == TargetState::Live("idle".into()));
@@ -5575,10 +5674,59 @@ The three `Done` arms:
         assert!(starts[1].duration_since(starts[0]) >= Duration::from_millis(700 + 500), "{:?}", starts[1].duration_since(starts[0]));
     }
 
+    /// `dispatch::request_files` on a snapshot the test shapes: the three request paths the
+    /// session test does not reach.
+    #[tokio::test]
+    async fn request_files_reads_failed_selected_rows_keeps_unreadable_rows_and_pins_the_branch_base() {
+        let dir = fixture();
+        let top = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+        let (late_tx, _late_rx) = unbounded_channel();
+        let ctx = |snapshot: Snapshot| dispatch::Context {
+            toplevel: top.clone(),
+            state_dir: None,
+            host: None,
+            host_wait: Duration::from_secs(1),
+            late: late_tx.clone(),
+            socket_path: None,
+            target: None,
+            worktree_renames: BTreeMap::new(),
+            generation: 0,
+            latest_generation: Arc::new(AtomicU64::new(0)),
+            nonce: Arc::new(|c| format!("n{c:05}")),
+            nonce_counter: 0,
+            snapshot: Arc::new(snapshot),
+            lane: Arc::new(Semaphore::new(1)),
+            now: now(),
+        };
+        let row = |path: &str| ChangedFile { path: path.into(), status: ChangedFileStatus::Modified, staged: false, insertions: None, deletions: None };
+        // A selected row whose diff is `Failed` on screen is loaded by the task like the others.
+        let mut snapshot = Snapshot::empty(&top);
+        snapshot.repo = RepoState::Repo { toplevel: top.clone(), branch: Some("main".into()), worktree: None };
+        snapshot.files = vec![row("a.txt"), row("b.txt")];
+        snapshot.selected = Some(FileKey::of(&snapshot.files[0]));
+        snapshot.diff = DiffState::Failed("boom".into());
+        let (lines, files) = dispatch::request_files(&ctx(snapshot.clone()), &dispatch::ReviewScope::All).await.unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(files[0].additions, vec![(1, 2)], "the failed selected row was read from disk");
+        // A row the loader cannot read is recorded with no ranges and still listed.
+        snapshot.files.push(row("vanished.txt"));
+        let (lines, files) = dispatch::request_files(&ctx(snapshot.clone()), &dispatch::ReviewScope::All).await.unwrap();
+        assert_eq!(lines[2].path, "vanished.txt");
+        assert!(files[2].additions.is_empty() && files[2].deletions.is_empty());
+        // Branch scope: the ranges and the record are against the merge-base the snapshot carries.
+        let head = String::from_utf8(std::process::Command::new("git").args(["-C", &top, "rev-parse", "HEAD"]).output().unwrap().stdout).unwrap().trim().to_string();
+        snapshot.scope = Scope::Branch;
+        snapshot.base = Some(Base { requested: "refs/heads/main".into(), commit: head.clone(), merge_base: Some(head.clone()), source: BaseSource::Default });
+        snapshot.files.truncate(2);
+        let (_, files) = dispatch::request_files(&ctx(snapshot), &dispatch::ReviewScope::All).await.unwrap();
+        assert!(files.iter().all(|f| matches!(&f.comparison, comments::AnchorComparison::Branch { merge_base, label } if *merge_base == head && label == "main")));
+        assert_eq!(files[0].additions, vec![(1, 2)]);
+    }
+
     #[test]
     fn a_colliding_nonce_is_passed_over_and_the_bound_is_measured_on_the_encoded_line() {
         let (dir, state, top, host) = sending_fixture();
-        let (_rt, handle) = start_with(sending_config(dir.path(), state.path(), host.clone()));
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
         ready_to_send(&handle);
         // A retained record already carries the nonce the seam would make first.
         let mut seeded = comments::Store::open(Some(state.path().to_path_buf()), &top, 1).0;
@@ -5610,7 +5758,7 @@ The three `Done` arms:
         let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
         config.state_dir = Some(state.path().to_path_buf());
         config.nonce = Arc::new(|counter| format!("n{counter:05}"));
-        let (_rt, handle) = start_with(config);
+        let (_rt, handle) = start_from(config);
         wait_for(&handle, "rows", |s| !s.files.is_empty());
         handle.commands.send(Command::SetTarget(Target::Clipboard)).unwrap();
         wait_for(&handle, "clipboard", |s| s.target_seq == 1);
@@ -5627,7 +5775,7 @@ The three `Done` arms:
         // Without a state directory: the sequence alone, Unconfirmed.
         let mut config = config_no_state(dir.path());
         config.nonce = Arc::new(|counter| format!("n{counter:05}"));
-        let (_rt2, bare) = start_with(config);
+        let (_rt2, bare) = start_from(config);
         wait_for(&bare, "rows", |s| !s.files.is_empty());
         bare.commands.send(Command::SetTarget(Target::Clipboard)).unwrap();
         bare.commands.send(pending(2, "x")).unwrap();
@@ -5666,7 +5814,7 @@ The three `Done` arms:
     #[test]
     fn copy_stamps_nothing_and_a_review_request_is_recorded_with_ranges_read_before_the_check() {
         let (dir, state, top, host) = sending_fixture();
-        let (_rt, handle) = start_with(sending_config(dir.path(), state.path(), host.clone()));
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
         ready_to_send(&handle);
         handle.commands.send(Command::Copy(dispatch::CopyRequest { what: dispatch::CopyWhat::Review })).unwrap();
         // One predicate: the copy's answer and the ready diff the request needs may arrive together.
@@ -5715,7 +5863,7 @@ The three `Done` arms:
     }
 ```
 
-`config_no_state(dir)` is `test_config(dir, Arc::new(AtomicBool::new(true)))` with `state_dir` left `None`; write it as a two-line helper beside `test_config`. `stamp_nonce()` in the clipboard test is a three-line test helper on `CommentState` returning the nonce of an `Unconfirmed` or `Sent` state (`Option<&str>`). The refusal-before-stamp path of the bound is `a_claim_takes_pending...`'s `Err("too large")` case in `comments.rs`; `encoded_len` is proven here on synthetic texts because fifty comments within the caps cannot reach 512 KiB.
+`config_no_state(dir)` is `test_config(dir, Arc::new(AtomicBool::new(true)))` with `state_dir` left `None`; write it as a two-line helper beside `test_config`. `stamp_nonce()` in the clipboard test and `is_pending_state()` in the settlement test are three-line test helpers on `CommentState` (the nonce of an `Unconfirmed` or `Sent` state as `Option<&str>`; `matches!(self, Pending)`). The refusal-before-stamp path of the bound is `a_claim_takes_pending...`'s `Err("too large")` case in `comments.rs`; `encoded_len` is proven here on synthetic texts because fifty comments within the caps cannot reach 512 KiB.
 
 Two more session tests, for the late answer and the oversized review:
 
@@ -5726,7 +5874,7 @@ Two more session tests, for the late answer and the oversized review:
         let mut config = sending_config(dir.path(), state.path(), host.clone());
         config.host_wait = Duration::from_millis(300);
         *host.prompt_delay.lock().unwrap() = Some(Duration::from_millis(900));
-        let (_rt, handle) = start_with(config);
+        let (_rt, handle) = start_from(config);
         ready_to_send(&handle);
         handle.commands.send(feedback(dispatch::Accepted::default())).unwrap();
         let s = wait_for(&handle, "unconfirmed at the wait", |s| s.send_seq == 1);
@@ -5749,12 +5897,12 @@ Two more session tests, for the late answer and the oversized review:
         let mut config = sending_config(dir.path(), state.path(), host.clone());
         config.host_wait = Duration::from_millis(300);
         *host.prompt_delay.lock().unwrap() = Some(Duration::from_millis(900));
-        let (_rt, a) = start_with(config);
+        let (_rt, a) = start_from(config);
         ready_to_send(&a);
         let dir2 = fixture();
         let mut config = sending_config(dir2.path(), state.path(), host.clone());
         config.nonce = Arc::new(|counter| format!("m{counter:05}"));
-        let (_rt2, b) = start_with(config);
+        let (_rt2, b) = start_from(config);
         wait_for(&b, "rows", |s| !s.files.is_empty());
         b.commands.send(Command::SetTarget(pane_target("w4:p2", "codex", Some("s1")))).unwrap();
         wait_for(&b, "live", |s| s.target_state == TargetState::Live("idle".into()));
@@ -5774,7 +5922,7 @@ Two more session tests, for the late answer and the oversized review:
     #[test]
     fn an_oversized_review_is_refused_before_any_stamp_and_without_a_call() {
         let (dir, state, _top, host) = sending_fixture();
-        let (_rt, handle) = start_with(sending_config(dir.path(), state.path(), host.clone()));
+        let (_rt, handle) = start_from(sending_config(dir.path(), state.path(), host.clone()));
         ready_to_send(&handle);
         // Fifty comments of 4,000 CJK characters are 600,000 bytes of text, over the 512 KiB bound.
         let wide = "字".repeat(comments::MAX_CHARS);
@@ -6516,7 +6664,7 @@ pub struct EditorPlace { pub after: EditorAnchor, pub lines: usize }
 pub enum EditorAnchor { Anchor(Anchor), Orphan(String), End }
 /// The row a card for `anchor` sits after, in `rows` without cards: the line's row, the range's last, the header.
 pub fn attach_row(diff: &LoadedDiff, row_of_target: &[usize], anchor: &Anchor) -> Option<usize>;
-/// The anchor's own target (its side and line; a range's last line; none for a file): what a card click lands on and what `u`/`x` match.
+/// The anchor's own target (its side and line; a range's last line exactly, never an earlier survivor; none for a file): what a card click lands on and what `u`/`x` match.
 pub fn anchor_target(diff: &LoadedDiff, anchor: &Anchor) -> Option<usize>;
 
 // src/tui/review.rs
@@ -6901,12 +7049,14 @@ pub fn orphans<'a>(comments: &'a [Comment], snapshot: &Snapshot) -> Vec<&'a Comm
         .collect()
 }
 
-/// The target an anchor names: its line on its side, a range's last line, none for a file.
+/// The target an anchor names: its line on its side, a range's last line exactly (a range whose
+/// last line is gone is drawn nowhere, as 10.3 says of a line that is gone; it never slides),
+/// none for a file.
 pub fn anchor_target(diff: &LoadedDiff, anchor: &Anchor) -> Option<usize> {
     match anchor.span {
         AnchorSpan::File => None,
         AnchorSpan::Line => nav::find(&diff.targets, anchor.side, anchor.line),
-        AnchorSpan::Range { end } => (anchor.line..=end).rev().find_map(|line| nav::find(&diff.targets, anchor.side, line)),
+        AnchorSpan::Range { end } => nav::find(&diff.targets, anchor.side, end),
     }
 }
 
@@ -7331,7 +7481,7 @@ pub fn step_on_side(diff: &LoadedDiff, cursor: usize, side: Side, delta: isize) 
 
 The orphan cursor: in `move_cursor`'s `LineDown`, when the cursor is the last target of the unified order (or `targets.len() - 1` in split) and `rows.orphan_tops` is non-empty, set `state.orphan = Some(0)` and keep the cursor; with **no targets at all** (an empty list, or a diff that is not `Ready`, with orphans drawn by `orphans_only`), `LineDown` from nothing sets `orphan = Some(0)` too, which is the entry path into an orphan-only view; `LineDown` on orphan `n` moves to `n + 1` while one exists; `LineUp` on orphan 0 clears `orphan` (and leaves the cursor where it was, or nowhere); `LineUp` on `n` moves to `n - 1`; every other movement key clears `orphan`. `keep_cursor_visible` scrolls to `orphan_tops[n].0` when `orphan` is set. `move_cursor`'s early return on `(DiffState::Ready, Some(cursor))` must therefore give way to the orphan rules before it returns `Inert`.
 
-4. `view.rs`: `body_line`'s two card arms are Step 4's; here they gain the cursor: an orphan card under the orphan cursor is drawn in reverse video as a cursor row is. `Action` gains `EditorCategory(Category)` (`key_action()` → `None`), handled in `handle_mouse`'s click arm by setting the open editor's category. The editor is modal for the mouse as the y/n box is: while `state.editor.is_some()`, `handle_mouse` handles `EditorCategory` clicks and the wheel (scrolling the body) and nothing else, so a click on the toolbar, the files panel or a diff row cannot open a picker, a box or another action under an open editor; a test, `clicks_under_an_open_editor_are_inert_except_the_category_words`, presses a toolbar hit and a file hit while editing and asserts `Outcome::Inert`, then clicks a category word and asserts the category changed. When the diff is not `Ready` but `rows::orphans` is non-empty, `render` draws `state.rows` (built by `orphans_only`) instead of `state_message`'s centred text, so an empty list with comments left behind shows the orphan section, not `working tree clean`. The editor's rows are real rows, so one coordinate system serves scrolling, hits and drawing: `Row::Editor { line: usize }`, one per line of `editor.lines(card_width)`, spliced by `rows::build` (and `orphans_only`) after the row the editor sits under, which `build` receives as `editor: Option<EditorPlace>` with `EditorPlace { after: EditorAnchor, lines: usize }` and `enum EditorAnchor { Anchor(Anchor), Orphan(String) /* the card's id */, End }`: the anchor's row through `attach_row` for an anchor in the loaded diff, the last `Row::Card` row carrying the id for an orphan being edited (the editor replaces the card visually), the last body row when the anchor's line is not in the diff. The rows carry no text; `view::body_line` draws `Row::Editor { line }` from `state.editor.lines(card_width)[line]`, `frame_top(editor.title(), …)` for the first, `frame_bottom(EDITOR_FOOTER, …)` for the last, so typing never rebuilds the rows: `reconcile`'s key gains `(editor anchor, line count)` and rebuilds only when the editor opens, closes, moves or grows a line, which is rare and cheap. The title line pushes one hit per category word, `Action::EditorCategory(Category)`, and a click sets `editor.category` (spec 10.3's clickable words); the text rows push no hit. `view::body_is_drawn` stays true while the editor is open (it is a card, not a modal).
+4. `view.rs`: `body_line`'s two card arms are Step 4's; here they gain the cursor: an orphan card under the orphan cursor is drawn in reverse video as a cursor row is. A visual selection is drawn: every row whose target lies on the selection's side between its first and last line takes the cursor's reverse video on its text span (`render` computes the selected target set from `review::selection` once per frame and passes `selected: bool` to `body_line` beside `cursor`), so what `i` or `y` will act on is visible; a view test, `a_visual_selection_is_drawn_in_reverse_over_its_lines`, selects two lines with `v`, `j` and asserts the reverse flag on exactly those rows' text spans and on no other. `Action` gains `EditorCategory(Category)` (`key_action()` → `None`), handled in `handle_mouse`'s click arm by setting the open editor's category. The editor is modal for the mouse as the y/n box is: while `state.editor.is_some()`, `handle_mouse` handles `EditorCategory` clicks and the wheel (scrolling the body) and nothing else, so a click on the toolbar, the files panel or a diff row cannot open a picker, a box or another action under an open editor; a test, `clicks_under_an_open_editor_are_inert_except_the_category_words`, presses a toolbar hit and a file hit while editing and asserts `Outcome::Inert`, then clicks a category word and asserts the category changed. When the diff is not `Ready` but `rows::orphans` is non-empty, `render` draws `state.rows` (built by `orphans_only`) instead of `state_message`'s centred text, so an empty list with comments left behind shows the orphan section, not `working tree clean`. The editor's rows are real rows, so one coordinate system serves scrolling, hits and drawing: `Row::Editor { line: usize }`, one per line of `editor.lines(card_width)`, spliced by `rows::build` (and `orphans_only`) after the row the editor sits under, which `build` receives as `editor: Option<EditorPlace>` with `EditorPlace { after: EditorAnchor, lines: usize }` and `enum EditorAnchor { Anchor(Anchor), Orphan(String) /* the card's id */, End }`: the anchor's row through `attach_row` for an anchor in the loaded diff, the last `Row::Card` row carrying the id for an orphan being edited (the editor replaces the card visually), the last body row when the anchor's line is not in the diff. The rows carry no text; `view::body_line` draws `Row::Editor { line }` from `state.editor.lines(card_width)[line]`, `frame_top(editor.title(), …)` for the first, `frame_bottom(EDITOR_FOOTER, …)` for the last, so typing never rebuilds the rows: `reconcile`'s key gains `(editor anchor, line count)` and rebuilds only when the editor opens, closes, moves or grows a line, which is rare and cheap. The title line pushes one hit per category word, `Action::EditorCategory(Category)`, and a click sets `editor.category` (spec 10.3's clickable words); the text rows push no hit. `view::body_is_drawn` stays true while the editor is open (it is a card, not a modal).
 
 With the editor's rows in `rows`, keeping it on screen is the existing machinery: `keep_cursor_visible` scrolls to the span from the editor's first row to its last (`ensure_visible` over `first..=last`), after `reconcile` and after every editor key; when the editor is taller than the body, the offset puts its last row (the caret's) on the bottom row, and the anchor above scrolls out as any row does. Tests in `state.rs`: `an_editor_opened_on_the_bottom_row_scrolls_into_view` (a 40-target diff in a 10-row body, the editor opened on the last target, its bottom row within the viewport), `an_editor_taller_than_the_body_keeps_its_caret_visible` (120 lines typed through `ctrl+j`, the last rendered row carries `_`), and `a_partially_visible_editor_whose_anchor_scrolled_away_still_draws` (the offset moved past the anchor row by `ctrl+d`: the editor's remaining rows are drawn at the top of the body, nothing is skipped). `files_lines`: the `✎` cell before the marker when any comment of the file exists under the current comparison kind (`snapshot.comments.iter().any(|c| c.anchor.key.path == file.path && kind matches)`), the name fitted to `FILES_WIDTH - 3`; the header `CHANGED {n} · ✎ {pending}` when `pending > 0`, counting `comments.iter().filter(|c| c.is_pending()).count()` across both scopes. Card rows push `Action::CursorToRow(row)` hits as other rows do; `CursorToRow` on a card row with `target: Some(t)` sets the cursor to `t`, the anchor's own target (in `handle_mouse`'s click arm: look the row up in `state.rows`), so the cursor lands on the comment's side.
 
@@ -8146,7 +8296,7 @@ fn box_key(state: &mut ViewState, snapshot: &Snapshot, key: KeyEvent) -> Outcome
 
 `y` on a selection, in `handle_key` before `keys::lookup` is consulted for the body: `if key is 'y' with no modifiers && state.visual.is_some()` → `selection(diff, visual, cursor)` → `Command::Copy(CopyRequest { what: CopyWhat::Selection(selection_text(..)) })`, clearing `visual`; without a selection `y` is inert (not in `KEYS`).
 
-4. `view.rs`: the box overlay after the confirm box's, `panel_width = columns.min(72)`, height from `dialog::line_count + 4` as the y/n box does; `b.drawn` set by the shell when the box fits, as `confirm.drawn` is (`ReviewBox::fits(width, height)` mirrors `Confirm::fits`). The scope line's chosen word in reverse video: `view.rs` post-processes the rendered `Scope  f this file   a all changes (n)` line, setting `reverse` on the span of the chosen scope's words. The footer hint: `hints` gains `format!("Y finish ({pending})")` while `pending > 0` and `@ request` always (dropped before `? help` as the others are). `body_is_drawn` gains `&& state.review_box.is_none()`.
+4. `view.rs`: the box overlay after the confirm box's, `panel_width = columns.min(72)`, height from `dialog::line_count + 4` as the y/n box does; and `handle_mouse` returns `Inert` for every click and wheel event while `state.review_box.is_some()`, exactly as it does for `state.confirm` (a test, `the_boxes_are_modal_for_the_mouse_too`, scrolls and clicks a file row with the Finish box open and asserts `Inert` and an unchanged offset); `b.drawn` set by the shell when the box fits, as `confirm.drawn` is (`ReviewBox::fits(width, height)` mirrors `Confirm::fits`). The scope line's chosen word in reverse video: `view.rs` post-processes the rendered `Scope  f this file   a all changes (n)` line, setting `reverse` on the span of the chosen scope's words. The footer hint: `hints` gains `format!("Y finish ({pending})")` while `pending > 0` and `@ request` always (dropped before `? help` as the others are). `body_is_drawn` gains `&& state.review_box.is_none()`.
 
 5. `shell.rs`: after `state.observe(&next)` in the snapshot loop and before drawing, `if let Some(osc) = state.pending_copy.take() { write_copy(&mut io::stdout(), &osc)?; }` with:
 
@@ -8282,7 +8432,8 @@ git commit -m "feat(tui): the finish and request boxes, the copy keys, the answe
 Implements spec 10.6 "The read-only guarantee" and "Standalone", 10.7's version paragraph, 10.9 tests 10 and 11 and criteria 12-17. Read 10.6, 10.7 and 10.9 before starting.
 
 **Files:**
-- Modify: `tests/readonly_guarantee.rs`, `tests/e2e_real_herdr.rs`, `README.md`, `README.zh-CN.md`, `README.ja.md`, `AGENTS.md`, `PORT-SURFACE.md`, `docs/superpowers/specs/2026-09-18-hunks-roadmap-p1-viewer-design.md` (one note under the 1.2 table), `docs/superpowers/specs/2026-09-30-agent-review-loop-design.md` (the state-file list of 10.6 and 10.9, see Step 1), `docs/acceptance-p1.md`, `Cargo.toml`, `Cargo.lock`, `herdr-plugin.toml`
+- Create: `tests/review_loop_guarantee.rs`
+- Modify: `tests/e2e_real_herdr.rs`, `README.md`, `README.zh-CN.md`, `README.ja.md`, `AGENTS.md`, `PORT-SURFACE.md`, `docs/superpowers/specs/2026-09-18-hunks-roadmap-p1-viewer-design.md` (one note under the 1.2 table), `docs/superpowers/specs/2026-09-30-agent-review-loop-design.md` (the state-file list of 10.6 and 10.9, see Step 1), `docs/acceptance-p1.md`, `Cargo.toml`, `Cargo.lock`, `herdr-plugin.toml`
 
 **Interfaces:**
 - Consumes: everything above.
@@ -8290,13 +8441,14 @@ Implements spec 10.6 "The read-only guarantee" and "Standalone", 10.7's version 
 
 - [ ] **Step 1: The recording test**
 
-Add a second test to `tests/readonly_guarantee.rs`, reusing its `real_git`, `git`, `tree_hash` and `ALLOWED` (which stays at ten: the review loop adds no subcommand):
+Create `tests/review_loop_guarantee.rs`: its own integration-test process, because it changes `PATH`, the working directory and the git environment policy, which `tests/env_policy.rs`'s rule reserves to one test per process (`cargo test` runs the tests of one file in one process; two such tests in `readonly_guarantee.rs` would race under the default thread count). Copy `real_git`, `git`, `tree_hash`, `ALLOWED` (ten entries: the review loop adds no subcommand) and the subcommand parser from `tests/readonly_guarantee.rs`, as `tests/hunk_actions.rs` did, then:
 
 ```rust
 mod support;
 
 #[test]
 fn the_review_loop_talks_to_the_host_alone_and_writes_only_its_files() {
+    // The one test of this file: it owns the process (PATH, cwd, init_process_env).
     use herdr_hunks::engine::comments::{Anchor, AnchorComparison, Category, Span};
     use herdr_hunks::engine::dispatch::{Accepted, CopyRequest, CopyWhat, ReviewScope, SendKind, SendRequest};
     use herdr_hunks::engine::host::{HerdrHost, SessionRef};
@@ -8423,12 +8575,12 @@ fn the_review_loop_talks_to_the_host_alone_and_writes_only_its_files() {
 }
 ```
 
-`FakeHerdr::all_calls()` is a one-line addition to `tests/support/mod.rs` returning every recorded request. `subcommand_of(line)` is the first test's subcommand parser factored into a function the two tests share: it skips `-C <directory>` pairs and nothing else, so `--version`, which `SessionConfig::production` runs at start, is read as the subcommand it is. The file list is the one this script produces: no base is picked and no mark made, so `bases.json` and `marks.json` are absent. Spec 10.6 and 10.9 (test 10) list eight files for this script; amend both sentences in this task's commit to "the files the script writes: `targets.json`, `comments.json`, `requests.json`, `clipboard.md`, `send.lock` and `split-panes.lock`, and `bases.json`/`marks.json` only when a base or a mark was made" — the guarantee is "nothing else", which the assertion keeps exact.
+`FakeHerdr::all_calls()` is a one-line addition to `tests/support/mod.rs` returning every recorded request. `subcommand_of(line)` is `readonly_guarantee.rs`'s subcommand parser copied as a function: it skips `-C <directory>` pairs and nothing else, so `--version`, which `SessionConfig::production` runs at start, is read as the subcommand it is. The file list is the one this script produces: no base is picked and no mark made, so `bases.json` and `marks.json` are absent. Spec 10.6 and 10.9 (test 10) list eight files for this script; amend both sentences in this task's commit to "the files the script writes: `targets.json`, `comments.json`, `requests.json`, `clipboard.md`, `send.lock` and `split-panes.lock`, and `bases.json`/`marks.json` only when a base or a mark was made" — the guarantee is "nothing else", which the assertion keeps exact.
 
 - [ ] **Step 2: Run it**
 
-Run: `CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" HOME="$(mktemp -d)" cargo test --locked --test readonly_guarantee -- --test-threads=1`
-Expected: both tests pass; the new one takes a few seconds (one `ENTER_MARGIN` per send). Falsify once: make `dispatch::send_inner` skip `store.claim` and watch the assertion on the comment's state in the engine test of Task 5 fail — this test's own falsification is the file list: add a stray `std::fs::write(dir.join("x"), b"")` in `save_target` and watch `written` disagree.
+Run: `CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" HOME="$(mktemp -d)" cargo test --locked --test review_loop_guarantee`
+Expected: it passes in a few seconds (one `ENTER_MARGIN` per send); `--test readonly_guarantee` is unchanged and still green. Falsify once: make `dispatch::send_inner` skip `store.claim` and watch the assertion on the comment's state in the engine test of Task 5 fail — this test's own falsification is the file list: add a stray `std::fs::write(dir.join("x"), b"")` in `save_target` and watch `written` disagree.
 
 - [ ] **Step 3: Tier B**
 
@@ -8584,7 +8736,7 @@ The P1 spec's 1.2 table gets one line under it: `Order amended 2026-09-30: Phase
 The full gate line, plus Tier B against both hosts, plus `cargo build --release` for the acceptance run.
 
 ```bash
-git add tests/readonly_guarantee.rs tests/support/mod.rs tests/e2e_real_herdr.rs README.md README.zh-CN.md README.ja.md AGENTS.md PORT-SURFACE.md docs/superpowers/specs/2026-09-18-hunks-roadmap-p1-viewer-design.md docs/superpowers/specs/2026-09-30-agent-review-loop-design.md docs/acceptance-p1.md Cargo.toml Cargo.lock herdr-plugin.toml
+git add tests/review_loop_guarantee.rs tests/support/mod.rs tests/e2e_real_herdr.rs README.md README.zh-CN.md README.ja.md AGENTS.md PORT-SURFACE.md docs/superpowers/specs/2026-09-18-hunks-roadmap-p1-viewer-design.md docs/superpowers/specs/2026-09-30-agent-review-loop-design.md docs/acceptance-p1.md Cargo.toml Cargo.lock herdr-plugin.toml
 git commit -m "feat: the review loop, part 1, documented and versioned 0.0.5"
 ```
 
@@ -8599,7 +8751,7 @@ The acceptance row's evidence and `Status: PASS` are a separate commit after the
 - **10.3 "The record"**: Task 3 (`Comment`, `CommentState` with `to` and `before`, `new_id`). **"The anchor"**: Task 3 (`Anchor`, `Span`, `AnchorComparison` with the label), Task 7 (`attach_row`, `in_place`, drawn only under its comparison kind and half). **"Cards"**: Task 7 (`cards::lines`, tones, `· sent` dim, the orphan section, cards as rows, hits). **"The editor"**: Task 7 (`Editor`, the title, `ctrl+h/l/j`, Enter/Esc, the limit title, the splice). **"Keys"**: Task 7 (`comment_key`, `v`, `u`/`U`/`x`/`X`, the notices). **"The target comes first"**: Task 7 (`i_without_a_target_opens_the_picker_and_keeps_the_anchor`). **"Marks and counts"**: Task 7 (`✎`, `CHANGED 3 · ✎ 2`), Task 8 (`Y finish (2)`), Task 3 (the cap over unsent, checked by adds alone). **"Remembered"**: Task 3 (transactions, shape checks, the journal and its conflict rule, the expiry on load and on refresh, the mtime reread, no state directory).
 - **10.4 "Finish"**: Task 8 (`ReviewBox::finish`, the table in `the_finish_box_says_what_the_table_says_for_each_state`, `Esc` is `n`, `A` over the box, the counts). **"The send"**: Task 5 (the six steps, `gates`, `Accepted`, the generation check twice, `fresh_nonce`, `claim`, the bound, the call without `wait`, `settle` three ways with `before`, `send_seq`/`send_error`/`send_outcome`), Task 8 (`send anyway` relabel with the typed `Refusal`). The send lock: Task 5 (`SendLock`, `two_viewers_sending_to_one_pane_take_the_send_lock_in_turn`, `NOTICE_WAITING`). The unconfirmed card and the next Finish: Tasks 3 and 5. **"Copy"**: Task 5 (`copy_out`, `osc52`, `clipboard.md`, the three settlements of a clipboard send, `c` claims nothing), Task 8 (`c` in both boxes, `y` on a selection, the OSC write in the shell). **"Request review"**: Task 5 (`request_files` reads first, ranges, `requests.json`, the selected row loaded like the others, `c` records with a clipboard target), Task 8 (the box, `f`/`a`, the three shapes of the scope line, `nothing to review`).
 - **10.5**: Task 4 (`review`, `request`, `strip_controls`, `quote_toplevel`, `comparison_label`, the merge-base footer only with a branch item, the pinned file and `port-check.sh`, `nonce`).
-- **10.6 "Commands and snapshot"**: Tasks 2, 3, 5 (every field in `fingerprint`). **"The host client"**: Task 1 (the deadline, the phases, `HostClient`, `HerdrHost`, `from_env`, `ENGINE_WAIT`). **"Where the work runs"**: Task 2 (the check in the refresh job), Task 5 (`Send`/`Copy` as their own tasks, one send at a time, `spawn_blocking` for the store and the host). **"The store module"**: Tasks 3 and 4 (`comments`, `target`, `prompt`; no git in them; the request's loads through the existing loaders). **"The view"**: Task 7 (`Row::Card`, the orphan section, `row_of_target`, the rebuild rule on five parts), Task 8 (the boxes as `dialog::Panel`s, `RESERVED = ["/"]`, the key sheet rows). **"The read-only guarantee"**: Task 9 (the recording test with the fake socket). **"Standalone"**: Task 2 (`NoHost`), Task 6 (`→ no host`), Task 9 (Tier B's clipboard send).
+- **10.6 "Commands and snapshot"**: Tasks 2, 3, 5 (every field in `fingerprint`). **"The host client"**: Task 1 (the deadline, the phases, `HostClient`, `HerdrHost`, `from_env`, `ENGINE_WAIT`). **"Where the work runs"**: Task 2 (the check in the refresh job), Task 5 (`Send`/`Copy` as their own tasks, one send at a time, `spawn_blocking` for the store and the host). **"The store module"**: Tasks 3 and 4 (`comments`, `target`, `prompt`; no git in them; the request's loads through the existing loaders). **"The view"**: Task 7 (`Row::Card`, the orphan section, `row_of_target`, the rebuild rule on five parts), Task 8 (the boxes as `dialog::Panel`s, `RESERVED = ["/"]`, the key sheet rows). **"The read-only guarantee"**: Task 9 (the recording test with the fake socket, in its own process beside `readonly_guarantee.rs`). **"Standalone"**: Task 2 (`NoHost`), Task 6 (`→ no host`), Task 9 (Tier B's clipboard send).
 - **10.7**: the table's rows map to: `NoHost` conditions (Task 1 `classify`, Task 2 `compare`), `pane.get` cannot run (Task 2), gone/left/restarted/blocked (Tasks 2, 5, 8), `pane.list` failure (Task 2, Task 6's `Row::Warn`), `targets.json` unreadable or unwritable (Task 2), `comments.json`/`requests.json` malformed (Task 3), a failed transaction and the journal (Task 3, Task 5's refusal to claim), the host's refusals and the timeout (Task 5), the viewer dying mid-send (Task 3's expiry), the second `Y` (Task 5), the 51st unsent (Task 3), the caps (Tasks 3 and 7), the 512 KiB bound (Task 5), an unloadable file in a request (Task 5), OSC 52 dropped (Task 5's file-first settlement), the moved base (Task 3's anchors keep their merge-base; Task 4 prints it), a row that left the list (Task 7's orphans), the send-time check that cannot run and the changed target (Task 5), the send lock (Task 5), the failed retry (Task 5), a hidden condition behind an accepted one (Task 5), a journaled edit meeting a changed record (Task 3), the small popup (`view.rs`'s existing size guard, Task 7 adds nothing of this section below 40×10). Cost and configuration: README (Task 9). Version: Task 9.
 - **10.8**: boundaries honoured by construction: no key of section 9 is touched; `to` and `requests.json` carry what part 2 needs (Tasks 3, 5); nothing here reads a pane or a transcript.
 - **10.9 tests 1-11**: 1 Task 2; 2 Task 2 and Task 6; 3 Task 3; 4 Task 5; 5 Task 5; 6 Task 4; 7 Task 1; 8 Tasks 6, 7, 8; 9 Tasks 6, 7, 8; 10 Task 9; 11 Task 9. Criteria 12-17: acceptance row 10 (Task 9).
@@ -8707,3 +8859,23 @@ renames up by side; the clipboard regression keeps the snapshot its wait returne
 adoption-write regression makes its race by holding the state lock; one line rule
 (`line_count`, `within_caps`) serves the editor, the store and the tests; and the wrapper
 keeps every character, spaces and indentation included.
+
+**Round 5 (codex, plan-complete, 2026-10-04).** Fourteen findings, all applied. Four were
+HIGH: the new test helpers collided with the session module's existing `start_with` and
+`wait_until` (now `start_from`, `wait_cond`) and the review `Target` with `nav::Target` in
+`types.rs` (written by path there); Task 3's edited-unconfirmed test called Task 5's `settle`
+(the settle half moved to Task 5); `HerdrHost::agent_prompt` took any JSON without an
+`error` as success (it now requires the documented result envelope and treats anything
+else as `After`, with a raw-reply control on the fake socket to prove it); and the request
+file's read errors were swallowed into an empty map (a missing file is empty, an unreadable
+one aborts the write). Then: a failed expiry write on load keeps the loaded comments on
+screen; the in-memory store refuses stale edits and deletions as the persisted one does; a
+range card anchors to its last line exactly and never slides; a visual selection is drawn in
+reverse over its lines; the Finish and Request boxes are modal for the mouse; the
+adoption-write regression forces its race through a `target_write_gate` seam and two
+counters; the competing-send test starts the second viewer with an hour's poll so its stale
+snapshot reaches the claim; the client gains a write-side deadline test (a server that never
+reads a four-megabyte request) and the fake's silent mode holds the stream open past the
+deadline; the recording test moves to its own integration file (`review_loop_guarantee.rs`),
+since it changes process-wide state; and `request_files` is unit-tested on a `Failed`
+selected row, an unreadable row and a branch-scope snapshot.
