@@ -1,8 +1,8 @@
 id = "winoooops.hunks"
 name = "hunks"
-version = "0.0.4"
+version = "0.0.5"
 min_herdr_version = "0.8.0"
-description = "Git hunk viewer: changed files, hunks, a clickable navigation toolbar, and staging behind a y/n box."
+description = "Git hunk viewer with staging, discarding, review comments and a send to the agent pane of your choice."
 platforms = ["macos", "linux"]
 
 [[build]]

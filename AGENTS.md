@@ -1,11 +1,11 @@
 # Working on herdr-hunks
 
-- Phases 1-2 ship a viewer whose only mutations are the confirmed hunk actions of spec 9. Keep comments and agent dispatch out.
+- Phases 1-3 ship a viewer whose only git mutations are the confirmed hunk actions of spec 9 and whose only host traffic is the three methods of spec 10 (`pane.get`, `pane.list`, `agent.prompt`). Reading agent replies is spec 11; keep it out until then.
 - `src/git/` is frozen at vimeflow `91e45b1c8f381385093813d0b4eb1d9daeb2d563` plus registered patches. Never edit it by hand: change the pin or add a numbered patch in `port/patches/`, registered in `PORT-SURFACE.md`.
 - Verify the frozen tree with `scripts/port-check.sh /path/to/vimeflow` and `sh scripts/port-check-selftest.sh /path/to/vimeflow`. Treat the reference checkout as read-only. The engine reaches five additional frozen functions through the D6 visibility patch; its read allow-list has ten subcommands, and `apply` is the eleventh.
 - Before committing, run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and `cargo check --no-default-features`, plus both port checks. Test HOME must be writable and outside a git repository; preserve CARGO_HOME and RUSTUP_HOME when overriding it.
 - Keep inherited clippy allowances on the `git` module declaration; do not alter frozen sources to satisfy lints.
-- Reserved keys remain unbound: `i I u U x X v y Y @ c /`. `b` and `B` are the scope keys; `s`, `d` and `D` are the Phase 2 write actions, bound in `worktree` scope only and, in `branch` scope, showing `switch to worktree scope (b) to stage or discard`.
+- `/` remains unbound. `b` and `B` are the scope keys; `s`, `d` and `D` are the Phase 2 write actions, bound in `worktree` scope only and, in `branch` scope, showing `switch to worktree scope (b) to stage or discard`; `A i I u U x X v y Y @ c` are the review loop's (spec 10).
 - `M` marks a commit as reviewed and writes only `marks.json`; the ten read subcommands are unchanged; `apply` is the eleventh and runs only from a confirmed `s`, `d` or `D` (`tests/hunk_actions.rs`).
 - Read the plugin ID from `HERDR_PLUGIN_ID`. Reach the host through `HERDR_BIN_PATH` or `HERDR_SOCKET_PATH`; never hardcode its executable name in Rust.
 - Use the shared absolute config/state directory helpers. Never write state relative to the current directory. Sanitize git text before drawing; use named ANSI colours only.
@@ -106,6 +106,8 @@ loop guarantees, and what a change to it must keep:
   variables gets a process of its own: `tests/env_policy.rs` holds one test for that
   reason.
 
+**The host is three methods behind a trait.** `engine::host::HostClient`; tests inject `host::Scripted`, the read-only test a fake socket.
+
 ### The TUI
 
 - `view::render` is pure: a `Snapshot`, a `ViewState` and a size in,
@@ -126,10 +128,12 @@ loop guarantees, and what a change to it must keep:
 
 `src/paths.rs` resolves the config and state directories (`HERDR_PLUGIN_*_DIR`, then
 XDG, then HOME; absolute values only). The state directory holds `bases.json`,
-`marks.json`, `split-panes.json` and `config-problems.log`. The three JSON files are
-rewritten under `actions::reuse::with_lock`, a `flock` on `split-panes.lock`, through
-a temporary file and a rename. `tests/readonly_guarantee.rs` asserts the exact list
-of files a session writes, so a new state file changes that test.
+`marks.json`, `split-panes.json`, `targets.json`, `comments.json`, `requests.json`,
+`clipboard.md` and `config-problems.log`. The JSON files are rewritten under
+`actions::reuse::with_lock`, a `flock` on `split-panes.lock`, through a temporary
+file and a rename. The second lock, `send.lock` (`dispatch::SendLock`), serializes
+sends. `tests/readonly_guarantee.rs` and `tests/review_loop_guarantee.rs` assert the
+exact list of files their sessions write, so a new state file changes those tests.
 
 ### Three invariants
 
@@ -173,8 +177,8 @@ here before changing them.
 
 - `PORT-SURFACE.md`: the frozen tree's pin and patches, the divergences D1-D6 and the
   known defects K1-K7.
-- `docs/superpowers/specs/`: section numbers run on across the three files (1-6 the
-  roadmap and Phase 1, 7 branch scope, 8 review marks), and code comments cite them
+- `docs/superpowers/specs/`: section numbers run on across the files (1-6 the
+  roadmap and Phase 1, 7 branch scope, 8 review marks, 9 hunk actions, 10 the review loop), and code comments cite them
   by number.
 - `docs/superpowers/plans/`: each plan ends with the notes of its review rounds.
 - `docs/acceptance-p1.md`: manual acceptance, one row per criterion.

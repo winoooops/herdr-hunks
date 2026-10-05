@@ -16,6 +16,12 @@ then changed only by the registered patches below:
 `0003-engine-visibility.patch` (D6) and `0004-status-two-halves.patch` (K5).
 `sh scripts/port-check-selftest.sh <vimeflow-checkout>` verifies the baseline and rejection of symlinks, extra files, hand edits, and unregistered patches in a temporary copy.
 
+## Carried prompt
+
+`src/engine/prompts/delegated-review.md` is the pin's
+`src/features/diff/prompts/delegated-review.prompt.md`, byte for byte, compared by
+`scripts/port-check.sh`; it is not part of `src/git/`.
+
 ## Port surface
 
 The frozen tree imports exactly these two shim modules:

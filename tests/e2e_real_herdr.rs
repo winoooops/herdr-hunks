@@ -105,6 +105,17 @@ impl Isolated {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    fn send_enter(&self, pane: &str) {
+        let out = self
+            .host_command()
+            .args(["pane", "send-keys", pane, "enter"])
+            .output()
+            .expect("send Enter through the isolated host");
+        if !out.status.success() {
+            self.herdr(&["pane", "send-text", pane, "\r"]);
+        }
+    }
+
     fn viewers(&self) -> Vec<Value> {
         self.herdr(&["pane", "list"])["result"]["panes"]
             .as_array()
@@ -288,12 +299,15 @@ fn open_split_creates_one_viewer_and_reuses_it() {
             "15000",
         ]);
         iso.herdr(&["pane", "send-text", viewer_id, "b"]);
+        // The headless split is about fifty columns, where the toolbar keeps the steppers and the
+        // target chip and drops the scope chip (spec 10.2), so `vs main` never shows here; the
+        // branch lists two rows where the worktree lists one, and the stepper says so.
         iso.herdr(&[
             "pane",
             "wait-output",
             viewer_id,
             "--match",
-            "vs main",
+            "a.txt 1/2",
             "--source",
             "visible",
             "--timeout",
@@ -420,6 +434,78 @@ fn open_split_creates_one_viewer_and_reuses_it() {
             "--timeout",
             "15000",
         ]);
+        // With no agent pane, send the review to the clipboard (spec 10).
+        iso.herdr(&["pane", "send-text", viewer_id, "A"]);
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "No agent pane in this session",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        iso.send_enter(viewer_id);
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "→ clipboard",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        iso.herdr(&["pane", "send-text", viewer_id, "i"]);
+        // The hunk action leaves the cursor on either side of the changed line.
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "comment on ",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        iso.herdr(&["pane", "send-text", viewer_id, "tier b"]);
+        iso.send_enter(viewer_id);
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "Change · pending",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        iso.herdr(&["pane", "send-text", viewer_id, "Y"]);
+        iso.herdr(&[
+            "pane",
+            "wait-output",
+            viewer_id,
+            "--match",
+            "to the clipboard?",
+            "--source",
+            "visible",
+            "--timeout",
+            "15000",
+        ]);
+        iso.herdr(&["pane", "send-text", viewer_id, "Y"]);
+        let clipboard = Path::new("plugins").join(plugin_id).join("clipboard.md");
+        wait_for("clipboard.md holds the review", || {
+            host_paths(&iso.state, &clipboard).iter().any(|p| {
+                std::fs::read_to_string(p)
+                    .map(|t| t.starts_with("> Inline review — 1 item."))
+                    .unwrap_or(false)
+            })
+        });
         assert_eq!(
             viewer["cwd"].as_str().map(PathBuf::from),
             Some(std::fs::canonicalize(&repo).unwrap())

@@ -1,7 +1,7 @@
 [package]
 name = "herdr-hunks"
-version = "0.0.4"
-description = "Git hunk viewer plugin for herdr, ported from vimeflow: changed files, hunks, and staging behind a y/n box."
+version = "0.0.5"
+description = "Git hunk viewer with staging, discarding, review comments and a send to the agent pane of your choice."
 license = "Apache-2.0"
 edition = "2021"
 rust-version = "1.88"

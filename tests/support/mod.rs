@@ -227,6 +227,11 @@ impl FakeHerdr {
         *self.reply_raw.lock().unwrap() = value;
     }
 
+    #[allow(dead_code)]
+    pub fn all_calls(&self) -> Vec<serde_json::Value> {
+        self.recorded.lock().unwrap().clone()
+    }
+
     pub fn calls_named(&self, method: &str) -> Vec<serde_json::Value> {
         self.recorded
             .lock()

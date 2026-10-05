@@ -721,9 +721,10 @@ target, writes a comment, finishes, copies with `c` and requests a review of
 all changes, and asserts that the only methods the host saw are `pane.list`,
 `pane.get` and `agent.prompt`, that `agent.prompt` was called exactly once per
 confirmed send with the text the test expects, that every git command was one
-of the ten, that the state directory afterwards holds `bases.json`,
-`marks.json`, `targets.json`, `comments.json`, `requests.json`, `clipboard.md`
-and the two lock files and nothing else, and, as before, that the index, the
+of the ten, that the state directory holds only the files the script writes:
+`targets.json`, `comments.json`, `requests.json`, `clipboard.md`, `send.lock`
+and `split-panes.lock`, and `bases.json`/`marks.json` only when a base or a mark
+was made, and, as before, that the index, the
 refs and the worktree are byte for byte what they were. The fake answers
 `pane.get` from a table the test edits mid-run, which is how the `Gone`,
 `Left`, `Restarted` and `blocked` paths of 10.4 are exercised without a host.
@@ -982,9 +983,10 @@ against the fake `HostClient` of 10.6, which records every request and answers
     that the host saw only `pane.list`, `pane.get` and `agent.prompt`,
     `agent.prompt` once per confirmed send with the expected text; that every
     git command the session ran, the request's diff loads included, is one of
-    the ten; that the state directory holds exactly `bases.json`,
-    `marks.json`, `targets.json`, `comments.json`, `requests.json`,
-    `clipboard.md`, `split-panes.lock` and `send.lock`; and that the
+    the ten; that the state directory holds only the files the script writes:
+    `targets.json`, `comments.json`, `requests.json`, `clipboard.md`, `send.lock`
+    and `split-panes.lock`, and `bases.json`/`marks.json` only when a base or a
+    mark was made; and that the
     repository is byte for byte what it was.
 11. Tier B (ignored, real host): after the existing `b` and `M`, the test
     presses `A` in a session whose only other pane is a shell, asserts the
