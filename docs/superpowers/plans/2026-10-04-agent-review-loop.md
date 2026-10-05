@@ -1710,9 +1710,10 @@ The waits below follow the rule of AGENTS.md: wait for the state the assertion n
         let (_rt, handle) = start_from(config);
         wait_for(&handle, "rows", |s| !s.files.is_empty());
         wait_cond("the opener was asked about", || host.calls.lock().unwrap().iter().filter(|c| *c == "pane.get").count() >= 1);
-        // A comment publishes a snapshot; the target in it is none, and the file has no record.
-        handle.commands.send(pending(2, "x")).unwrap();
-        let s = wait_for(&handle, "a snapshot after the resolution", |s| s.comment_seq == 1);
+        // A pane listing publishes a snapshot (this task's own command); the target in it is none, and
+        // the file has no record.
+        handle.commands.send(Command::LoadPanes(1)).unwrap();
+        let s = wait_for(&handle, "a snapshot after the resolution", |s| s.panes_seq == 1);
         assert_eq!(s.target, None, "a reply about w4:p9 preselected it for an opener in w4:p2");
         assert!(target::load_targets(state.path()).0.get(&top).is_none());
     }
@@ -2508,6 +2509,36 @@ mod tests {
     }
 
     #[test]
+    fn a_journaled_add_stays_on_screen_through_a_failed_edit_on_a_full_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = open(dir.path());
+        let mut b = open(dir.path());
+        a.fail_writes_for_tests(true);
+        a.transact(Operation::Add(comment("mine", "unsaved", 1)), 1_001).unwrap_err();
+        for i in 0..50 {
+            b.transact(Operation::Add(comment(&format!("b{i}"), "t", 2)), 1_002).unwrap();
+        }
+        // a's edit of b0 passes the rules (the record is as a saw it after a reload) and fails to write:
+        // the add refused by the full file is still on a's screen, and both are journaled.
+        let _ = a.refresh(1_003);
+        assert!(a.comments().iter().any(|c| c.id == "mine"));
+        let notice = a.transact(Operation::Edit { id: "b0".into(), category: Category::Bug, text: "mine too".into(), seen: comment("b0", "t", 2) }, 1_004).unwrap_err();
+        assert!(notice.starts_with(NOTICE_NOT_REMEMBERED));
+        assert_eq!(a.journal_len(), 2);
+        assert!(a.comments().iter().any(|c| c.id == "mine"), "the journaled add vanished behind a failed edit");
+        assert_eq!(a.comments().iter().find(|c| c.id == "b0").map(|c| c.text.as_str()), Some("mine too"));
+        // Further failed refreshes keep it; a successful one replays the edit, keeps the add journaled and shown.
+        let _ = a.refresh(1_005);
+        assert!(a.comments().iter().any(|c| c.id == "mine"));
+        a.fail_writes_for_tests(false);
+        let _ = a.refresh(1_006);
+        assert_eq!(a.journal_len(), 1, "the edit was written; the add still waits for room");
+        assert!(a.comments().iter().any(|c| c.id == "mine"));
+        b.refresh(1_007);
+        assert_eq!(b.comments().iter().find(|c| c.id == "b0").map(|c| c.text.as_str()), Some("mine too"));
+    }
+
+    #[test]
     fn a_journaled_deletion_of_a_record_since_sent_is_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = open(dir.path());
@@ -2536,15 +2567,8 @@ mod tests {
         sorted.sort();
         assert_eq!(sorted, ids, "later ids sort later");
         assert_eq!(ids.iter().collect::<BTreeSet<_>>().len(), 50, "all distinct");
-        // The claim's order: two comments made in the same second go out in creation order.
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = open(dir.path());
-        let (first, second) = (new_id(), new_id());
-        store.transact(Operation::Add(Comment { id: second.clone(), ..comment("x", "made second", 5) }), 1_001).unwrap();
-        store.transact(Operation::Add(Comment { id: first.clone(), ..comment("x", "made first", 5) }), 1_001).unwrap();
-        let make = |c: u64| format!("n{c:05}");
-        let claimed = store.claim(1_002, &Destination::clipboard(), &make, &mut 0, &|| Ok(()), |eligible, _| Ok(eligible.iter().map(|(n, c)| format!("{n}:{}", c.text)).collect::<Vec<_>>().join(" "))).unwrap();
-        assert_eq!(claimed.text, "1:made first 2:made second", "same second, creation order by id");
+        // Task 5's `a_claim_takes_pending_and_unconfirmed_in_order_and_never_anothers_sending` relies on
+        // this order for two comments made in the same second.
     }
 
     #[test]
@@ -2613,6 +2637,33 @@ mod tests {
         remove_request(dir.path(), "/repo", "zz9zz9").unwrap();
         let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("requests.json")).unwrap()).unwrap();
         assert_eq!(written["/third"].as_array().map(Vec::len), Some(1));
+        // The shape rules of 10.7, one record each: a path with `..`, a merge-base that is no object id,
+        // a label with a control character, a zero-based range, an inverted range, a bad nonce.
+        let file_of = |f: RequestFile| RequestRecord { files: vec![f], ..record.clone() };
+        let ok_file = record.files[0].clone();
+        let bad: Vec<RequestRecord> = vec![
+            file_of(RequestFile { key: FileKey { path: "../etc/passwd".into(), staged: false, untracked: false }, ..ok_file.clone() }),
+            file_of(RequestFile { key: FileKey { path: "/abs".into(), staged: false, untracked: false }, ..ok_file.clone() }),
+            file_of(RequestFile { comparison: AnchorComparison::Branch { merge_base: "main".into(), label: "main".into() }, ..ok_file.clone() }),
+            file_of(RequestFile { comparison: AnchorComparison::Branch { merge_base: "0123456789abcdef0123456789abcdef01234567".into(), label: "ma\u{1b}in".into() }, ..ok_file.clone() }),
+            file_of(RequestFile { additions: vec![(0, 3)], ..ok_file.clone() }),
+            file_of(RequestFile { deletions: vec![(5, 2)], ..ok_file.clone() }),
+            RequestRecord { nonce: "no spaces!".into(), ..record.clone() },
+        ];
+        let good = file_of(RequestFile { comparison: AnchorComparison::Branch { merge_base: "0123456789abcdef0123456789abcdef01234567".into(), label: "origin/main".into() }, ..ok_file.clone() });
+        let mut entries: Vec<serde_json::Value> = bad.iter().map(|r| serde_json::to_value(r).unwrap()).collect();
+        entries.push(serde_json::to_value(&good).unwrap());
+        std::fs::write(dir.path().join("requests.json"), serde_json::json!({ "/repo": entries }).to_string()).unwrap();
+        let (loaded, problem) = load_requests(dir.path(), "/repo");
+        assert_eq!(loaded, vec![good]);
+        assert_eq!(problem.as_deref(), Some("requests.json: 7 unusable record(s)"));
+        // A file that is no object at all: nothing is read, the problem says so, and the next write replaces it.
+        std::fs::write(dir.path().join("requests.json"), "[1, 2]").unwrap();
+        let (loaded, problem) = load_requests(dir.path(), "/repo");
+        assert!(loaded.is_empty());
+        assert!(problem.as_deref().is_some_and(|p| p.starts_with("requests.json: not a JSON object")));
+        record_request(dir.path(), "/repo", &record).unwrap();
+        assert_eq!(load_requests(dir.path(), "/repo"), (vec![record.clone()], None));
     }
 
     #[test]
@@ -2881,24 +2932,31 @@ fn stamp_ok(stamp: &Stamp) -> bool {
 }
 
 /// Every shape rule of spec 10.3 "Remembered".
+/// A repository-relative path with no `..` component: the one shape rule for a path in either file.
+fn path_ok(path: &str) -> bool {
+    let p = Path::new(path);
+    !path.is_empty()
+        && !path.contains('\0')
+        && p.is_relative()
+        && !p.components().any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+/// `Worktree`, or a `Branch` whose merge-base is an object id and whose label is printable.
+fn comparison_ok(comparison: &AnchorComparison) -> bool {
+    match comparison {
+        AnchorComparison::Worktree => true,
+        AnchorComparison::Branch { merge_base, label } => base::is_object_id(merge_base) && super::target::printable(label),
+    }
+}
+
 pub fn check_record(comment: &Comment) -> bool {
-    let path = Path::new(&comment.anchor.key.path);
-    let path_ok = !comment.anchor.key.path.is_empty()
-        && path.is_relative()
-        && !path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir));
+    let path_valid = path_ok(&comment.anchor.key.path);
     let span_ok = match comment.anchor.span {
         Span::Line => comment.anchor.line >= 1,
         Span::Range { end } => comment.anchor.line >= 1 && end >= comment.anchor.line,
         Span::File => comment.anchor.line == 0 && comment.anchor.side == Side::Additions,
     };
-    let comparison_ok = match &comment.anchor.comparison {
-        AnchorComparison::Worktree => true,
-        AnchorComparison::Branch { merge_base, label } => {
-            base::is_object_id(merge_base) && super::target::printable(label)
-        }
-    };
+    let comparison_valid = comparison_ok(&comment.anchor.comparison);
     let text_ok = comment.text.chars().all(|c| c == '\n' || !c.is_control()) && within_caps(&comment.text);
     // Production ids are 32 hex characters; tests name comments `a1`, so the shape is alphanumeric.
     let id_ok = (comment.id.len() == 32 && comment.id.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -2910,7 +2968,7 @@ pub fn check_record(comment: &Comment) -> bool {
         }
         CommentState::Sent(s) => stamp_ok(s),
     };
-    path_ok && span_ok && comparison_ok && text_ok && id_ok && state_ok
+    path_valid && span_ok && comparison_valid && text_ok && id_ok && state_ok
 }
 
 /// `Sending` older than `EXPIRY` becomes `Unconfirmed`, by nonce and only while still `Sending`.
@@ -3106,6 +3164,19 @@ impl Store {
         Ok(result.expect("the locked closure ran"))
     }
 
+    /// An add the cap still refuses stays visible, journaled: the reviewer can shorten or drop it, and
+    /// a later failure (another viewer filled the file; this viewer's edit could not be written) never
+    /// hides what this viewer typed. Run after every reload of `comments`, on success and on failure.
+    fn show_journaled_adds(&mut self) {
+        for entry in &self.journal {
+            if let Operation::Add(comment) = entry {
+                if !self.comments.iter().any(|c| c.id == comment.id) {
+                    self.comments.push(comment.clone());
+                }
+            }
+        }
+    }
+
     /// Under the lock: read the file, replay the journal, apply `op`, expire, write when anything
     /// changed, keep the merged array. `Ok((dropped, problem))`: the notice for a dropped journal
     /// entry and the load problem, if any. The journal is replaced only after a successful write.
@@ -3168,11 +3239,13 @@ impl Store {
             })();
             if let Err(e) = written {
                 // The screen shows what the file holds plus what this viewer still owes it: the journal's
-                // operations are reapplied, so an earlier unsaved add is not hidden by a later failure.
+                // operations are reapplied, so an earlier unsaved add is not hidden by a later failure,
+                // and one the cap refuses on a full file is overlaid all the same (`show_journaled_adds`).
                 self.comments = loaded;
                 for entry in &self.journal {
                     let _ = apply(&mut self.comments, entry);
                 }
+                self.show_journaled_adds();
                 self.mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
                 return Err(e);
             }
@@ -3180,14 +3253,7 @@ impl Store {
         self.journal = kept_journal;
         self.mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         self.comments = comments;
-        // An add the cap still refuses stays visible: the reviewer can shorten or drop it.
-        for entry in &self.journal {
-            if let Operation::Add(comment) = entry {
-                if !self.comments.iter().any(|c| c.id == comment.id) {
-                    self.comments.push(comment.clone());
-                }
-            }
-        }
+        self.show_journaled_adds();
         if let Some(refusal) = refusal {
             return Err(TxError::Refused(refusal));
         }
@@ -3330,26 +3396,30 @@ pub struct RequestRecord {
     pub files: Vec<RequestFile>,
 }
 
+/// The shape rules of 10.7 for a request record: the comment record's rules for a path and a comparison
+/// (`path_ok`, `comparison_ok`, shared with `check_record`), one-based ordered ranges, a nonce, a destination.
 fn check_request(record: &RequestRecord) -> bool {
     is_nonce(&record.nonce)
         && record.target.is_well_formed()
         && record.files.iter().all(|f| {
-            !f.key.path.is_empty()
-                && Path::new(&f.key.path).is_relative()
-                && f.additions.iter().chain(&f.deletions).all(|(a, b)| a <= b)
+            path_ok(&f.key.path)
+                && comparison_ok(&f.comparison)
+                && f.additions.iter().chain(&f.deletions).all(|(a, b)| *a >= 1 && a <= b)
         })
 }
 
-/// This worktree's requests, checked by shape; a malformed record is dropped alone.
 /// The request file as a map of raw per-worktree values. Another worktree's entry is kept whatever its
 /// shape, so one malformed entry never costs the others their records (and their reply correlations); a
 /// missing file is an empty map; a file that cannot be read is an error. A top level that is no object
-/// holds nothing anyone can keep and reads as empty.
-fn read_request_map(path: &Path) -> std::io::Result<BTreeMap<String, serde_json::Value>> {
+/// holds nothing anyone can keep: it reads as empty, with the problem beside it for the caller to report.
+fn read_request_map(path: &Path) -> std::io::Result<(BTreeMap<String, serde_json::Value>, Option<String>)> {
     match std::fs::read_to_string(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((BTreeMap::new(), None)),
         Err(e) => Err(e),
-        Ok(text) => Ok(serde_json::from_str(&text).unwrap_or_default()),
+        Ok(text) => match serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&text) {
+            Ok(all) => Ok((all, None)),
+            Err(e) => Ok((BTreeMap::new(), Some(format!("{REQUESTS_FILE}: not a JSON object ({e}); its records are discarded")))),
+        },
     }
 }
 
@@ -3370,10 +3440,12 @@ fn parse_requests(all: &BTreeMap<String, serde_json::Value>, toplevel: &str) -> 
     (kept, (dropped > 0).then(|| format!("{REQUESTS_FILE}: {dropped} unusable record(s)")))
 }
 
+/// This worktree's requests, checked by shape; a malformed record is dropped alone, a malformed file whole.
 pub fn load_requests(state_dir: &Path, toplevel: &str) -> (Vec<RequestRecord>, Option<String>) {
     match read_request_map(&state_dir.join(REQUESTS_FILE)) {
         Err(e) => (Vec::new(), Some(format!("{REQUESTS_FILE}: {e}"))),
-        Ok(all) => parse_requests(&all, toplevel),
+        Ok((_, Some(problem))) => (Vec::new(), Some(problem)),
+        Ok((all, None)) => parse_requests(&all, toplevel),
     }
 }
 
@@ -3388,7 +3460,11 @@ fn append_request(state_dir: &Path, toplevel: &str, record: &RequestRecord) -> s
     // A file that cannot be read aborts the write, or the rename would replace every worktree's
     // records with this one's. Malformed records of this worktree are rewritten out; every other
     // entry is written back as read.
-    let mut all = read_request_map(&state_dir.join(REQUESTS_FILE))?;
+    let (mut all, problem) = read_request_map(&state_dir.join(REQUESTS_FILE))?;
+    if let Some(problem) = problem {
+        // The file is replaced by a valid one below; the problem would otherwise never be seen.
+        base::note_problem(state_dir, &problem);
+    }
     let (mut mine, _) = parse_requests(&all, toplevel);
     mine.push(record.clone());
     all.insert(toplevel.to_string(), serde_json::Value::Array(mine.iter().map(|r| serde_json::to_value(r).unwrap_or_default()).collect()));
@@ -3459,7 +3535,10 @@ pub fn write_clipboard(state_dir: &Path, text: &str) -> std::io::Result<PathBuf>
 /// Removes this worktree's request under `nonce`: a request whose send definitely failed.
 pub fn remove_request(state_dir: &Path, toplevel: &str, nonce: &str) -> std::io::Result<()> {
     reuse::with_lock(state_dir, || {
-        let mut all = read_request_map(&state_dir.join(REQUESTS_FILE))?;
+        let (mut all, problem) = read_request_map(&state_dir.join(REQUESTS_FILE))?;
+        if let Some(problem) = problem {
+            base::note_problem(state_dir, &problem);
+        }
         let (mine, _) = parse_requests(&all, toplevel);
         let kept: Vec<_> = mine.into_iter().filter(|r| r.nonce != nonce).map(|r| serde_json::to_value(r).unwrap_or_default()).collect();
         all.insert(toplevel.to_string(), serde_json::Value::Array(kept));
@@ -3556,7 +3635,9 @@ fn now() -> u64 {
 The three commands run the transaction on the blocking pool, because `with_lock` can wait two seconds, and answer with `Done::Comment`:
 
 ```rust
-                    Command::AddComment { token, anchor, category, text } | Command::EditComment { token, .. } | Command::DeleteComment { .. } => { /* see below */ }
+                    Command::AddComment { token, anchor, category, text } => { /* see below */ }
+                    Command::EditComment { token, seen, category, text } => { /* see below */ }
+                    Command::DeleteComment { seen } => { /* see below */ }
 ```
 
 Write it as one arm per command that builds an `Operation` and calls a shared method `State::transact(op, token, results)` (`Some(token)` for an add or edit, `None` for a delete):
@@ -4378,6 +4459,11 @@ Add to `comments.rs`'s tests:
         store.transact(Operation::Add(comment("p2", "fourth", 4)), 1_010).unwrap();
         // An older comment that landed late in the array (a journal replay) is numbered by its creation time.
         store.transact(Operation::Add(comment("p0", "zeroth", 0)), 1_010).unwrap();
+        // Two made in the same second (`created_at` is in seconds) are ordered by their ids, which
+        // `new_id` makes increase with time: the one made first goes first, whatever the array order.
+        let (first, second) = (new_id(), new_id());
+        store.transact(Operation::Add(Comment { id: second.clone(), ..comment("x", "made second", 5) }), 1_010).unwrap();
+        store.transact(Operation::Add(Comment { id: first.clone(), ..comment("x", "made first", 5) }), 1_010).unwrap();
         let to = Destination::Pane { pane: "w4:p2".into(), agent: "codex".into(), session: None };
         let make = |counter: u64| format!("n{counter:05}");
         let ok = || Ok(());
@@ -4390,14 +4476,14 @@ Add to `comments.rs`'s tests:
             .unwrap();
         // `theirs` and `oldone` are retained nonces, but `n00001` is free: the first candidate is taken.
         assert_eq!(claimed.nonce, "n00001");
-        // Numbered by creation time, not array order: p0 first, p2 last.
-        assert_eq!(claimed.text, "n00001|1:p0,2:p1,3:u1,4:p2");
-        assert_eq!(claimed.comments.len(), 4);
+        // Numbered by creation time, not array order: p0 first, p2 and the same-second pair last, in order.
+        assert_eq!(claimed.text, format!("n00001|1:p0,2:p1,3:u1,4:p2,5:{first},6:{second}"));
+        assert_eq!(claimed.comments.len(), 6);
         for c in &claimed.comments {
             match &c.state {
                 CommentState::Sending { stamp, before } => {
                     assert_eq!((stamp.nonce.as_str(), &stamp.to), ("n00001", &to));
-                    let expected_item = ["p0", "p1", "u1", "p2"].iter().position(|id| *id == c.id).unwrap() as u32 + 1;
+                    let expected_item = ["p0", "p1", "u1", "p2", first.as_str(), second.as_str()].iter().position(|id| *id == c.id).unwrap() as u32 + 1;
                     assert_eq!(stamp.item, expected_item);
                     assert_eq!(before.is_some(), c.id == "u1", "only the unconfirmed one remembers its earlier stamp");
                 }
@@ -7561,7 +7647,7 @@ pub fn attach_row(diff: &LoadedDiff, row_of_target: &[usize], anchor: &Anchor) -
     }
 ```
 
-where `anchor_target(diff, anchor)` is the target of the anchor's own line on its own side (`nav::find(&diff.targets, anchor.side, anchor.line)`, the range's last line for a `Range`, `None` for a `File`), so a click on a card lands on the line the comment is about, on its side, and never on the other side's cell of the same split row. `orphans_only(orphans, width)` is the same tail on an empty `rows` with no `row_of_target`. A comment whose anchor line is not in the diff (`attach_row` is `None`) is not drawn on this screen and not an orphan either: its row is listed, its line is not; it is counted and sent as 10.3 says, and `✎` still marks the file.
+where `anchor_target(diff, anchor)` is the target of the anchor's own line on its own side (`nav::find(&diff.targets, anchor.side, anchor.line)`, the range's last line for a `Range`, `None` for a `File`), so a click on a card lands on the line the comment is about, on its side, and never on the other side's cell of the same split row. `orphans_only(orphans, width, editor)` is the same tail on an empty `rows` with no `row_of_target`, the editor (if any) spliced after the last row. A comment whose anchor line is not in the diff (`attach_row` is `None`) is not drawn on this screen and not an orphan either: its row is listed, its line is not; it is counted and sent as 10.3 says, and `✎` still marks the file.
 
 `view::body_line`'s match is exhaustive, so this step also adds its two arms, or the crate does not compile: `Row::Orphans { count }` draws `Span::label(format!("✎ on changes no longer shown ({count})"))`, and `Row::Card { line, .. }` draws, after the gutter's spaces, through `cards::frame_top` / `frame_text` / `frame_bottom` at `cards::card_width(columns, mode)`, the same number the rows were wrapped for, the title span styled `Style { semantic: tone, role: if dim { Role::Label } else { Role::Emphasis }, ..Style::role(Role::Body) }`. Step 7 adds the cursor highlight and the hits on top of this. A test in `view.rs`, `a_card_is_wrapped_and_framed_at_one_width`, renders a 200-character comment at 80 and 120 columns in both modes and asserts that the text rows' contents, joined, equal the comment's text: nothing hidden by a frame narrower than the wrap.
 
@@ -7761,7 +7847,7 @@ Tests in `review.rs`: `the_editor_title_names_the_place_and_the_chosen_category`
 
 `RESERVED` shrinks to `["y", "Y", "@", "c", "/"]` (Task 8 finishes it); `KEYS.len()` becomes 35, and `help_panel(false).rows.len()` 35 in the same `keys.rs` test.
 
-2. `state.rs`: the new fields (`editor`, `visual`, `orphan`, `seen_comment_seq`, and `comment_token: u64`, the counter whose next value numbers a save); `reconcile` rebuilds when any of the six parts of `built_from` changed (the diff's `Arc`, the mode, the comments' `Arc`, the files hash, the width, the editor's place and line count), where the files hash is `(snapshot.scope, snapshot.files.iter().map(FileKey::of))` hashed with `DefaultHasher`, and the width is the body width (`self.width` minus the panel); `rows::build(diff, self.mode, &rows::in_place(&snapshot.comments, diff, branch), &rows::orphans(&snapshot.comments, snapshot), cards::card_width(body_width, self.mode), self.editor_place().as_ref())`, with `editor_place()` deriving `EditorPlace` from `self.editor` (its anchor, or the orphan id it edits, and `editor.lines(card_width).len()`). `reconcile` also drops a visual selection whose diff is no longer the one on screen (below). When the diff is not `Ready` but orphans exist, `reconcile` builds `rows::orphans_only(&orphans, body_width)` instead of clearing `self.rows`, with `cursor = None`, and clears it only when there are no orphans either; the five-part `built_from` key is kept with a `None` diff in that case. `observe` gains:
+2. `state.rs`: the new fields (`editor`, `visual`, `orphan`, `seen_comment_seq`, and `comment_token: u64`, the counter whose next value numbers a save); `reconcile` rebuilds when any of the six parts of `built_from` changed (the diff's `Arc`, the mode, the comments' `Arc`, the files hash, the width, the editor's place and line count), where the files hash is `(snapshot.scope, snapshot.files.iter().map(FileKey::of))` hashed with `DefaultHasher`, and the width is the body width (`self.width` minus the panel); `rows::build(diff, self.mode, &rows::in_place(&snapshot.comments, diff, branch), &rows::orphans(&snapshot.comments, snapshot), cards::card_width(body_width, self.mode), self.editor_place().as_ref())`, with `editor_place()` deriving `EditorPlace` from `self.editor` (its anchor, or the orphan id it edits, and `editor.lines(card_width).len()`). `reconcile` also drops a visual selection whose diff is no longer the one on screen (below). When the diff is not `Ready` but orphans exist, or the editor is open, `reconcile` builds `rows::orphans_only(&orphans, body_width, self.editor_place().as_ref())` instead of clearing `self.rows`, with `cursor = None` (the editor is spliced at `EditorAnchor::End`: its anchor is in no loaded diff, and a draft must never be off screen while its keys are modal, as when the last changed file turns clean under an open editor), and clears it only when there are no orphans and no editor; the five-part `built_from` key is kept with a `None` diff in that case. `a_draft_stays_on_screen_when_the_diff_goes_away` (Step 7's tests) pins it. `observe` gains:
 
 ```rust
         if snapshot.comment_seq != self.seen_comment_seq {
@@ -7964,7 +8050,7 @@ pub fn step_on_side(diff: &LoadedDiff, cursor: usize, side: Side, delta: isize) 
 
 The orphan cursor: in `move_cursor`'s `LineDown`, when the cursor is the last target of the unified order (or `targets.len() - 1` in split) and `rows.orphan_tops` is non-empty, set `state.orphan = Some(0)` and keep the cursor; with **no targets at all** (an empty list, or a diff that is not `Ready`, with orphans drawn by `orphans_only`), `LineDown` from nothing sets `orphan = Some(0)` too, which is the entry path into an orphan-only view; `LineDown` on orphan `n` moves to `n + 1` while one exists; `LineUp` on orphan 0 clears `orphan` (and leaves the cursor where it was, or nowhere); `LineUp` on `n` moves to `n - 1`; every other movement key clears `orphan`. `keep_cursor_visible` scrolls to `orphan_tops[n].0` when `orphan` is set. `move_cursor`'s early return on `(DiffState::Ready, Some(cursor))` must therefore give way to the orphan rules before it returns `Inert`.
 
-4. `view.rs`: `body_line`'s two card arms are Step 4's; here they gain the cursor: an orphan card under the orphan cursor is drawn in reverse video as a cursor row is. A visual selection is drawn: every row whose target lies on the selection's side between its first and last line takes the cursor's reverse video on its text span (`render` computes the selected target set from `review::selection` once per frame and passes `selected: bool` to `body_line` beside `cursor`), so what `i` or `y` will act on is visible; a view test, `a_visual_selection_is_drawn_in_reverse_over_its_lines`, selects two lines with `v`, `j` and asserts the reverse flag on exactly those rows' text spans and on no other. `Action` gains `EditorCategory(Category)` (`key_action()` → `None`), handled in `handle_mouse`'s click arm by setting the open editor's category. The editor is modal for the mouse as the y/n box is: while `state.editor.is_some()`, `handle_mouse` handles `EditorCategory` clicks and the wheel (scrolling the body) and nothing else, so a click on the toolbar, the files panel or a diff row cannot open a picker, a box or another action under an open editor; a test, `clicks_under_an_open_editor_are_inert_except_the_category_words`, presses a toolbar hit and a file hit while editing and asserts `Outcome::Inert`, then clicks a category word and asserts the category changed. When the diff is not `Ready` but `rows::orphans` is non-empty, `render` draws `state.rows` (built by `orphans_only`) instead of `state_message`'s centred text, so an empty list with comments left behind shows the orphan section, not `working tree clean`. The editor's rows are real rows, so one coordinate system serves scrolling, hits and drawing: `Row::Editor { line: usize }`, one per line of `editor.lines(card_width)`, spliced by `rows::build` (and `orphans_only`) after the row the editor sits under, which `build` receives as `editor: Option<EditorPlace>` with `EditorPlace { after: EditorAnchor, lines: usize }` and `enum EditorAnchor { Anchor(Anchor), Orphan(String) /* the card's id */, End }`: the anchor's row through `attach_row` for an anchor in the loaded diff, the last `Row::Card` row carrying the id for an orphan being edited (the editor replaces the card visually), the last body row when the anchor's line is not in the diff. The rows carry no text; `view::body_line` draws `Row::Editor { line }` from `state.editor.lines(card_width)[line]`, `frame_top(editor.title(), …)` for the first, `frame_bottom(if editor.pending.is_some() { "saving…" } else { EDITOR_FOOTER }, …)` for the last, so typing never rebuilds the rows: `reconcile`'s key gains `(editor anchor, line count)` and rebuilds only when the editor opens, closes, moves or grows a line, which is rare and cheap. The title line pushes one hit per category word, `Action::EditorCategory(Category)`, and a click sets `editor.category` (spec 10.3's clickable words); the text rows push no hit. `view::body_is_drawn` stays true while the editor is open (it is a card, not a modal).
+4. `view.rs`: `body_line`'s two card arms are Step 4's; here they gain the cursor: an orphan card under the orphan cursor is drawn in reverse video as a cursor row is. A visual selection is drawn: every row whose target lies on the selection's side between its first and last line takes the cursor's reverse video on its text span (`render` computes the selected target set from `review::selection` once per frame and passes `selected: bool` to `body_line` beside `cursor`), so what `i` or `y` will act on is visible; a view test, `a_visual_selection_is_drawn_in_reverse_over_its_lines`, selects two lines with `v`, `j` and asserts the reverse flag on exactly those rows' text spans and on no other. `Action` gains `EditorCategory(Category)` (`key_action()` → `None`), handled in `handle_mouse`'s click arm by setting the open editor's category. The editor is modal for the mouse as the y/n box is: while `state.editor.is_some()`, `handle_mouse` handles `EditorCategory` clicks and the wheel (scrolling the body) and nothing else, so a click on the toolbar, the files panel or a diff row cannot open a picker, a box or another action under an open editor; a test, `clicks_under_an_open_editor_are_inert_except_the_category_words`, presses a toolbar hit and a file hit while editing and asserts `Outcome::Inert`, then clicks a category word and asserts the category changed. When the diff is not `Ready` but `rows::orphans` is non-empty or the editor is open, `render` draws `state.rows` (built by `orphans_only`) instead of `state_message`'s centred text, so an empty list with comments left behind shows the orphan section, not `working tree clean`, and a draft is never hidden behind that message. The editor's rows are real rows, so one coordinate system serves scrolling, hits and drawing: `Row::Editor { line: usize }`, one per line of `editor.lines(card_width)`, spliced by `rows::build` (and `orphans_only`) after the row the editor sits under, which `build` receives as `editor: Option<EditorPlace>` with `EditorPlace { after: EditorAnchor, lines: usize }` and `enum EditorAnchor { Anchor(Anchor), Orphan(String) /* the card's id */, End }`: the anchor's row through `attach_row` for an anchor in the loaded diff, the last `Row::Card` row carrying the id for an orphan being edited (the editor replaces the card visually), the last body row when the anchor's line is not in the diff. The rows carry no text; `view::body_line` draws `Row::Editor { line }` from `state.editor.lines(card_width)[line]`, `frame_top(editor.title(), …)` for the first, `frame_bottom(if editor.pending.is_some() { "saving…" } else { EDITOR_FOOTER }, …)` for the last, so typing never rebuilds the rows: `reconcile`'s key gains `(editor anchor, line count)` and rebuilds only when the editor opens, closes, moves or grows a line, which is rare and cheap. The title line pushes one hit per category word, `Action::EditorCategory(Category)`, and a click sets `editor.category` (spec 10.3's clickable words); the text rows push no hit. `view::body_is_drawn` stays true while the editor is open (it is a card, not a modal).
 
 With the editor's rows in `rows`, keeping it on screen is the existing machinery: `keep_cursor_visible` scrolls to the span from the editor's first row to its last (`ensure_visible` over `first..=last`), after `reconcile` and after every editor key; when the editor is taller than the body, the offset puts its last row (the caret's) on the bottom row, and the anchor above scrolls out as any row does. Tests in `state.rs`: `an_editor_opened_on_the_bottom_row_scrolls_into_view` (a 40-target diff in a 10-row body, the editor opened on the last target, its bottom row within the viewport), `an_editor_taller_than_the_body_keeps_its_caret_visible` (120 lines typed through `ctrl+j`, the last rendered row carries `_`), and `a_partially_visible_editor_whose_anchor_scrolled_away_still_draws` (the offset moved past the anchor row by `ctrl+d`: the editor's remaining rows are drawn at the top of the body, nothing is skipped). `files_lines`: the `✎` cell before the marker when any comment of the file exists under the current comparison kind (`snapshot.comments.iter().any(|c| c.anchor.key.path == file.path && kind matches)`), the name fitted to `FILES_WIDTH - 3`; the header `CHANGED {n} · ✎ {pending}` when `pending > 0`, counting `comments.iter().filter(|c| c.is_pending()).count()` across both scopes. Card rows push `Action::CursorToRow(row)` hits as other rows do; `CursorToRow` on a card row with `target: Some(t)` sets the cursor to `t`, the anchor's own target (in `handle_mouse`'s click arm: look the row up in `state.rows`), so the cursor lands on the comment's side.
 
@@ -8165,6 +8251,25 @@ The tests that follow start from `review_setup` where they need a listed file, l
     }
 
     #[test]
+    fn a_draft_stays_on_screen_when_the_diff_goes_away() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        handle_key(&mut st, &snap, key("i"), 120);
+        for ch in "half".chars() {
+            handle_key(&mut st, &snap, key(&ch.to_string()), 120);
+        }
+        // The last changed file turns clean under the editor: the draft is drawn, the keys still reach it.
+        snap.files.clear();
+        snap.diff = DiffState::Idle;
+        st.observe(&snap);
+        st.reconcile(&snap);
+        assert!(st.rows.as_ref().is_some_and(|r| r.rows.iter().any(|row| matches!(row, Row::Editor { .. }))), "the editor's rows survive the diff");
+        let rendered = crate::tui::view::render(&snap, &st, 120, 24);
+        assert!(rendered.plain().iter().any(|line| line.contains("half_")), "the draft is drawn, caret included");
+        assert_eq!(handle_key(&mut st, &snap, key("!"), 120), Outcome::Redraw);
+        assert!(matches!(handle_key(&mut st, &snap, key("Enter"), 120), Outcome::Engine(Command::AddComment { text, .. }) if text == "half!"));
+    }
+
+    #[test]
     fn in_split_mode_u_and_x_take_the_card_of_the_cursors_side_only() {
         let (mut snap, mut st) = review_setup(&[(10, " -+ ")]);
         st.requested_mode = ViewMode::Split;
@@ -8336,6 +8441,8 @@ pub review_box: Option<ReviewBox>,
 seen_send_seq: u64, seen_copy_seq: u64,
 /// The OSC 52 text the shell writes before the next frame, taken once.
 pub pending_copy: Option<String>,
+/// A command `observe` decided on (the picker it opened asks for its rows); the shell sends it after `observe`, once.
+pub pending_command: Option<Command>,
 ```
 
 - [ ] **Step 1: The typed refusal on the snapshot**
@@ -8807,10 +8914,27 @@ A note on the `Restarted` acceptance in `submit`: the chip's `Restarted` state d
                 }
             }
         }
+        // A target that leaves or vanishes under an open box: the box becomes the picker (10.4's table),
+        // which asks for its rows through `pending_command`. A box with a send pending waits for the
+        // answer first; the refusal it brings clears `pending`, and the next observe gets here.
+        if let (Some(b), Some(Target::Pane { agent, pane, .. }), TargetState::Left | TargetState::Gone) = (&self.review_box, &snapshot.target, &snapshot.target_state) {
+            if b.pending.is_none() {
+                let return_to = match b.kind {
+                    crate::tui::review::BoxKind::Finish => crate::tui::panes::ReturnTo::Finish,
+                    crate::tui::review::BoxKind::Request => crate::tui::panes::ReturnTo::Request(b.scope.clone()),
+                };
+                self.review_box = None;
+                self.notify(format!("{} · {} is gone · pick a pane", crate::tui::sanitize::sanitize(agent), crate::tui::sanitize::sanitize(pane)));
+                self.panes_token += 1;
+                self.panes = Some(crate::tui::panes::PanePicker::open(self.panes_token, return_to));
+                self.pending_command = Some(Command::LoadPanes(self.panes_token));
+            }
+        }
         // The picker opened by Y or @ returns to its box.
         if let Some(picker) = &self.panes {
             if picker.done && snapshot.target.is_some() {
-                match picker.return_to {
+                // By reference: the scope is cloned out of the picker, which `self.panes` still owns here.
+                match &picker.return_to {
                     crate::tui::panes::ReturnTo::Finish => self.review_box = Some(crate::tui::review::ReviewBox::finish()),
                     crate::tui::panes::ReturnTo::Request(scope) => {
                         // The scope chosen before A is the scope after the pick; `offers` withdraws Y if it is gone.
@@ -8824,7 +8948,7 @@ A note on the `Restarted` acceptance in `submit`: the chip's `Restarted` state d
         }
 ```
 
-A box whose target state turns `Left`/`Gone` while open is closed by `observe`, which opens the picker with the gone notice instead (`ReturnTo` the box's kind, a Request box's with its scope).
+A box whose target state turns `Left`/`Gone` while open is closed by `observe`, which opens the picker with the gone notice instead (`ReturnTo` the box's kind, a Request box's with its scope). `observe` returns nothing, so the rows are asked for through one slot: `ViewState.pending_command: Option<Command>`, set to `Command::LoadPanes(self.panes_token)` here and drained by the shell right after `observe` (`if let Some(command) = state.pending_command.take() { let _ = handle.commands.send(command); }`, beside the `pending_copy` write of Step 4), so the picker a snapshot opened loads like one a key opened. The code is in `observe` above; `a_box_whose_target_goes_away_becomes_the_picker_and_asks_for_rows` in Step 5 pins it.
 
 3. `input.rs`: routing: help, confirm, `review_box` (`box_key`), editor, pane picker, base picker, body. `box_key`:
 
@@ -8887,6 +9011,11 @@ fn box_key(state: &mut ViewState, snapshot: &Snapshot, key: KeyEvent) -> Outcome
                 state.notify(dispatch::NOTICE_NO_PENDING);
                 return Outcome::Redraw;
             }
+            // Nothing to review: the box says so with `n` alone (10.4), whatever the target; no picker.
+            if action == RequestReview && snapshot.files.is_empty() {
+                state.review_box = Some(review::ReviewBox::request(snapshot));
+                return Outcome::Redraw;
+            }
             match (&snapshot.target, &snapshot.target_state) {
                 (None, _) | (Some(_), TargetState::Left | TargetState::Gone) => {
                     if let Some(Target::Pane { agent, pane, .. }) = &snapshot.target {
@@ -8907,7 +9036,7 @@ fn box_key(state: &mut ViewState, snapshot: &Snapshot, key: KeyEvent) -> Outcome
 
 4. `view.rs`: the box overlay after the confirm box's, `panel_width = columns.min(72)`, height from `dialog::line_count + 4` as the y/n box does; and `handle_mouse` returns `Inert` for every click and wheel event while `state.review_box.is_some()`, exactly as it does for `state.confirm` (a test, `the_boxes_are_modal_for_the_mouse_too`, scrolls and clicks a file row with the Finish box open and asserts `Inert` and an unchanged offset); `b.drawn` set by the shell when the box fits, as `confirm.drawn` is (`ReviewBox::fits(width, height)` mirrors `Confirm::fits`). The scope line's chosen word in reverse video: `view.rs` post-processes the rendered `Scope  f this file   a all changes (n)` line, setting `reverse` on the span of the chosen scope's words. The footer hint: `hints` gains `format!("Y finish ({pending})")` while `pending > 0` and `@ request` always (dropped before `? help` as the others are). `body_is_drawn` gains `&& state.review_box.is_none()`.
 
-5. `shell.rs`: after `state.observe(&next)` in the snapshot loop and before drawing, `if let Some(osc) = state.pending_copy.take() { write_copy(&mut io::stdout(), &osc)?; }` with:
+5. `shell.rs`: after `state.observe(&next)` in the snapshot loop and before drawing, `if let Some(command) = state.pending_command.take() { let _ = handle.commands.send(command); }` and `if let Some(osc) = state.pending_copy.take() { write_copy(&mut io::stdout(), &osc)?; }` with:
 
 ```rust
 /// The OSC 52 write of spec 10.4: raw bytes between frames; the terminal does not answer.
@@ -8983,6 +9112,28 @@ and a unit test that a `Vec<u8>` receives exactly the sequence.
     }
 
     #[test]
+    fn a_box_whose_target_goes_away_becomes_the_picker_and_asks_for_rows() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        snap.target = Some(pane_target());
+        snap.target_state = crate::engine::TargetState::Live("idle".into());
+        snap.comments = std::sync::Arc::new(vec![comment_at(&anchor_on(&snap, 10), "p", 1)]);
+        assert_eq!(handle_key(&mut st, &snap, key("Y"), 120), Outcome::Redraw);
+        assert!(st.review_box.is_some());
+        // The agent leaves the pane while the box is open: the box becomes the picker, which asks for rows.
+        snap.target_state = crate::engine::TargetState::Gone;
+        st.observe(&snap);
+        assert!(st.review_box.is_none());
+        assert!(matches!(st.panes.as_ref().map(|p| &p.return_to), Some(crate::tui::panes::ReturnTo::Finish)));
+        assert_eq!(st.pending_command.take(), Some(Command::LoadPanes(1)));
+        assert_eq!(st.pending_command.take(), None, "sent once");
+        assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some("codex · w4:p2 is gone · pick a pane"));
+        // Observed again with the picker open, nothing happens twice.
+        st.observe(&snap);
+        assert_eq!(st.pending_command, None);
+        assert_eq!(st.panes_token, 1);
+    }
+
+    #[test]
     fn the_request_box_scopes_with_f_and_a_and_c_copies_without_claiming() {
         let (mut snap, mut st) = review_setup(&[(10, " + ")]);
         snap.target = Some(pane_target());
@@ -9021,6 +9172,20 @@ and a unit test that a `Vec<u8>` receives exactly the sequence.
         snap.target_state = crate::engine::TargetState::Gone;
         assert_eq!(handle_key(&mut st, &snap, key("@"), 120), Outcome::Engine(Command::LoadPanes(2)));
         assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some("codex · w4:p2 is gone · pick a pane"));
+        handle_key(&mut st, &snap, key("Esc"), 120);
+        // A clean repository with no target: @ shows `nothing to review`, n alone; no picker, no host call.
+        snap.files.clear();
+        snap.target = None;
+        snap.target_state = crate::engine::TargetState::Unverified;
+        assert_eq!(handle_key(&mut st, &snap, key("@"), 120), Outcome::Redraw);
+        assert!(st.panes.is_none());
+        let b = st.review_box.as_ref().expect("the box opened");
+        let panel = b.panel(&snap, 60);
+        assert_eq!((panel.rows.len(), panel.footer.as_str()), (1, "n cancel"));
+        assert_eq!(handle_key(&mut st, &snap, key("A"), 120), Outcome::Inert);
+        assert_eq!(handle_key(&mut st, &snap, key("c"), 120), Outcome::Inert);
+        assert_eq!(handle_key(&mut st, &snap, key("n"), 120), Outcome::Redraw);
+        assert!(st.review_box.is_none());
     }
 
     #[test]
@@ -9572,3 +9737,19 @@ and the wheel test's scroll arithmetic moves to `dialog::line_count` once the no
 comments claim in creation order (tested); a pick from a file-scoped Request box returns to a
 file-scoped box (`ReturnTo::Request(ReviewScope)`); and `tests/host_env.rs` is in Task 1's
 commit.
+
+**Round 9 (codex, plan-complete, 2026-10-05).** Seven findings, all applied. Three were HIGH:
+two tests reached forward across tasks (Task 2's opener test now publishes through its own
+`LoadPanes`; the same-second claim order moved into Task 5's claim test, Task 3 keeping the id
+shape and sort); the picker-return handler moved a `ReviewScope` out of a borrowed picker (it
+matches by reference); and the failure path of `read_and_apply` re-applied the journal through
+the cap, so a journaled add vanished behind a failed edit on a full file (`show_journaled_adds`
+overlays it on both paths; tested with fifty of another viewer's and a failing edit). Then: the
+picker that `observe` opens for a target gone under an open box asks for its rows through
+`ViewState.pending_command`, drained by the shell after `observe` (code and test); a draft is
+drawn whatever the diff does (`orphans_only` splices the open editor, `render` draws the rows,
+and a test turns the last file clean under a half-typed comment); `@` on a clean repository
+without a target shows `nothing to review` with `n` alone instead of opening the picker; and
+`check_request` applies the comment record's path and comparison rules plus one-based ordered
+ranges, while a request file that is no object reads as empty with a reported problem (seven
+malformed records and a malformed file tested).
