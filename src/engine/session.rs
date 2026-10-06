@@ -387,6 +387,7 @@ enum Done {
     StoreRefreshed(comments::Store, Vec<String>, Option<String>),
     Comment {
         token: Option<u64>,
+        is_add: bool,
         store: Option<comments::Store>,
         outcome: Result<Option<String>, String>,
     },
@@ -783,6 +784,7 @@ impl State {
         if !self.store_opened && !self.store_opening {
             let _ = results.send(Done::Comment {
                 token,
+                is_add: matches!(op, comments::Operation::Add(_)),
                 store: None,
                 outcome: Err("not a git repository".into()),
             });
@@ -813,6 +815,7 @@ impl State {
                     )
                 }
                 StoreOp::Comment(op, token) => {
+                    let is_add = matches!(op, comments::Operation::Add(_));
                     let (store, outcome) = tokio::task::spawn_blocking(move || {
                         let outcome = store.transact(op, now());
                         (store, outcome)
@@ -821,6 +824,7 @@ impl State {
                     .expect("transaction task");
                     Done::Comment {
                         token,
+                        is_add,
                         store: Some(store),
                         outcome,
                     }
@@ -1555,7 +1559,7 @@ async fn run(
                                 state: comments::CommentState::Pending,
                             }), Some(token), &results_tx),
                             Err(error) => {
-                                let _ = results_tx.send(Done::Comment { token: Some(token), store: None, outcome: Err(error) });
+                                let _ = results_tx.send(Done::Comment { token: Some(token), is_add: true, store: None, outcome: Err(error) });
                             }
                         }
                     }
@@ -1565,7 +1569,7 @@ async fn run(
                                 id: seen.id.clone(), category, text, seen,
                             }, Some(token), &results_tx),
                             Err(error) => {
-                                let _ = results_tx.send(Done::Comment { token: Some(token), store: None, outcome: Err(error) });
+                                let _ = results_tx.send(Done::Comment { token: Some(token), is_add: false, store: None, outcome: Err(error) });
                             }
                         }
                     }
@@ -1848,7 +1852,7 @@ async fn run(
                         publish(&mut state, next, &snapshots);
                         state.run_store_queue(&results_tx);
                     }
-                    Done::Comment { token, store, outcome } => {
+                    Done::Comment { token, is_add, store, outcome } => {
                         if let Some(store) = store {
                             if next.comments.as_slice() != store.comments() {
                                 next.comments = Arc::new(store.comments().to_vec());
@@ -1859,12 +1863,13 @@ async fn run(
                         next.comment_seq = state.comment_seq;
                         next.comment_token = token;
                         next.comment_refused = matches!(&outcome, Err(e) if !e.starts_with(comments::NOTICE_NOT_REMEMBERED));
+                        let accepted = outcome.is_ok();
                         next.comment_error = match outcome {
                             Ok(notice) => notice,
                             Err(e) => Some(e),
                         };
-                        if next.comment_error.as_deref().is_none_or(|e| !e.starts_with(comments::NOTICE_NOT_REMEMBERED)) {
-                            if state.target_source == Some(target::Source::Opener) {
+                        if accepted {
+                            if is_add && state.target_source == Some(target::Source::Opener) {
                                 state.target_write_pending = true;
                                 state.target_source = Some(target::Source::Remembered);
                             }
@@ -2771,6 +2776,128 @@ mod tests {
         });
         assert_eq!(s.target, Some(Target::Clipboard));
         assert_eq!(host.calls.lock().unwrap().as_slice(), ["pane.get"]);
+    }
+
+    #[test]
+    fn an_opener_is_remembered_only_after_an_accepted_add() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let host = host::Scripted::with_panes(vec![agent_pane(
+            "w4:p1",
+            "claude",
+            "idle",
+            Some("c1"),
+            &top,
+        )]);
+        let opener = pane_target("w4:p1", "claude", Some("c1"));
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.host = Some(host);
+        config.socket_path = Some("/run/fake.sock".into());
+        config.opener_pane = Some("w4:p1".into());
+        config.poll_interval = Duration::from_secs(3_600);
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "opener preselected", |s| {
+            s.target.as_ref() == Some(&opener) && !s.refreshing
+        });
+        let assert_unwritten = || {
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !state.path().join("targets.json").exists(),
+                "the opener was remembered before an accepted add"
+            );
+            assert_eq!(handle.target_writes_done.load(Ordering::SeqCst), 0);
+        };
+        assert_unwritten();
+
+        let Command::AddComment {
+            anchor, category, ..
+        } = pending(2, "other viewer")
+        else {
+            unreachable!()
+        };
+        let mut other = comments::Store::open(Some(state.path().to_path_buf()), &top, now()).0;
+        for _ in 0..comments::CAP {
+            other
+                .transact(
+                    comments::Operation::Add(comments::Comment {
+                        id: comments::new_id(),
+                        anchor: anchor.clone(),
+                        category,
+                        text: "other viewer".into(),
+                        created_at: now(),
+                        state: comments::CommentState::Pending,
+                    }),
+                    now(),
+                )
+                .unwrap();
+        }
+        handle.commands.send(pending(2, "my comment")).unwrap();
+        let s = wait_for(&handle, "add refused at the shared cap", |s| {
+            s.comment_seq == 1 && s.comment_refused && s.comments.len() == comments::CAP
+        });
+        assert_eq!(s.comment_error.as_deref(), Some(comments::NOTICE_CAP));
+        assert_unwritten();
+
+        let seen = s.comments[0].clone();
+        other
+            .transact(
+                comments::Operation::Edit {
+                    id: seen.id.clone(),
+                    seen: seen.clone(),
+                    category,
+                    text: "changed by the other viewer".into(),
+                },
+                now(),
+            )
+            .unwrap();
+        handle
+            .commands
+            .send(Command::DeleteComment { seen })
+            .unwrap();
+        let s = wait_for(&handle, "stale deletion refused", |s| {
+            s.comment_seq == 2 && s.comment_refused && s.comments.len() == comments::CAP
+        });
+        assert_eq!(s.comment_error.as_deref(), Some("No comment selected."));
+        assert_unwritten();
+
+        handle
+            .commands
+            .send(Command::DeleteComment {
+                seen: s.comments[0].clone(),
+            })
+            .unwrap();
+        wait_for(&handle, "accepted deletion frees a slot", |s| {
+            s.comment_seq == 3
+                && !s.comment_refused
+                && s.comment_error.is_none()
+                && s.comments.len() == comments::CAP - 1
+        });
+        assert_unwritten();
+
+        handle.commands.send(pending(2, "my comment")).unwrap();
+        let s = wait_for(&handle, "accepted add remembers the opener", |s| {
+            s.comment_seq == 4
+                && !s.comment_refused
+                && s.comment_error.is_none()
+                && s.comments.len() == comments::CAP
+                && s.comments.iter().any(|c| c.text == "my comment")
+                && s.target_seq > 0
+        });
+        assert_eq!(s.target_seq, 1);
+        assert_eq!(s.target_error, None);
+        assert_eq!(handle.target_writes_done.load(Ordering::SeqCst), 1);
+        // Only a source still marked Opener can promote on this first accepted add.
+        assert_eq!(
+            target::load_targets(state.path()).0.get(&top),
+            Some(&opener)
+        );
     }
 
     #[test]
