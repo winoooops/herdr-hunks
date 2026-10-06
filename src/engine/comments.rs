@@ -600,7 +600,10 @@ impl Store {
         self.comments = comments;
         self.show_journaled_adds();
         if let Some(refusal) = refusal {
-            return Err(TxError::Refused(refusal));
+            return Err(TxError::Refused(match dropped {
+                Some(dropped) => format!("{refusal} {dropped}"),
+                None => refusal,
+            }));
         }
         Ok((dropped, problem))
     }
@@ -1962,6 +1965,60 @@ mod tests {
         );
         b.refresh(8);
         assert_eq!(b.comments().len(), 4);
+    }
+
+    #[test]
+    fn a_refused_add_reports_a_dropped_journal_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = open(dir.path());
+        let seen = comment("original", "original", 1);
+        a.transact(Operation::Add(seen.clone()), 1).unwrap();
+        let mut b = open(dir.path());
+        a.fail_writes_for_tests(true);
+        let notice = a
+            .transact(
+                Operation::Edit {
+                    id: seen.id.clone(),
+                    seen: seen.clone(),
+                    category: Category::Bug,
+                    text: "unsaved edit".into(),
+                },
+                2,
+            )
+            .unwrap_err();
+        assert!(notice.starts_with(NOTICE_NOT_REMEMBERED));
+        assert_eq!(a.journal_len(), 1);
+        b.transact(
+            Operation::Edit {
+                id: seen.id.clone(),
+                seen,
+                category: Category::Question,
+                text: "other viewer".into(),
+            },
+            3,
+        )
+        .unwrap();
+        for i in 1..CAP {
+            b.transact(Operation::Add(comment(&format!("b{i}"), "shared", 4)), 4)
+                .unwrap();
+        }
+        a.fail_writes_for_tests(false);
+        let notice = a
+            .transact(Operation::Add(comment("refused", "new", 5)), 5)
+            .unwrap_err();
+        assert_eq!(
+            notice,
+            format!("{NOTICE_CAP} a comment changed under you; your edit was dropped")
+        );
+        assert_eq!(a.journal_len(), 0);
+        assert_eq!(a.comments(), b.comments());
+        assert_eq!(open(dir.path()).comments(), b.comments());
+        assert_eq!(a.refresh(6), (Vec::new(), None));
+        assert_eq!(
+            a.transact(Operation::Add(comment("refused", "new", 7)), 7),
+            Err(NOTICE_CAP.into())
+        );
+        assert_eq!(a.refresh(8), (Vec::new(), None));
     }
 
     #[test]

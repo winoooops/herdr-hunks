@@ -55,25 +55,24 @@ impl Editor {
         }
     }
 
-    fn try_push(&mut self, ch: char) {
+    fn try_push(&mut self, ch: char) -> bool {
         let mut candidate = self.text.clone();
         candidate.push(ch);
         if !comments::within_caps(&candidate) {
             self.at_limit = true;
-            return;
+            return false;
         }
         self.text = candidate;
         self.at_limit = false;
+        true
     }
 
-    pub fn insert(&mut self, ch: char) {
-        if !ch.is_control() {
-            self.try_push(ch);
-        }
+    pub fn insert(&mut self, ch: char) -> bool {
+        !ch.is_control() && self.try_push(ch)
     }
 
-    pub fn newline(&mut self) {
-        self.try_push('\n');
+    pub fn newline(&mut self) -> bool {
+        self.try_push('\n')
     }
 
     pub fn backspace(&mut self) {

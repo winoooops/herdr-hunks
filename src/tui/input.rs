@@ -136,15 +136,19 @@ pub fn handle_paste(state: &mut ViewState, snapshot: &Snapshot, text: &str) -> O
         }
         let mut chars = text.chars().peekable();
         while let Some(ch) = chars.next() {
-            match ch {
+            let accepted = match ch {
                 '\r' => {
                     if chars.peek() == Some(&'\n') {
                         chars.next();
                     }
-                    editor.newline();
+                    editor.newline()
                 }
                 '\n' => editor.newline(),
+                ch if ch.is_control() => continue,
                 ch => editor.insert(ch),
+            };
+            if !accepted {
+                break;
             }
         }
         state.reconcile(snapshot);
@@ -3186,6 +3190,55 @@ pub(crate) mod tests {
             matches!(&choices[0], panes::Choice::Pane(row) if row.record.agent.as_deref() == Some("codex"))
         );
         assert!(picker.pending.is_none());
+    }
+
+    #[test]
+    fn paste_stops_at_the_first_rejected_newline() {
+        for newline in ["\n", "\r", "\r\n"] {
+            let (snap, mut st) = review_setup(&[(10, " --+ ")]);
+            handle_key(&mut st, &snap, key("i"), 120);
+            let text = format!("{}tail", format!("a{newline}").repeat(comments::MAX_LINES));
+            assert_eq!(handle_paste(&mut st, &snap, &text), Outcome::Redraw);
+            let editor = st.editor.as_ref().unwrap();
+            assert_eq!(
+                editor.text,
+                format!("{}a", "a\n".repeat(comments::MAX_LINES - 1))
+            );
+            assert_eq!(comments::line_count(&editor.text), comments::MAX_LINES);
+            assert!(!editor.text.contains("tail"));
+            assert!(editor.at_limit);
+            assert_eq!(editor.title()[0].text, comments::NOTICE_LIMIT);
+        }
+    }
+
+    #[test]
+    fn paste_within_the_caps_keeps_all_printable_text() {
+        for (text, expected) in [
+            ("first\n字\ntail", "first\n字\ntail"),
+            ("first\t\0\u{1b}\u{7f}\n字\ntail", "first\n字\ntail"),
+        ] {
+            let (snap, mut st) = review_setup(&[(10, " --+ ")]);
+            handle_key(&mut st, &snap, key("i"), 120);
+            assert_eq!(handle_paste(&mut st, &snap, text), Outcome::Redraw);
+            let editor = st.editor.as_ref().unwrap();
+            assert_eq!(editor.text, expected);
+            assert!(!editor.at_limit);
+        }
+    }
+
+    #[test]
+    fn paste_stops_at_the_character_cap() {
+        let (snap, mut st) = review_setup(&[(10, " --+ ")]);
+        handle_key(&mut st, &snap, key("i"), 120);
+        let accepted = "字".repeat(comments::MAX_CHARS);
+        assert_eq!(
+            handle_paste(&mut st, &snap, &format!("{accepted}tail\nmore")),
+            Outcome::Redraw
+        );
+        let editor = st.editor.as_ref().unwrap();
+        assert_eq!(editor.text, accepted);
+        assert!(editor.at_limit);
+        assert_eq!(editor.title()[0].text, comments::NOTICE_LIMIT);
     }
 
     #[test]
