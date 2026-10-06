@@ -958,11 +958,13 @@ fn move_cursor(state: &mut ViewState, snapshot: &Snapshot, action: KeyAction) ->
             if outcome == Outcome::Inert {
                 return outcome;
             }
+            let end = state.offset + usize::from(state.body_height);
             let centre = state.offset + usize::from(state.body_height / 2);
             if let Some((target, _)) = rows
                 .row_of_target
                 .iter()
                 .enumerate()
+                .filter(|(_, row)| **row >= state.offset && **row < end)
                 .min_by_key(|(_, row)| row.abs_diff(centre))
             {
                 state.set_cursor(diff, target);
@@ -3785,6 +3787,92 @@ pub(crate) mod tests {
             handle_key(&mut st, &snap, key("x"), 120),
             Outcome::Engine(Command::DeleteComment { seen }) if seen.id == missing.id
         ));
+    }
+
+    fn page_through_tall_in_place_comment(mode: ViewMode) {
+        let (mut snap, mut st) = review_setup(&[(1, "+ ")]);
+        snap.comments = std::sync::Arc::new(vec![comment_at(
+            &anchor_on(&snap, 1),
+            &["line"; 100].join("\n"),
+            1,
+        )]);
+        st.requested_mode = mode;
+        st.resize(120, 20);
+        st.reconcile(&snap);
+        assert_eq!(st.mode, mode);
+        assert_eq!((st.offset, st.cursor), (0, Some(0)));
+        let down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+        for (key, offset) in [
+            (down, 10),
+            (down, 20),
+            (down, 30),
+            (up, 20),
+            (up, 10),
+            (up, 0),
+            (key("ctrl+d"), 10),
+            (key("ctrl+d"), 20),
+            (key("ctrl+d"), 30),
+            (key("ctrl+u"), 20),
+            (key("ctrl+u"), 10),
+            (key("ctrl+u"), 0),
+        ] {
+            assert_eq!(handle_key(&mut st, &snap, key, 120), Outcome::Redraw);
+            st.resize(120, 20);
+            st.reconcile(&snap);
+            assert_eq!((st.offset, st.cursor), (offset, Some(0)), "{key:?}");
+            assert_eq!(st.cursor_id, Some((Side::Additions, 1)));
+            if offset > 0 {
+                assert!(st.rows.as_ref().unwrap().rows[offset..offset + 20]
+                    .iter()
+                    .all(|row| matches!(row, Row::Card { .. })));
+            }
+        }
+
+        handle_key(&mut st, &snap, key("ctrl+d"), 120);
+        assert_eq!(handle_key(&mut st, &snap, key("j"), 120), Outcome::Redraw);
+        st.reconcile(&snap);
+        assert_eq!(st.cursor, Some(1));
+        assert_eq!(st.cursor_id, Some((Side::Additions, 2)));
+        let row = st.rows.as_ref().unwrap().row_of_target[1];
+        assert!(row >= st.offset && row < st.offset + 20);
+        assert_eq!(handle_key(&mut st, &snap, key("k"), 120), Outcome::Redraw);
+        assert_eq!(st.cursor, Some(0));
+        let row = st.rows.as_ref().unwrap().row_of_target[0];
+        assert!(row >= st.offset && row < st.offset + 20);
+
+        let end = st.rows.as_ref().unwrap().rows.len() - 20;
+        for (key, limit) in [
+            (down, end),
+            (up, 0),
+            (key("ctrl+d"), end),
+            (key("ctrl+u"), 0),
+        ] {
+            while st.offset != limit {
+                let next = if limit == 0 {
+                    st.offset.saturating_sub(10)
+                } else {
+                    (st.offset + 10).min(end)
+                };
+                assert_eq!(handle_key(&mut st, &snap, key, 120), Outcome::Redraw);
+                st.resize(120, 20);
+                st.reconcile(&snap);
+                assert_eq!(st.offset, next);
+            }
+            assert_eq!(handle_key(&mut st, &snap, key, 120), Outcome::Inert);
+            assert_eq!(st.offset, limit);
+            assert_eq!(st.cursor, Some(usize::from(limit == end)));
+        }
+    }
+
+    #[test]
+    fn page_keys_scroll_a_tall_in_place_comment_in_unified_mode() {
+        page_through_tall_in_place_comment(ViewMode::Unified);
+    }
+
+    #[test]
+    fn page_keys_scroll_a_tall_in_place_comment_in_split_mode() {
+        page_through_tall_in_place_comment(ViewMode::Split);
     }
 
     #[test]
