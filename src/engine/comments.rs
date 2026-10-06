@@ -438,6 +438,8 @@ pub struct Store {
     state_dir: Option<PathBuf>,
     toplevel: String,
     comments: Vec<Comment>,
+    /// The file's records before unsaved adds are overlaid for display.
+    persisted: Vec<Comment>,
     journal: Vec<Operation>,
     /// Why unsaved operations prevent a send from claiming comments.
     journal_reason: Option<String>,
@@ -457,6 +459,7 @@ impl Store {
             state_dir,
             toplevel: toplevel.to_string(),
             comments: Vec::new(),
+            persisted: Vec::new(),
             journal: Vec::new(),
             journal_reason: None,
             others: BTreeMap::new(),
@@ -539,6 +542,10 @@ impl Store {
         let mut dropped = None;
         let mut kept_journal = Vec::new();
         for entry in self.journal.clone() {
+            if matches!(&entry, Operation::Add(c) if comments.iter().any(|saved| saved.id == c.id))
+            {
+                continue;
+            }
             match apply(&mut comments, &entry) {
                 Ok(true) => changed = true,
                 Ok(false) => {
@@ -574,6 +581,7 @@ impl Store {
             let written = self.write_locked_with(&comments);
             if let Err(e) = written {
                 // Restore the file's records, then overlay this viewer's unsaved work.
+                self.persisted = loaded.clone();
                 self.comments = loaded;
                 for entry in &self.journal {
                     let _ = apply(&mut self.comments, entry);
@@ -588,6 +596,7 @@ impl Store {
             self.journal_reason = None;
         }
         self.mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        self.persisted = comments.clone();
         self.comments = comments;
         self.show_journaled_adds();
         if let Some(refusal) = refusal {
@@ -683,20 +692,20 @@ impl Store {
         }
     }
 
-    pub fn refresh(&mut self, now: u64) -> Vec<String> {
+    pub fn refresh(&mut self, now: u64) -> (Vec<String>, Option<String>) {
         let Some(path) = self.path() else {
             expire(&mut self.comments, now);
-            return Vec::new();
+            return (Vec::new(), None);
         };
         let moved = std::fs::metadata(&path).and_then(|m| m.modified()).ok() != self.mtime;
         let expiring = self.comments.iter().any(|c| matches!(&c.state, CommentState::Sending { stamp, .. } if now.saturating_sub(stamp.at) >= EXPIRY.as_secs()));
         if !moved && !expiring && self.journal.is_empty() {
-            return Vec::new();
+            return (Vec::new(), None);
         }
         match self.locked(|store| store.read_and_apply(None, now)) {
-            Ok(Ok((dropped, problem))) => dropped.into_iter().chain(problem).collect(),
+            Ok(Ok((dropped, problem))) => (problem.into_iter().collect(), dropped),
             Ok(Err(TxError::Refused(e) | TxError::Io(e)))
-            | Err(TxError::Refused(e) | TxError::Io(e)) => vec![e],
+            | Err(TxError::Refused(e) | TxError::Io(e)) => (vec![e], None),
         }
     }
 
@@ -723,17 +732,20 @@ impl Store {
         }
         let mut build = Some(build);
         let mut body = |store: &mut Self| -> Result<Claimed, TxError> {
-            if store.state_dir.is_some() {
+            let mut working = if store.state_dir.is_some() {
                 store.read_and_apply(None, now)?;
+                store.persisted.clone()
             } else {
                 expire(&mut store.comments, now);
-            }
+                store.comments.clone()
+            };
             // The caller's last word before anything is stamped: the send's selection generation.
             guard().map_err(TxError::Refused)?;
             let used = match &store.state_dir {
-                Some(dir) => nonces_in_use(dir, &store.comments)
-                    .map_err(|e| TxError::Io(format!("nonces: {e}")))?,
-                None => nonces_of(&store.comments),
+                Some(dir) => {
+                    nonces_in_use(dir, &working).map_err(|e| TxError::Io(format!("nonces: {e}")))?
+                }
+                None => nonces_of(&working),
             };
             let nonce = loop {
                 *counter += 1;
@@ -743,8 +755,7 @@ impl Store {
                 }
             };
             // Order by creation time and id, including replayed comments.
-            let mut ordered: Vec<&Comment> = store
-                .comments
+            let mut ordered: Vec<&Comment> = working
                 .iter()
                 .filter(|c| {
                     matches!(
@@ -767,7 +778,6 @@ impl Store {
             let ids: Vec<(String, u32)> =
                 eligible.iter().map(|(n, c)| (c.id.clone(), *n)).collect();
             // Stamped on a working copy: the array shows the claim only once the file holds it.
-            let mut working = store.comments.clone();
             let mut claimed = Vec::new();
             for comment in &mut working {
                 if let Some((_, item)) = ids.iter().find(|(id, _)| id == &comment.id) {
@@ -795,7 +805,9 @@ impl Store {
             if store.state_dir.is_some() {
                 store.write_locked_with(&working)?;
             }
+            store.persisted = working.clone();
             store.comments = working;
+            store.show_journaled_adds();
             Ok(Claimed {
                 comments: claimed,
                 text,
@@ -820,10 +832,12 @@ impl Store {
     /// failed write leaves the array as the file has it.
     pub fn settle(&mut self, now: u64, nonce: &str, outcome: Settlement) -> Result<(), String> {
         let body = |store: &mut Self| -> Result<(), TxError> {
-            if store.state_dir.is_some() {
+            let mut working = if store.state_dir.is_some() {
                 store.read_and_apply(None, now)?;
-            }
-            let mut working = store.comments.clone();
+                store.persisted.clone()
+            } else {
+                store.comments.clone()
+            };
             let mut changed = false;
             for comment in &mut working {
                 // Late successes settle earlier attempts; failures remove them from the chain.
@@ -876,7 +890,9 @@ impl Store {
                 if store.state_dir.is_some() {
                     store.write_locked_with(&working)?;
                 }
+                store.persisted = working.clone();
                 store.comments = working;
+                store.show_journaled_adds();
             }
             Ok(())
         };
@@ -916,6 +932,7 @@ impl Store {
             serde_json::to_value(&comments).unwrap(),
         );
         std::fs::write(&path, serde_json::to_vec_pretty(&all).unwrap()).unwrap();
+        self.persisted = comments.clone();
         self.comments = comments;
         self.mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     }
@@ -931,6 +948,7 @@ impl Store {
             state_dir: Some(state_dir.to_path_buf()),
             toplevel: toplevel.to_string(),
             comments: Vec::new(),
+            persisted: Vec::new(),
             journal: Vec::new(),
             journal_reason: None,
             others: BTreeMap::new(),
@@ -1370,6 +1388,116 @@ mod tests {
     }
 
     #[test]
+    fn settlement_keeps_a_cap_refused_add_in_the_journal_and_off_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = open(dir.path());
+        let mut uncertain = comment("sent", "maybe delivered", 1);
+        uncertain.state = CommentState::Unconfirmed {
+            stamp: stamp("aaaaaa"),
+            before: Vec::new(),
+        };
+        a.transact(Operation::Add(uncertain), 100).unwrap();
+        a.fail_writes_for_tests(true);
+        a.transact(Operation::Add(comment("local", "unsaved", 2)), 101)
+            .unwrap_err();
+        a.fail_writes_for_tests(false);
+        let mut b = open(dir.path());
+        for i in 1..CAP {
+            b.transact(Operation::Add(comment(&format!("b{i}"), "shared", 3)), 102)
+                .unwrap();
+        }
+        a.settle(103, "aaaaaa", Settlement::Failed).unwrap();
+        assert_eq!(open(dir.path()).comments().len(), CAP);
+        assert_eq!(a.comments().len(), CAP + 1);
+        a.refresh(104);
+        assert_eq!(a.journal, [Operation::Add(comment("local", "unsaved", 2))]);
+        let before = std::fs::read(a.path().unwrap()).unwrap();
+        assert!(a
+            .claim(
+                105,
+                &Destination::clipboard(),
+                &|_| "bbbbbb".into(),
+                &mut 0,
+                &|| Ok(()),
+                |_, _| Ok(String::new())
+            )
+            .unwrap_err()
+            .starts_with("comments not saved: "));
+        assert_eq!(std::fs::read(a.path().unwrap()).unwrap(), before);
+        let claimed = b
+            .claim(
+                106,
+                &Destination::clipboard(),
+                &|_| "bbbbbb".into(),
+                &mut 0,
+                &|| Ok(()),
+                |_, _| Ok(String::new()),
+            )
+            .unwrap();
+        assert_eq!(claimed.comments.len(), CAP);
+        assert!(claimed.comments.iter().all(|c| c.id != "local"));
+    }
+
+    #[test]
+    fn replay_of_an_add_already_on_disk_drops_it_without_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = open(dir.path());
+        let added = comment("same", "landed", 1);
+        a.fail_writes_for_tests(true);
+        a.transact(Operation::Add(added.clone()), 100).unwrap_err();
+        let mut b = open(dir.path());
+        b.transact(Operation::Add(added), 101).unwrap();
+        a.fail_writes_for_tests(false);
+        let path = a.path().unwrap();
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        a.refresh(102);
+        assert_eq!(
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(a.journal_len(), 0);
+    }
+
+    #[test]
+    fn a_claim_guard_refusal_stamps_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        store
+            .transact(Operation::Add(comment("pending", "kept", 1)), 100)
+            .unwrap();
+        let path = store.path().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let result = store.claim(
+            101,
+            &Destination::clipboard(),
+            &|_| "aaaaaa".into(),
+            &mut 0,
+            &|| Err("changed".into()),
+            |_, _| Ok(String::new()),
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert!(store.comments().iter().all(Comment::is_pending));
+        assert_eq!(result.unwrap_err(), "changed");
+    }
+
+    #[test]
     fn adds_edits_and_deletes_are_transactions_two_viewers_interleave() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = open(dir.path());
@@ -1700,7 +1828,7 @@ mod tests {
         let mut b = open(dir.path());
         a.transact(Operation::Add(comment("a1", "x", 1)), 1)
             .unwrap();
-        assert!(b.refresh(2).is_empty());
+        assert_eq!(b.refresh(2), (Vec::new(), None));
         assert_eq!(b.comments().len(), 1);
         let reads = b.reads_for_tests();
         b.refresh(3);

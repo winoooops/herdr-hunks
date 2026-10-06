@@ -2423,6 +2423,98 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn plain_answers_displaced_in_one_batch_return_after_a_key() {
+        let (mut snap, mut st) = setup(&[(1, "+")]);
+        snap.mark_seq = 1;
+        snap.mark = Some(crate::engine::Mark {
+            commit: "a".repeat(40),
+            at: 1,
+            state: crate::engine::MarkState::Current,
+            classified_at: None,
+        });
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().unwrap().text,
+            "marked aaaaaaa as reviewed"
+        );
+        snap.send_seq = 1;
+        snap.send_outcome = Some(dispatch::SendOutcome {
+            kind: dispatch::SendKind::Feedback,
+            items: 1,
+            to: crate::engine::Destination::Pane {
+                pane: "w4:p2".into(),
+                agent: "codex".into(),
+                session: None,
+            },
+            unconfirmed: false,
+            copy: None,
+        });
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().unwrap().text,
+            "sent 1 item to codex · w4:p2"
+        );
+        handle_key(&mut st, &snap, key("t"), 120);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("marked aaaaaaa as reviewed")
+        );
+        handle_key(&mut st, &snap, key("t"), 120);
+        assert!(st.notice.is_none());
+    }
+
+    #[test]
+    fn a_plain_key_notice_returns_after_a_mark_answer() {
+        let (mut snap, mut st) = setup(&[]);
+        handle_key(&mut st, &snap, key("s"), 120);
+        assert_eq!(
+            st.notice.as_ref().unwrap().text,
+            crate::engine::actions::NOTICE_NO_HUNK
+        );
+        snap.mark_seq = 1;
+        snap.mark_error = Some("nothing to mark".into());
+        st.observe(&snap);
+        assert_eq!(st.notice.as_ref().unwrap().text, "nothing to mark");
+        handle_key(&mut st, &snap, key("t"), 120);
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some(crate::engine::actions::NOTICE_NO_HUNK)
+        );
+        handle_key(&mut st, &snap, key("t"), 120);
+        assert!(st.notice.is_none());
+    }
+
+    #[test]
+    fn a_plain_notice_holds_back_rewrite_and_base_warnings() {
+        let (mut snap, mut st) = setup(&[]);
+        handle_key(&mut st, &snap, key("s"), 120);
+        snap.head_seen = Some("b".repeat(40));
+        snap.mark = Some(crate::engine::Mark {
+            commit: "a".repeat(40),
+            at: 1,
+            state: crate::engine::MarkState::Rewritten,
+            classified_at: snap.head_seen.clone(),
+        });
+        snap.base_error = Some("base failed".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().unwrap().text,
+            crate::engine::actions::NOTICE_NO_HUNK
+        );
+        handle_key(&mut st, &snap, key("t"), 120);
+        assert!(st
+            .notice
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("no longer on this branch"));
+        handle_key(&mut st, &snap, key("t"), 120);
+        assert_eq!(st.notice.as_ref().unwrap().text, "base failed");
+        handle_key(&mut st, &snap, key("t"), 120);
+        assert!(st.notice.is_none());
+    }
+
+    #[test]
     fn acknowledging_an_answer_shows_the_warning_that_waited_behind_it() {
         use crate::engine::{Mark, MarkState};
         let (mut snap, mut st) = setup(&[(1, "+")]);
@@ -3860,6 +3952,40 @@ pub(crate) mod tests {
             handle_key(&mut st, &snap, key("ctrl+c"), 120),
             Outcome::Quit
         );
+    }
+
+    #[test]
+    fn editing_a_line_card_replaces_it_until_escape() {
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+            st.requested_mode = mode;
+            st.resize(120, 20);
+            let card = comment_at(&anchor_on(&snap, 11), "line card words", 1);
+            let id = card.id.clone();
+            snap.comments = std::sync::Arc::new(vec![card]);
+            st.reconcile(&snap);
+            handle_key(&mut st, &snap, key("u"), 120);
+            st.reconcile(&snap);
+            let plain = render(&snap, &st, 120, 24).plain().join("\n");
+            assert_eq!(plain.matches("line card words").count(), 1, "{plain}");
+            assert!(plain.contains("line card words_"));
+            assert!(!st
+                .rows
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::Card { id: shown, .. } if shown == &id)));
+            handle_key(&mut st, &snap, key("Esc"), 120);
+            st.reconcile(&snap);
+            assert!(st
+                .rows
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::Card { id: shown, .. } if shown == &id)));
+        }
     }
 
     #[test]

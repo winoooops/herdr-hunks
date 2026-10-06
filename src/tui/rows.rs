@@ -69,13 +69,13 @@ pub struct Rows {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorPlace {
     pub after: EditorAnchor,
+    pub editing: Option<String>,
     pub lines: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorAnchor {
     Anchor(Anchor),
-    Orphan(String),
     End,
 }
 
@@ -149,28 +149,26 @@ fn append_orphans(rows: &mut Rows, orphans: &[&Comment], width: usize) {
 fn splice_editor(rows: &mut Rows, diff: Option<&LoadedDiff>, editor: Option<&EditorPlace>) {
     let Some(editor) = editor else { return };
     let end = rows.rows.len();
-    let replaced = match &editor.after {
-        EditorAnchor::Anchor(anchor) => {
-            let at = diff
+    let card = editor.editing.as_ref().and_then(|id| {
+        let first = rows
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Card { id: card, .. } if card == id));
+        let last = rows
+            .rows
+            .iter()
+            .rposition(|r| matches!(r, Row::Card { id: card, .. } if card == id));
+        first.zip(last).map(|(first, last)| first..last + 1)
+    });
+    let replaced = card.unwrap_or_else(|| {
+        let at = match &editor.after {
+            EditorAnchor::Anchor(anchor) => diff
                 .and_then(|d| attach_row(d, &rows.row_of_target, anchor))
-                .map_or(end, |r| r + 1);
-            at..at
-        }
-        EditorAnchor::Orphan(id) => {
-            let first = rows
-                .rows
-                .iter()
-                .position(|r| matches!(r, Row::Card { id: card, .. } if card == id));
-            let last = rows
-                .rows
-                .iter()
-                .rposition(|r| matches!(r, Row::Card { id: card, .. } if card == id));
-            first
-                .zip(last)
-                .map_or(end..end, |(first, last)| first..last + 1)
-        }
-        EditorAnchor::End => end..end,
-    };
+                .map_or(end, |r| r + 1),
+            EditorAnchor::End => end,
+        };
+        at..at
+    });
     let delta = editor.lines as isize - replaced.len() as isize;
     rows.rows.splice(
         replaced.clone(),

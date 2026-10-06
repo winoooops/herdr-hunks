@@ -309,7 +309,7 @@ struct State {
     selection_generation: u64,
     latest_selection: Arc<AtomicU64>,
     target_seq: u64,
-    /// The first refresh loads `targets.json` and asks about the opener; later ones only re-verify.
+    /// Retry initial target resolution until the opener check is conclusive.
     target_unresolved: bool,
     /// A pick or comment must write the in-memory record back to disk.
     target_write_pending: bool,
@@ -384,8 +384,7 @@ enum Done {
         generation: u64,
         outcome: Result<Option<(dispatch::CopyOut, u64)>, String>,
     },
-    StoreOpened(comments::Store, Vec<String>),
-    StoreRefreshed(comments::Store, Vec<String>),
+    StoreRefreshed(comments::Store, Vec<String>, Option<String>),
     Comment {
         token: Option<u64>,
         store: Option<comments::Store>,
@@ -641,30 +640,36 @@ async fn resolve_target(
     job: &Job,
     toplevel: &str,
     opener: Option<&str>,
-) -> Option<(Target, target::Source)> {
+) -> Result<Option<(Target, target::Source)>, host::HostFailure> {
     if let Some(dir) = &job.state_dir {
         let (targets, problem) = target::load_targets(dir);
         if let Some(problem) = problem {
             base::note_problem(dir, &problem);
         }
         if let Some(target) = targets.get(toplevel) {
-            return Some((target.clone(), target::Source::Remembered));
+            return Ok(Some((target.clone(), target::Source::Remembered)));
         }
     }
-    let (opener, socket) = (opener?, job.socket_path.clone()?);
+    let (Some(opener), Some(socket)) = (opener, job.socket_path.clone()) else {
+        return Ok(None);
+    };
     if !target::is_pane_id(opener) {
-        return None;
+        return Ok(None);
     }
     let pane = opener.to_string();
-    let record = dispatch::call_host(job.host.clone(), move |h| h.pane_get(&pane))
-        .await
-        .ok()?;
-    // A reply about another pane preselects nothing: the id typed into the environment is the one asked about.
+    let record = match dispatch::call_host(job.host.clone(), move |h| h.pane_get(&pane)).await {
+        Ok(record) => record,
+        Err(host::HostFailure::Api { .. }) => return Ok(None),
+        Err(transient) => return Err(transient),
+    };
+    // A reply must name the opener's pane before it can preselect an agent.
     if record.pane_id != opener {
-        return None;
+        return Ok(None);
     }
-    let agent = record.agent.clone()?;
-    Some((
+    let Some(agent) = record.agent else {
+        return Ok(None);
+    };
+    Ok(Some((
         Target::Pane {
             pane: record.pane_id,
             socket,
@@ -673,7 +678,7 @@ async fn resolve_target(
             title: record.title.unwrap_or_default(),
         },
         target::Source::Opener,
-    ))
+    )))
 }
 
 async fn run_job(job: Job) -> Done {
@@ -722,10 +727,10 @@ async fn run_job(job: Job) -> Done {
         .map(|r| r.repo_root.clone())
         .filter(|t| !t.is_empty());
     let target_found = match (&job.resolve_target, &toplevel) {
-        (Some(opener), Some(toplevel)) => Some((
-            job.generation,
-            resolve_target(&job, toplevel, opener.as_deref()).await,
-        )),
+        (Some(opener), Some(toplevel)) => resolve_target(&job, toplevel, opener.as_deref())
+            .await
+            .ok()
+            .map(|found| (job.generation, found)),
         _ => None,
     };
     let checked = match (&job.target, &target_found) {
@@ -821,20 +826,23 @@ impl State {
                     }
                 }
                 StoreOp::Refresh | StoreOp::LateAnswer(_, _) => {
-                    let (store, problems) = tokio::task::spawn_blocking(move || {
-                        let problems = match op {
-                            StoreOp::LateAnswer(nonce, settlement) => store
-                                .settle(now(), &nonce, settlement)
-                                .err()
-                                .into_iter()
-                                .collect(),
+                    let (store, problems, notice) = tokio::task::spawn_blocking(move || {
+                        let (problems, notice) = match op {
+                            StoreOp::LateAnswer(nonce, settlement) => (
+                                store
+                                    .settle(now(), &nonce, settlement)
+                                    .err()
+                                    .into_iter()
+                                    .collect(),
+                                None,
+                            ),
                             _ => store.refresh(now()),
                         };
-                        (store, problems)
+                        (store, problems, notice)
                     })
                     .await
                     .expect("store refresh task");
-                    Done::StoreRefreshed(store, problems)
+                    Done::StoreRefreshed(store, problems, notice)
                 }
             };
             let _ = results.send(done);
@@ -929,7 +937,7 @@ impl State {
                 })
                 .await
                 .expect("store open task");
-                let _ = results.send(Done::StoreOpened(store, problems));
+                let _ = results.send(Done::StoreRefreshed(store, problems, None));
             });
         } else {
             if !self
@@ -1565,6 +1573,7 @@ async fn run(
                         state.transact(comments::Operation::Delete { id: seen.id.clone(), seen }, None, &results_tx);
                     }
                     Command::SetTarget { token, target } => {
+                        state.target_unresolved = false;
                         state.selection_generation += 1;
                         // The number the send task and the write guard compare with, stored before anything can read it.
                         state.latest_selection.store(state.selection_generation, Ordering::SeqCst);
@@ -1817,7 +1826,7 @@ async fn run(
                         copies_answered.fetch_add(1, Ordering::SeqCst);
                     }
 
-                    Done::StoreOpened(store, problems) | Done::StoreRefreshed(store, problems) => {
+                    Done::StoreRefreshed(store, problems, notice) => {
                         state.store_opened = true;
                         state.store_opening = false;
                         if next.comments.as_slice() != store.comments() {
@@ -1828,13 +1837,13 @@ async fn run(
                             if let Some(dir) = &state.inputs.state_dir {
                                 base::note_problem(dir, &problem);
                             }
-                            if problem.starts_with("a comment changed under you; ") {
-                                state.comment_seq += 1;
-                                next.comment_seq = state.comment_seq;
-                                next.comment_error = Some(problem);
-                                next.comment_refused = false;
-                                next.comment_token = None;
-                            }
+                        }
+                        if let Some(notice) = notice {
+                            state.comment_seq += 1;
+                            next.comment_seq = state.comment_seq;
+                            next.comment_error = Some(notice);
+                            next.comment_refused = false;
+                            next.comment_token = None;
                         }
                         publish(&mut state, next, &snapshots);
                         state.run_store_queue(&results_tx);
@@ -2609,6 +2618,159 @@ mod tests {
             .unwrap();
         let s = wait_for(&a, "limit", |s| s.comment_seq == 4);
         assert_eq!(s.comment_error.as_deref(), Some(comments::NOTICE_LIMIT));
+    }
+
+    #[test]
+    fn a_refresh_reports_a_dropped_journal_once_without_logging_it() {
+        let dir = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let top = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut config = test_config(dir.path(), Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        config.poll_interval = Duration::from_secs(3_600);
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "rows", |s| !s.files.is_empty());
+        handle.commands.send(pending(2, "original")).unwrap();
+        let s = wait_for(&handle, "original comment", |s| s.comment_seq == 1);
+        let seen = s.comments[0].clone();
+        let blocked = state
+            .path()
+            .join(format!("comments.json.{}.tmp", std::process::id()));
+        std::fs::create_dir(&blocked).unwrap();
+        handle
+            .commands
+            .send(Command::EditComment {
+                token: 1,
+                seen: seen.clone(),
+                category: comments::Category::Bug,
+                text: "unsaved edit".into(),
+            })
+            .unwrap();
+        wait_for(&handle, "journaled edit", |s| {
+            s.comment_seq == 2
+                && s.comment_error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with(comments::NOTICE_NOT_REMEMBERED))
+        });
+        std::fs::remove_dir(blocked).unwrap();
+        let mut other = comments::Store::open(Some(state.path().to_path_buf()), &top, now()).0;
+        other
+            .transact(
+                comments::Operation::Edit {
+                    id: seen.id.clone(),
+                    seen,
+                    category: comments::Category::Question,
+                    text: "other viewer".into(),
+                },
+                now(),
+            )
+            .unwrap();
+        handle.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&handle, "dropped edit", |s| {
+            s.comment_seq == 3 && s.comments[0].text == "other viewer"
+        });
+        assert_eq!(
+            s.comment_error.as_deref(),
+            Some("a comment changed under you; your edit was dropped")
+        );
+        let log = state.path().join("config-problems.log");
+        assert!(
+            !log.exists(),
+            "{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        let mut changed = s.comments[0].clone();
+        changed.text = "another refresh".into();
+        other.set_for_tests(vec![changed.clone()]);
+        handle.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&handle, "next refresh", |s| {
+            s.comments[0].text == "another refresh"
+        });
+        assert_eq!(s.comment_seq, 3, "the dropped edit was announced again");
+        assert!(!log.exists());
+        changed.text = "valid alongside malformed".into();
+        std::fs::write(
+            state.path().join("comments.json"),
+            serde_json::json!({top: [serde_json::to_value(changed).unwrap(), {"bad": true}]})
+                .to_string(),
+        )
+        .unwrap();
+        handle.commands.send(Command::Refresh).unwrap();
+        let s = wait_for(&handle, "malformed record skipped", |s| {
+            s.comments[0].text == "valid alongside malformed"
+        });
+        assert_eq!(s.comment_seq, 3);
+        assert!(std::fs::read_to_string(log)
+            .unwrap()
+            .contains("comments.json: 1 unusable record(s)"));
+    }
+
+    #[test]
+    fn a_transient_opener_failure_is_retried_on_the_next_refresh() {
+        for failure in [
+            host::HostFailure::After("timeout".into()),
+            host::HostFailure::Before("write failed".into()),
+            host::HostFailure::NoHost("offline".into()),
+        ] {
+            let (dir, state, _top, host) = sending_fixture();
+            *host.list_failure.lock().unwrap() = Some(failure);
+            let mut config = sending_config(dir.path(), state.path(), host.clone());
+            config.opener_pane = Some("w4:p2".into());
+            config.poll_interval = Duration::from_secs(3_600);
+            let (_rt, handle) = start_from(config);
+            let s = wait_for(&handle, "first refresh finished", |s| {
+                !s.files.is_empty() && !s.refreshing
+            });
+            assert!(s.target.is_none());
+            assert_eq!(host.calls.lock().unwrap().as_slice(), ["pane.get"]);
+            *host.list_failure.lock().unwrap() = None;
+            handle.commands.send(Command::Refresh).unwrap();
+            wait_for(
+                &handle,
+                "opener preselected after recovery",
+                |s| matches!(&s.target, Some(Target::Pane { pane, .. }) if pane == "w4:p2"),
+            );
+            assert_eq!(
+                host.calls.lock().unwrap().as_slice(),
+                ["pane.get", "pane.get"]
+            );
+            assert!(!state.path().join("targets.json").exists());
+        }
+    }
+
+    #[test]
+    fn a_pick_after_a_transient_opener_failure_stops_resolution() {
+        let (dir, state, _top, host) = sending_fixture();
+        *host.list_failure.lock().unwrap() = Some(host::HostFailure::After("timeout".into()));
+        let mut config = sending_config(dir.path(), state.path(), host.clone());
+        config.opener_pane = Some("w4:p2".into());
+        config.poll_interval = Duration::from_secs(3_600);
+        config.pick_write_gate = Some(Arc::new(Semaphore::new(0)));
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "first refresh finished", |s| {
+            !s.files.is_empty() && !s.refreshing
+        });
+        *host.list_failure.lock().unwrap() = None;
+        std::fs::write(dir.path().join("a.txt"), "one\nTWO\nTHREE\n").unwrap();
+        handle
+            .commands
+            .send(Command::SetTarget {
+                token: 1,
+                target: Target::Clipboard,
+            })
+            .unwrap();
+        let s = wait_for(&handle, "pick refresh finished", |s| {
+            s.files
+                .iter()
+                .any(|f| f.path == "a.txt" && f.insertions == Some(2))
+        });
+        assert_eq!(s.target, Some(Target::Clipboard));
+        assert_eq!(host.calls.lock().unwrap().as_slice(), ["pane.get"]);
     }
 
     #[test]
@@ -7729,6 +7891,44 @@ mod tests {
         assert!(std::fs::read_to_string(state.path().join("clipboard.md"))
             .unwrap()
             .starts_with("> Delegate a code review"));
+    }
+
+    #[test]
+    fn a_late_after_answer_leaves_the_records_unconfirmed_under_their_stamp() {
+        let (dir, state, top, host) = sending_fixture();
+        let mut config = sending_config(dir.path(), state.path(), host.clone());
+        config.host_wait = Duration::from_millis(100);
+        *host.prompt_delay.lock().unwrap() = Some(Duration::from_millis(400));
+        host.prompt_results
+            .lock()
+            .unwrap()
+            .push(Err(host::HostFailure::After("still uncertain".into())));
+        let (_rt, handle) = start_from(config);
+        ready_to_send(&handle);
+        handle
+            .commands
+            .send(feedback(dispatch::Accepted::default()))
+            .unwrap();
+        let initial = wait_for(&handle, "unconfirmed at the engine deadline", |s| {
+            s.send_seq == 1
+            && s.comments.len() == 2 && s.comments.iter().all(|c|
+                matches!(&c.state, comments::CommentState::Unconfirmed { stamp, .. } if stamp.nonce == "n00001"))
+        });
+        wait_cond("late host answer", || {
+            !host.prompts.lock().unwrap().is_empty()
+        });
+        let until = Instant::now() + dispatch::ENTER_MARGIN + Duration::from_secs(1);
+        while Instant::now() < until {
+            for s in handle.snapshots.try_iter() {
+                assert_eq!(
+                    s.comments, initial.comments,
+                    "a second timeout settled the claim"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let store = comments::Store::open(Some(state.path().to_path_buf()), &top, now()).0;
+        assert_eq!(store.comments(), initial.comments.as_slice());
     }
 
     #[test]

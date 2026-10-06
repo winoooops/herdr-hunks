@@ -253,20 +253,9 @@ impl ViewState {
 
     pub fn editor_place(&self) -> Option<EditorPlace> {
         let editor = self.editor.as_ref()?;
-        let after = editor
-            .editing
-            .as_ref()
-            .filter(|c| {
-                self.rows
-                    .as_ref()
-                    .is_some_and(|rows| rows.orphan_tops.iter().any(|(_, id)| id == &c.id))
-            })
-            .map_or_else(
-                || EditorAnchor::Anchor(editor.anchor.clone()),
-                |c| EditorAnchor::Orphan(c.id.clone()),
-            );
         Some(EditorPlace {
-            after,
+            after: EditorAnchor::Anchor(editor.anchor.clone()),
+            editing: editor.editing.as_ref().map(|c| c.id.clone()),
             lines: editor
                 .lines(cards::card_width(usize::from(self.body_width()), self.mode))
                 .len(),
@@ -352,7 +341,7 @@ impl ViewState {
         if answered_target {
             self.seen_target_seq = snapshot.target_seq;
             if let Some(error) = &snapshot.target_error {
-                self.displace_urgent();
+                self.displace_notice();
                 self.warn(crate::tui::sanitize::sanitize(error));
             }
         }
@@ -360,7 +349,7 @@ impl ViewState {
         if answered_comment {
             self.seen_comment_seq = snapshot.comment_seq;
             if let Some(error) = &snapshot.comment_error {
-                self.displace_urgent();
+                self.displace_notice();
                 self.warn(crate::tui::sanitize::sanitize(error));
             }
             if self
@@ -397,13 +386,13 @@ impl ViewState {
                     }
                 }
                 (Some(error), _) => {
-                    self.displace_urgent();
+                    self.displace_notice();
                     self.notify(crate::tui::sanitize::sanitize(error));
                 }
                 (None, Some(outcome)) => {
                     self.review_box = None;
                     let (text, urgent) = crate::tui::review::outcome_notice(outcome, snapshot);
-                    self.displace_urgent();
+                    self.displace_notice();
                     if urgent {
                         self.warn(text)
                     } else {
@@ -419,7 +408,7 @@ impl ViewState {
             if let Some(copy) = &snapshot.copy {
                 self.pending_copy = copy.osc.clone();
                 if !send_answered {
-                    self.displace_urgent();
+                    self.displace_notice();
                     if copy.urgent {
                         self.warn(copy.notice.clone())
                     } else {
@@ -442,7 +431,7 @@ impl ViewState {
                     }
                 };
                 self.review_box = None;
-                self.displace_urgent();
+                self.displace_notice();
                 self.notify(format!(
                     "{} · {} is gone · pick a pane",
                     crate::tui::sanitize::sanitize(agent),
@@ -460,7 +449,7 @@ impl ViewState {
         if snapshot.mark_seq != self.seen_mark_seq {
             self.seen_mark_seq = snapshot.mark_seq;
             answered_mark = true;
-            self.displace_urgent();
+            self.displace_notice();
             match (&snapshot.mark_error, &snapshot.mark) {
                 (Some(error), _) => self.warn(crate::tui::sanitize::sanitize(error)),
                 (None, Some(mark)) => {
@@ -475,7 +464,7 @@ impl ViewState {
             self.seen_action_seq = snapshot.action_seq;
             answered_action = true;
             if let Some(pending) = self.pending_action.take() {
-                self.displace_urgent();
+                self.displace_notice();
                 match &snapshot.action_error {
                     Some(error) => {
                         let mut text = format!(
@@ -512,9 +501,8 @@ impl ViewState {
             (Some(&at) == snapshot.head_seen.as_ref() && mark.state != MarkState::Current)
                 .then(|| (mark.commit.clone(), at, mark.state.clone()))
         });
-        // Leave the warning pending until an urgent answer has been acknowledged.
-        let urgent_stands = self.notice.as_ref().is_some_and(|n| n.urgent);
-        if rewritten != self.seen_rewrite && !answered_now && !urgent_stands {
+        // Leave the warning pending until the current notice has been acknowledged.
+        if rewritten != self.seen_rewrite && !answered_now && self.notice.is_none() {
             self.seen_rewrite = rewritten.clone();
             match rewritten.map(|(_, _, state)| state) {
                 Some(MarkState::Rewritten) => {
@@ -545,7 +533,7 @@ impl ViewState {
         // warning -- including the one the branch above just set, whose pair is already
         // recorded and would never speak again.
         if let Some(error) = self.pending_base_error.clone() {
-            if !answered_now && !self.notice.as_ref().is_some_and(|n| n.urgent) {
+            if !answered_now && self.notice.is_none() {
                 self.pending_base_error = None;
                 self.warn(error);
                 self.notice_kind = NoticeKind::BaseError;
@@ -558,9 +546,9 @@ impl ViewState {
         }
     }
 
-    /// Urgent answers displace unread warnings; each warning retains its way back.
-    fn displace_urgent(&mut self) {
-        if let Some(displaced) = self.notice.as_ref().filter(|n| n.urgent) {
+    /// Displaced notices retain their way back after the answer is read.
+    fn displace_notice(&mut self) {
+        if let Some(displaced) = self.notice.as_ref() {
             match self.notice_kind {
                 NoticeKind::Rewrite => self.seen_rewrite = None,
                 NoticeKind::BaseError => self.pending_base_error = Some(displaced.text.clone()),

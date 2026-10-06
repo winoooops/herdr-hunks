@@ -15,7 +15,8 @@ use super::{branch, worktree, DiffState, FileKey, Snapshot};
 use crate::git::ChangedFileStatus;
 
 pub const SEND_LOCK: &str = "send.lock";
-pub const LOCK_WAIT: Duration = Duration::from_secs(12);
+// Two ENGINE_WAITs (20 s) + ENTER_MARGIN (0.5 s) + at least one second spare.
+pub const LOCK_WAIT: Duration = Duration::from_secs(25);
 pub const ENTER_MARGIN: Duration = Duration::from_millis(500);
 pub const REQUEST_BOUND: usize = 512 * 1024;
 pub const OSC_LIMIT: usize = 100_000;
