@@ -311,7 +311,14 @@ transaction of this section runs on it in memory, claims and settlements
 included, both kinds of send work, and the first add shows `comments not
 remembered: no state directory`, once, which is also the warning that a quit
 forgets what was sent. The journal is for a state directory that exists and
-fails.
+fails. The store belongs to the toplevel it was opened for. When a refresh
+finds the viewer's directory under another toplevel -- a subdirectory became a
+repository of its own, or stopped being one -- the session rebinds: the
+snapshot carries no comments until the new toplevel's array is read, a store
+still answering for the old toplevel publishes nothing, the old journal is
+replayed once, and what that replay could not write, or without a state
+directory the pending and unconfirmed comments the session held, is dropped
+with the notice `the repository changed; N unsaved comment changes dropped`.
 
 ### 10.4 Finishing, sending and copying
 
@@ -770,6 +777,7 @@ comment is a record beside the diff, never in it.
 | the base moves (a merge into `main`, a fetch) under branch-scope comments | the anchors keep the merge-base they were made against and are drawn at their numbers; the prompt names that merge-base, so the agent sees what the reviewer saw |
 | a comment's row leaves the list (the file was committed, the hunk discarded) | the card moves to the orphan section at the end of the body, where `u` and `x` still reach it; the comment is counted and sent; `✎` leaves the panel with the row |
 | the selected file's diff fails to load while the file carries comments | its pending and unconfirmed comments join the orphan section under the failure's reason until the diff loads, where `u` and `x` reach them |
+| the viewer's directory moves under another toplevel | the comments follow it: the new toplevel's are shown, the old ones stay in `comments.json` under their key, and unsaved ones are dropped with `the repository changed; N unsaved comment changes dropped` |
 | another viewer holds the send lock | the box reads `another viewer is sending` and the send waits for it; the lock is released by the host's answer plus half a second, or by the death of the viewer holding it |
 | a retry of an `Unconfirmed` comment fails definitely | the record returns to `Unconfirmed` with its earlier stamp, never to `Pending`: the earlier send may have arrived |
 | the fresh check finds a condition the box did not show (a restart behind a `working` refusal) | refused and shown; `send anyway` accepts only what the box named |

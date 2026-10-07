@@ -24,6 +24,13 @@ pub const NOTICE_NOTHING: &str = "nothing to send: another viewer sent these com
 const COMMENTS_FILE: &str = "comments.json";
 const REQUESTS_FILE: &str = "requests.json";
 
+fn notice_repository_changed(count: usize) -> String {
+    format!(
+        "the repository changed; {count} unsaved comment change{} dropped",
+        if count == 1 { "" } else { "s" }
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Category {
@@ -483,6 +490,36 @@ impl Store {
 
     pub fn comments(&self) -> &[Comment] {
         &self.comments
+    }
+
+    pub fn toplevel(&self) -> &str {
+        &self.toplevel
+    }
+
+    pub fn rebind(mut self, toplevel: &str, now: u64) -> (Store, Vec<String>, Option<String>) {
+        if self.toplevel == toplevel {
+            return (self, Vec::new(), None);
+        }
+        let (mut problems, replay_notice) = if self.journal.is_empty() {
+            (Vec::new(), None)
+        } else {
+            self.refresh(now)
+        };
+        let lost = if self.state_dir.is_some() {
+            self.journal.len()
+        } else {
+            self.comments.iter().filter(|c| c.is_editable()).count()
+        };
+        let (store, opened) = Store::open(self.state_dir, toplevel, now);
+        problems.extend(opened);
+        let notice = match (
+            replay_notice,
+            (lost > 0).then(|| notice_repository_changed(lost)),
+        ) {
+            (Some(replay), Some(loss)) => Some(format!("{replay} · {loss}")),
+            (replay, loss) => replay.or(loss),
+        };
+        (store, problems, notice)
     }
 
     pub fn journal_len(&self) -> usize {
@@ -1232,6 +1269,167 @@ pub fn nonces_in_use(state_dir: &Path, own: &[Comment]) -> std::io::Result<BTree
 mod tests {
     use super::*;
     use crate::engine::nav::Side;
+
+    #[test]
+    fn rebind_returns_replay_notices_before_any_loss_notice() {
+        for lose_add in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = open(dir.path());
+            let seen = comment("original", "original", 1);
+            store.transact(Operation::Add(seen.clone()), 1).unwrap();
+            store.fail_writes_for_tests(true);
+            store
+                .transact(
+                    Operation::Edit {
+                        id: seen.id.clone(),
+                        seen: seen.clone(),
+                        category: Category::Bug,
+                        text: "unsaved edit".into(),
+                    },
+                    2,
+                )
+                .unwrap_err();
+            if lose_add {
+                store
+                    .transact(Operation::Add(comment("local", "unsaved add", 2)), 2)
+                    .unwrap_err();
+            }
+            let mut other = open(dir.path());
+            other
+                .transact(
+                    Operation::Edit {
+                        id: seen.id.clone(),
+                        seen,
+                        category: Category::Question,
+                        text: "other viewer".into(),
+                    },
+                    3,
+                )
+                .unwrap();
+            if lose_add {
+                for i in 1..CAP {
+                    other
+                        .transact(
+                            Operation::Add(comment(&format!("other{i}"), "shared", 3)),
+                            3,
+                        )
+                        .unwrap();
+                }
+            }
+            store.fail_writes_for_tests(false);
+            let (store, problems, notice) = store.rebind("/other", 4);
+            let expected = if lose_add {
+                "a comment changed under you; your edit was dropped · the repository changed; 1 unsaved comment change dropped"
+            } else {
+                "a comment changed under you; your edit was dropped"
+            };
+            assert_eq!(notice.as_deref(), Some(expected));
+            assert!(problems.is_empty(), "{problems:?}");
+            assert!(!dir.path().join("config-problems.log").exists());
+            assert_eq!(store.toplevel(), "/other");
+            assert_eq!(open(dir.path()).comments(), other.comments());
+        }
+    }
+
+    #[test]
+    fn rebind_to_the_same_toplevel_preserves_comments_without_io() {
+        let dir = tempfile::tempdir().unwrap();
+        for state_dir in [None, Some(dir.path().to_path_buf())] {
+            let (mut store, _) = Store::open(state_dir, "/repo", 1);
+            let pending = comment("a", "pending", 1);
+            store.fail_writes_for_tests(true);
+            store
+                .transact(Operation::Add(pending.clone()), 1)
+                .unwrap_err();
+            let reads = store.reads;
+            let journal = store.journal.clone();
+            let (store, problems, notice) = store.rebind("/repo", 2);
+            assert_eq!(store.comments(), &[pending]);
+            assert!(problems.is_empty());
+            assert_eq!(notice, None);
+            assert_eq!(store.reads, reads);
+            assert_eq!(store.journal, journal);
+            assert!(store.fail_writes);
+        }
+    }
+
+    #[test]
+    fn rebind_reads_the_new_toplevel_without_changing_the_old_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = comment("old", "old repo", 1);
+        let new = comment("new", "new repo", 2);
+        let mut store = open(dir.path());
+        store.transact(Operation::Add(old.clone()), 1_000).unwrap();
+        let mut other = Store::open(Some(dir.path().to_path_buf()), "/other", 1_000).0;
+        other.transact(Operation::Add(new.clone()), 1_000).unwrap();
+        let (store, problems, notice) = store.rebind("/other", 1_000);
+        assert_eq!(store.toplevel(), "/other");
+        assert_eq!(store.comments(), &[new]);
+        assert!(problems.is_empty());
+        assert_eq!(notice, None);
+        assert_eq!(open(dir.path()).comments(), &[old]);
+    }
+
+    #[test]
+    fn rebind_replays_the_old_journal_once_and_reports_what_is_lost() {
+        for failing in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = open(dir.path());
+            store.fail_writes_for_tests(true);
+            let old = comment("old", "unsaved", 1);
+            store
+                .transact(Operation::Add(old.clone()), 1_000)
+                .unwrap_err();
+            assert_eq!(store.journal_len(), 1);
+            store.fail_writes_for_tests(failing);
+            let (store, problems, notice) = store.rebind("/other", 1_000);
+            assert_eq!(store.toplevel(), "/other");
+            assert!(store.comments().is_empty());
+            assert_eq!(store.journal_len(), 0);
+            if failing {
+                assert_eq!(problems, ["comments.json: write failed (test)"]);
+                assert_eq!(
+                    notice.as_deref(),
+                    Some("the repository changed; 1 unsaved comment change dropped")
+                );
+                assert!(open(dir.path()).comments().is_empty());
+            } else {
+                assert!(problems.is_empty());
+                assert_eq!(notice, None);
+                assert_eq!(open(dir.path()).comments(), &[old]);
+            }
+        }
+    }
+
+    #[test]
+    fn rebind_counts_pending_and_unconfirmed_memory_comments() {
+        for uncertain in [false, true] {
+            let (mut store, _) = Store::open(None, "/repo", 1_000);
+            store
+                .transact(Operation::Add(comment("a", "first", 1)), 1_000)
+                .unwrap_err();
+            store
+                .transact(Operation::Add(comment("b", "second", 2)), 1_000)
+                .unwrap();
+            if uncertain {
+                store.comments[1].state = CommentState::Unconfirmed {
+                    stamp: stamp("abcdef"),
+                    before: Vec::new(),
+                };
+            }
+            let mut sent = comment("s", "already sent", 3);
+            sent.state = CommentState::Sent(stamp("abcdef"));
+            store.comments.push(sent);
+            let (store, problems, notice) = store.rebind("/other", 1_000);
+            assert_eq!(store.toplevel(), "/other");
+            assert!(store.comments().is_empty());
+            assert!(problems.is_empty());
+            assert_eq!(
+                notice.as_deref(),
+                Some("the repository changed; 2 unsaved comment changes dropped")
+            );
+        }
+    }
 
     #[test]
     fn the_memory_only_warning_is_not_repeated_after_deleting_every_comment() {

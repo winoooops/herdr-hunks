@@ -240,6 +240,7 @@ enum StoreOp {
     Comment(comments::Operation, Option<u64>),
     Send(dispatch::SendRequest, dispatch::Context),
     Refresh,
+    Rebind(String),
     LateAnswer(String, comments::Settlement),
 }
 
@@ -289,6 +290,7 @@ struct State {
     /// How the published target was chosen; an opener preselection is written on the first comment.
     target_source: Option<target::Source>,
     store: Option<comments::Store>,
+    store_toplevel: Option<String>,
     store_opened: bool,
     store_opening: bool,
     store_queue: VecDeque<StoreOp>,
@@ -829,6 +831,13 @@ impl State {
                         outcome,
                     }
                 }
+                StoreOp::Rebind(toplevel) => {
+                    let (store, problems, notice) =
+                        tokio::task::spawn_blocking(move || store.rebind(&toplevel, now()))
+                            .await
+                            .expect("store rebind task");
+                    Done::StoreRefreshed(store, problems, notice)
+                }
                 StoreOp::Refresh | StoreOp::LateAnswer(_, _) => {
                     let (store, problems, notice) = tokio::task::spawn_blocking(move || {
                         let (problems, notice) = match op {
@@ -924,11 +933,12 @@ impl State {
         });
     }
 
-    fn refresh_comments(&mut self, repo: &RepoState, results: &UnboundedSender<Done>) {
+    fn refresh_comments(&mut self, repo: &RepoState, results: &UnboundedSender<Done>) -> bool {
         let RepoState::Repo { toplevel, .. } = repo else {
-            return;
+            return false;
         };
         if !self.store_opened && !self.store_opening {
+            self.store_toplevel = Some(toplevel.clone());
             self.store_opening = true;
             let (dir, toplevel, results) = (
                 self.inputs.state_dir.clone(),
@@ -943,6 +953,14 @@ impl State {
                 .expect("store open task");
                 let _ = results.send(Done::StoreRefreshed(store, problems, None));
             });
+        } else if self.store_toplevel.as_ref() != Some(toplevel) {
+            self.store_toplevel = Some(toplevel.clone());
+            self.store_queue
+                .retain(|op| !matches!(op, StoreOp::Rebind(_)));
+            self.store_queue
+                .push_back(StoreOp::Rebind(toplevel.clone()));
+            self.run_store_queue(results);
+            return true;
         } else {
             if !self
                 .store_queue
@@ -953,6 +971,7 @@ impl State {
             }
             self.run_store_queue(results);
         }
+        false
     }
 
     /// One refresh: status, head when asked, and the rows of the current or requested comparison.
@@ -1362,6 +1381,7 @@ async fn run(
         action_seq: 0,
         target_source: None,
         store: None,
+        store_toplevel: None,
         store_opened: false,
         store_opening: false,
         store_queue: VecDeque::new(),
@@ -1774,7 +1794,9 @@ async fn run(
                         state.send_in_flight = false;
                         state.nonce_counter = state.nonce_counter.max(finished.counter);
                         if let Some(store) = finished.store {
-                            next.comments = Arc::new(store.comments().to_vec());
+                            if Some(store.toplevel()) == state.store_toplevel.as_deref() {
+                                next.comments = Arc::new(store.comments().to_vec());
+                            }
                             state.store = Some(store);
                         }
                         state.send_seq += 1;
@@ -1833,7 +1855,8 @@ async fn run(
                     Done::StoreRefreshed(store, problems, notice) => {
                         state.store_opened = true;
                         state.store_opening = false;
-                        if next.comments.as_slice() != store.comments() {
+                        if Some(store.toplevel()) == state.store_toplevel.as_deref()
+                            && next.comments.as_slice() != store.comments() {
                             next.comments = Arc::new(store.comments().to_vec());
                         }
                         state.store = Some(store);
@@ -1854,7 +1877,8 @@ async fn run(
                     }
                     Done::Comment { token, is_add, store, outcome } => {
                         if let Some(store) = store {
-                            if next.comments.as_slice() != store.comments() {
+                            if Some(store.toplevel()) == state.store_toplevel.as_deref()
+                                && next.comments.as_slice() != store.comments() {
                                 next.comments = Arc::new(store.comments().to_vec());
                             }
                             state.store = Some(store);
@@ -2099,7 +2123,9 @@ async fn run(
                                 }
                             }
                         }
-                        state.refresh_comments(&next.repo, &results_tx);
+                        if state.refresh_comments(&next.repo, &results_tx) {
+                            next.comments = Arc::new(Vec::new());
+                        }
                         if matches!(change, Some(Change::Mark(_))) && !mark_answered {
                             state.mark_seq += 1;
                             next.mark_seq = state.mark_seq;
@@ -2554,6 +2580,66 @@ mod tests {
             category: comments::Category::Bug,
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn comments_follow_a_changed_repository_toplevel() {
+        let dir = fixture();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let top_a = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let top_b = sub.canonicalize().unwrap().to_string_lossy().into_owned();
+        let mut config = test_config(&sub, Arc::new(AtomicBool::new(true)));
+        config.state_dir = Some(state.path().to_path_buf());
+        let (_rt, handle) = start_from(config);
+        wait_for(&handle, "A's changed file", |s| {
+            matches!(&s.repo, RepoState::Repo { toplevel, .. } if toplevel == &top_a)
+                && ready(s).is_some_and(|d| d.key.path == "a.txt")
+        });
+        handle.commands.send(pending(2, "A's comment")).unwrap();
+        let a = wait_for(&handle, "A's saved comment", |s| {
+            s.comment_seq == 1 && s.comments.len() == 1 && s.comment_error.is_none()
+        })
+        .comments[0]
+            .clone();
+        assert_eq!(
+            comments::Store::open(Some(state.path().to_path_buf()), &top_a, now())
+                .0
+                .comments(),
+            std::slice::from_ref(&a)
+        );
+
+        git(&sub, &["init", "-q", "-b", "main"]);
+        git(&sub, &["config", "user.email", "t@example.com"]);
+        git(&sub, &["config", "user.name", "t"]);
+        std::fs::write(sub.join("a.txt"), "one\ntwo\n").unwrap();
+        git(&sub, &["add", "-A"]);
+        git(&sub, &["commit", "-q", "-m", "init"]);
+        std::fs::write(sub.join("a.txt"), "one\nB\n").unwrap();
+        handle.commands.send(Command::Refresh).unwrap();
+        wait_for(&handle, "B's changed file without A's comments", |s| {
+            matches!(&s.repo, RepoState::Repo { toplevel, .. } if toplevel == &top_b)
+                && s.comments.is_empty()
+                && ready(s).is_some_and(|d| d.key.path == "a.txt" && d.raw_diff.contains("+B\n"))
+        });
+        handle.commands.send(pending(2, "B's comment")).unwrap();
+        let b = wait_for(&handle, "B's saved comment", |s| {
+            s.comment_seq == 2 && s.comments.len() == 1 && s.comment_error.is_none()
+        })
+        .comments[0]
+            .clone();
+        let saved: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(state.path().join("comments.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved[&top_a], serde_json::json!([a]));
+        assert_eq!(saved[&top_b], serde_json::json!([b]));
     }
 
     #[test]
