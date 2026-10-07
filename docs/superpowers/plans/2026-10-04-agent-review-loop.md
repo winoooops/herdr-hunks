@@ -10331,4 +10331,42 @@ picker had gone inert; a short pane picker hid the clipboard row behind its wrap
 a pending connect; a mouse file selection left the orphan cursor set (`7159149`). Round 5: no
 findings.
 
+**Kimi milestone, first pass: hold.** Two MEDIUMs, both taken (`544f4af`). A settlement or a
+claim wrote the display array, which the journal overlays, so a cap-refused add could land in
+`comments.json` past the cap and its journal entry be absorbed without a notice; the store now
+keeps `persisted`, the records as read and written, apart from the display. An unread plain
+notice was overwritten by the next answer drained in the same batch; `displace_notice` now
+rescues every standing notice by the way its kind names. Seven LOWs were taken in the same
+commit: an edited card is replaced by its editor; a late second timeout settles nothing; the
+claim's guard is pinned; the recording test waits for git to go quiet; a dropped journal entry
+is a notice, not a log line; the send lock's wait covers two host waits; a transient failure of
+the opener's first check is retried. Deferred, each a window of one poll or a bug rather than a
+path: a send whose blocking step panics leaves `send_in_flight` set; a request record is reserved
+before its text goes out and removed best-effort; a `c` or `y` copy can rewrite `clipboard.md`
+between a clipboard send's write and its settlement; a late success for an earlier stamp of a
+`before` chain settles a record another viewer has reclaimed (both attempts delivered); the
+Finish box can offer `Y` over comments another viewer sent while it was open (the engine
+answers `nothing to send`); `u` or `x` on an orphan card sent between the frame and the key is
+inert without a notice; `is_under` compares raw path components; the recording test drives one
+script, the other forms being covered by the session tests against the scripted host.
+
+**Branch review, rounds 6 to 9.** Round 6: a paste past the 100-line cap appended the rest of
+its text to the last accepted line without the limit warning, and a replay conflict's notice
+was lost when the operation it rode with was refused at the cap (`4c88a0d`). Round 7: page keys
+could not read through an in-place card taller than the body (`96e9609`); the half-page
+`PageDown` and `PageUp` of 0.0.4 are unchanged. Round 8: a refused add still promoted the opener
+to the remembered target and wrote `targets.json` (`a041bb8`). Round 9: no findings.
+
+**Kimi milestone, second pass: ship.** Both MEDIUMs closed, each re-falsified by kimi in a
+scratch copy. One new LOW, older than the first pass: a base error parked behind an answer was
+overwritten by a different base error arriving before it spoke; the older one now joins the
+deferred queue (`2204452`).
+
+**The owner's trial and rounds 10 and 11.** In a live session against this repository the owner
+asked for a rule between the pane picker's two groups (`94917be`) and a taller editor, which now
+opens with three text rows and grows from there (`61d55e0`; 10.3 amended). Round 10: with the
+Request box open on one file, a refresh that removed the file and left one other hid the scope
+line while the retained scope disabled `Y` (`50ede44`). Round 11: no findings. Rounds 1 to 11
+ran against a local `main` still at `dfde11a`, so they also covered 0.0.4's code.
+
 <!-- codex-reviewed: 2026-10-05T11:00:21Z -->
