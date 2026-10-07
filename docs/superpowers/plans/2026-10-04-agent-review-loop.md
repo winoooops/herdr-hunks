@@ -10369,4 +10369,12 @@ Request box open on one file, a refresh that removed the file and left one other
 line while the retained scope disabled `Y` (`50ede44`). Round 11: no findings. Rounds 1 to 11
 ran against a local `main` still at `dfde11a`, so they also covered 0.0.4's code.
 
+**Rounds 12 and 13, against `origin/main`.** Round 12: the comments of a listed, selected file
+whose diff failed to load were neither in place nor orphans, so `u` and `x` could not reach what
+Finish would send; they now join the orphan section under the failure's reason (`634cdb7`). The
+comment store kept the toplevel of the first refresh, so a viewer whose directory became a
+repository of its own wrote new comments under the parent's key; the store now rebinds, and a
+rebind to its own toplevel changes nothing (`28b71fa`). Both amend 10.3 and 10.7. Round 13: no
+findings.
+
 <!-- codex-reviewed: 2026-10-05T11:00:21Z -->
