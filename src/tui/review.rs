@@ -18,6 +18,7 @@ pub const NO_LINE: &str = "No diff line selected for comment.";
 pub const NO_COMMENT: &str = "No comment selected.";
 pub const CHOOSE_PANE: &str = "choose the pane this review goes to";
 pub const EDITOR_FOOTER: &str = "enter save · ctrl+j newline · esc cancel";
+pub const EDITOR_MIN_ROWS: usize = 3;
 
 pub struct Editor {
     pub anchor: Anchor,
@@ -125,6 +126,7 @@ impl Editor {
             Some(last) if width(last) < inner => last.push('_'),
             _ => text.push("_".to_string()),
         }
+        text.resize(text.len().max(EDITOR_MIN_ROWS), String::new());
         lines.extend(text.into_iter().map(CardLine::Text));
         lines.push(CardLine::Bottom);
         lines
@@ -643,6 +645,44 @@ mod tests {
         assert_eq!(editor.place_label(), "L3-9");
         editor.anchor.span = AnchorSpan::File;
         assert_eq!(editor.place_label(), "file");
+    }
+
+    #[test]
+    fn a_fresh_editor_has_three_text_rows_with_the_caret_first() {
+        let editor = Editor::new(anchor());
+        assert_eq!(
+            editor.lines(12),
+            vec![
+                CardLine::Top {
+                    title: String::new(),
+                    tone: None,
+                    dim: false,
+                },
+                CardLine::Text("_".into()),
+                CardLine::Text(String::new()),
+                CardLine::Text(String::new()),
+                CardLine::Bottom,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_editor_grows_to_five_wrapped_text_rows() {
+        let mut editor = Editor::new(anchor());
+        editor.text = "x".repeat(33);
+        let lines = editor.lines(12);
+        assert!(matches!(lines.first(), Some(CardLine::Top { .. })));
+        assert_eq!(
+            &lines[1..lines.len() - 1],
+            &[
+                CardLine::Text("xxxxxxxx".into()),
+                CardLine::Text("xxxxxxxx".into()),
+                CardLine::Text("xxxxxxxx".into()),
+                CardLine::Text("xxxxxxxx".into()),
+                CardLine::Text("x_".into()),
+            ]
+        );
+        assert!(matches!(lines.last(), Some(CardLine::Bottom)));
     }
 
     #[test]

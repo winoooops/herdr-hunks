@@ -2500,8 +2500,12 @@ mod tests {
         assert!(plain[at - 1].contains("12 + line +"));
         assert!(plain[at].contains("ctrl+h/l"));
         assert!(plain[at + 1].contains('_'));
-        assert!(plain[at + 2].contains(EDITOR_FOOTER));
-        assert!(plain[at + 3].contains("13 + line +"));
+        for row in &plain[at + 2..=at + 3] {
+            assert!(row.trim().starts_with('│') && row.trim().ends_with('│'));
+            assert!(row.chars().all(|ch| ch == '│' || ch.is_whitespace()));
+        }
+        assert!(plain[at + 4].contains(EDITOR_FOOTER));
+        assert!(plain[at + 5].contains("13 + line +"));
         assert!(body_is_drawn(&st, &snap, 120, 24));
     }
 

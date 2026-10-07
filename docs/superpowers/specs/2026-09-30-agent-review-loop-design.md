@@ -225,7 +225,7 @@ and it is the card part 2's thread grows under; it is counted nowhere.
 
 **The editor** is a card too, drawn in the place the comment's card will take:
 the title `comment on R16 · Question Change Bug Suggestion` with the chosen
-category in reverse video and `ctrl+h/l` at the right, one text row that grows
+category in reverse video and `ctrl+h/l` at the right, three text rows, growing
 with the text, and `enter save · ctrl+j newline · esc cancel` on the bottom
 edge. It is modal like the picker: printable keys insert, `ctrl+h`/`ctrl+l`
 cycle the category, `ctrl+j` inserts a newline, `Enter` saves (whitespace-only
