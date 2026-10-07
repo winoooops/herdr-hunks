@@ -444,6 +444,7 @@ impl ReviewBox {
         let (_, mut offers) = self.state_line(snapshot);
         if self.kind == BoxKind::Request {
             let one_loaded_row = snapshot.files.len() == 1
+                && self.scope_available(snapshot, &self.scope)
                 && self.scope_available(snapshot, &ReviewScope::All)
                 && Self::selected_key(snapshot)
                     .is_some_and(|k| self.scope_available(snapshot, &ReviewScope::File(k)));
@@ -1077,6 +1078,19 @@ mod tests {
         assert_eq!(texts(&panel)[0], "nothing to review");
         assert_eq!(panel.footer, "n cancel");
         assert!(b.submit(&s).is_none());
+    }
+
+    #[test]
+    fn the_request_box_keeps_scope_controls_when_its_file_disappears() {
+        let s = with_comments(Some(Target::Clipboard), TargetState::Clipboard, 0, 0);
+        let mut b = ReviewBox::request(&s);
+        b.scope = ReviewScope::File(box_anchor("gone.rs", 1).key);
+        let offers = b.offers(&s);
+        assert_eq!((offers.scope_line, offers.y), (true, None));
+
+        b.scope = ReviewScope::All;
+        let offers = b.offers(&s);
+        assert_eq!((offers.scope_line, offers.y), (false, Some("copy")));
     }
 
     #[test]
