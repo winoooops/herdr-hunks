@@ -2337,6 +2337,14 @@ mod tests {
             .collect();
         assert_eq!(first.len(), 1);
         assert!(text[usize::from(first[0].y)].contains("codex  w1:p2"));
+        let other = r
+            .hits
+            .iter()
+            .find(|hit| hit.action == Action::PickPaneRow(1))
+            .unwrap();
+        assert_eq!(other.y, 7);
+        assert!(text[usize::from(other.y)].contains("kimi  w2:p1"));
+        assert_eq!(r.hit(other.x0, other.y), Some(&Action::PickPaneRow(1)));
         assert!(r
             .hits
             .iter()

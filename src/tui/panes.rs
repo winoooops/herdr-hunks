@@ -202,8 +202,9 @@ impl PanePicker {
                     .any(|c| matches!(c, Choice::Pane(row) if row.this_worktree == *group))
             })
             .count();
+        let group_lines = headings + usize::from(headings == 2);
         let body = usize::from(height.saturating_sub(4));
-        if dialog::line_count(&head, width) + headings + 1 > body {
+        if dialog::line_count(&head, width) + group_lines + 1 > body {
             match head.rows.get_mut(1) {
                 Some(row @ Row::Note(_)) => *row = Row::Text(truncate(NO_AGENT, line)),
                 Some(Row::Warn(error)) => *error = truncate(error, line),
@@ -211,7 +212,7 @@ impl PanePicker {
             }
         }
         let visible = body
-            .saturating_sub(dialog::line_count(&head, width) + headings)
+            .saturating_sub(dialog::line_count(&head, width) + group_lines)
             .max(1);
         let mut rows = head.rows;
         let first = self.window(visible);
@@ -220,6 +221,9 @@ impl PanePicker {
         for (index, choice) in choices.iter().enumerate().skip(first).take(visible) {
             if let Choice::Pane(row) = choice {
                 if last_group != Some(row.this_worktree) {
+                    if last_group == Some(true) && !row.this_worktree {
+                        rows.push(Row::Rule);
+                    }
                     last_group = Some(row.this_worktree);
                     rows.push(Row::Text(
                         if row.this_worktree {
@@ -530,7 +534,7 @@ mod tests {
                 "the clipboard row is never filtered out"
             );
         }
-        // The panel: two headings, the rows, the clipboard; the cursor lands on an entry row.
+        // The panel separates the groups and keeps the cursor on an entry row.
         let panel = picker.panel(&s, WIDTH, 20);
         let plain: Vec<String> = panel
             .rows
@@ -553,13 +557,72 @@ mod tests {
             plain[2]
         );
         assert!(plain[3].starts_with("E kimi  w2:p1  idle  ") && plain[3].contains("repo"));
-        assert_eq!(plain[4], "T other panes");
-        assert!(plain[5].starts_with("E codex  w1:p2  working  ") && plain[5].contains("other"));
-        assert_eq!(plain[6], format!("E {CLIPBOARD_ROW} | "));
+        assert_eq!(plain[4], "R");
+        assert_eq!(plain[5], "T other panes");
+        assert!(plain[6].starts_with("E codex  w1:p2  working  ") && plain[6].contains("other"));
+        assert_eq!(plain[7], format!("E {CLIPBOARD_ROW} | "));
+        assert_eq!(plain.len(), 8);
         assert_eq!(panel.cursor, Some(2));
-        assert_eq!(picker.panel_line(&s, WIDTH, 20, 3), Some(6));
+        assert_eq!(picker.panel_line(&s, WIDTH, 20, 2), Some(6));
+        assert_eq!(picker.panel_line(&s, WIDTH, 20, 3), Some(7));
         assert_eq!(panel.title, "Send to");
         assert_eq!(panel.footer, "Enter pick · Esc cancel · type to filter");
+    }
+
+    #[test]
+    fn a_single_visible_group_has_no_rule() {
+        for groups in [vec![], vec![true], vec![false], vec![true, false]] {
+            let s = snapshot_with(
+                groups
+                    .into_iter()
+                    .map(|this| pane("w1:p2", "codex", "idle", "/r", "", this))
+                    .collect(),
+                1,
+            );
+            let mut picker = PanePicker::open(1, ReturnTo::Nothing);
+            let choices = picker.choices(&s);
+            for index in 0..choices.len() {
+                let panel = picker.panel(&s, WIDTH, 8);
+                assert!(!panel.rows.iter().any(|row| matches!(row, Row::Rule)));
+                assert!(picker.panel_line(&s, WIDTH, 8, index).is_some());
+                let visible = picker.visible(&s, WIDTH, 8);
+                picker.move_by(1, &choices, visible);
+            }
+        }
+    }
+
+    #[test]
+    fn the_group_rule_keeps_entries_and_clipboard_within_the_window() {
+        let s = snapshot_with(
+            vec![
+                pane("w1:p2", "codex", "idle", "/r", "", true),
+                pane("w2:p1", "kimi", "idle", "/other", "", false),
+            ],
+            1,
+        );
+        for height in 8..=11 {
+            let mut picker = PanePicker::open(1, ReturnTo::Nothing);
+            let choices = picker.choices(&s);
+            for index in 0..choices.len() {
+                let panel = picker.panel(&s, WIDTH, height);
+                assert!(dialog::line_count(&panel, WIDTH) <= usize::from(height - 4));
+                let line = picker
+                    .panel_line(&s, WIDTH, height, index)
+                    .expect("the selected entry must stay visible");
+                let rendered = dialog::render(&panel, WIDTH, height);
+                let text: String = rendered[line + 1]
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect();
+                let label = match &choices[index] {
+                    Choice::Pane(row) => row.record.pane_id.as_str(),
+                    Choice::Clipboard => "✂ clipboard",
+                };
+                assert!(text.contains(label), "{text}");
+                let visible = picker.visible(&s, WIDTH, height);
+                picker.move_by(1, &choices, visible);
+            }
+        }
     }
 
     #[test]
