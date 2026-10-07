@@ -526,7 +526,12 @@ impl ViewState {
         if snapshot.base_error != self.seen_base_error {
             self.seen_base_error = snapshot.base_error.clone();
             if let (Some(error), None) = (&snapshot.base_error, &self.picker) {
-                self.pending_base_error = Some(crate::tui::sanitize::sanitize(error));
+                if let Some(older) = self
+                    .pending_base_error
+                    .replace(crate::tui::sanitize::sanitize(error))
+                {
+                    self.deferred.push_back(older);
+                }
             }
         }
         // It then waits behind a mark answer from this same snapshot and behind any unread
@@ -1154,6 +1159,38 @@ pub(crate) mod tests {
         st.notice = None;
         st.observe(&snap);
         assert!(st.notice.is_none(), "and then it rests");
+    }
+
+    #[test]
+    fn a_new_base_error_preserves_one_parked_behind_a_mark_answer() {
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        snap.base_error = Some("base error A".into());
+        st.observe(&snap);
+        assert_eq!(st.notice.as_ref().unwrap().text, "base error A");
+
+        snap.mark_seq = 1;
+        snap.mark_error = Some("mark not remembered: no state directory".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().unwrap().text,
+            "mark not remembered: no state directory"
+        );
+
+        snap.base_error = Some("base error B".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().unwrap().text,
+            "mark not remembered: no state directory"
+        );
+        for expected in ["base error B", "base error A"] {
+            st.notice = None;
+            st.observe(&snap);
+            assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some(expected));
+        }
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none());
     }
 
     #[test]
