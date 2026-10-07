@@ -679,6 +679,7 @@ fn body_line(
             scroll_text(text, hscroll),
             Style::semantic(Role::Label, Semantic::Accent),
         )],
+        Row::Note(text) => vec![Span::label(text.clone())],
         Row::Gap { lines } => vec![Span::label(format!(
             "··· {lines} unmodified line{} ···",
             if *lines == 1 { "" } else { "s" }

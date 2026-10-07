@@ -6,7 +6,7 @@ use crate::engine::comments::{
 };
 use crate::engine::nav::{self, Side, ViewMode};
 use crate::engine::LoadedDiff;
-use crate::engine::{Comparison, FileKey, Scope, Snapshot};
+use crate::engine::{Comparison, DiffState, FileKey, Scope, Snapshot};
 use crate::git::DiffLineType;
 use crate::tui::cards::{self, CardLine, MIN_WIDTH};
 use crate::tui::sanitize::sanitize;
@@ -42,6 +42,8 @@ pub enum Row {
     Gap {
         lines: u32,
     },
+    /// A label without a cursor target; `N` in the plain row-kind trace.
+    Note(String),
     Unified {
         target: usize,
         old_no: Option<u32>,
@@ -100,7 +102,11 @@ pub fn orphans<'a>(comments: &'a [Comment], snapshot: &Snapshot) -> Vec<&'a Comm
             )
         })
         .filter(|c| matches!(c.anchor.comparison, AnchorComparison::Branch { .. }) == branch)
-        .filter(|c| !listed.contains(&c.anchor.key))
+        .filter(|c| {
+            !listed.contains(&c.anchor.key)
+                || (matches!(snapshot.diff, DiffState::Failed(_))
+                    && snapshot.selected.as_ref() == Some(&c.anchor.key))
+        })
         .collect()
 }
 
@@ -187,9 +193,14 @@ fn splice_editor(rows: &mut Rows, diff: Option<&LoadedDiff>, editor: Option<&Edi
     }
 }
 
-pub fn orphans_only(orphans: &[&Comment], width: usize, editor: Option<&EditorPlace>) -> Rows {
+pub fn orphans_only(
+    orphans: &[&Comment],
+    width: usize,
+    editor: Option<&EditorPlace>,
+    note: Option<String>,
+) -> Rows {
     let mut rows = Rows {
-        rows: Vec::new(),
+        rows: note.into_iter().map(Row::Note).collect(),
         max_text_width: 0,
         row_of_target: Vec::new(),
         orphan_tops: Vec::new(),
@@ -494,6 +505,7 @@ mod tests {
                 Row::FileHeader { .. } => 'F',
                 Row::HunkHeader { .. } => 'H',
                 Row::Gap { .. } => 'G',
+                Row::Note(_) => 'N',
                 Row::Unified { sign, .. } => *sign,
                 Row::Split { .. } => 'S',
                 Row::Truncated { .. } => 'T',
@@ -804,6 +816,41 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["c"]
         );
+    }
+
+    #[test]
+    fn failed_selected_files_keep_their_editable_comments_as_orphans() {
+        let (mut snap, _) = crate::tui::input::tests::review_setup(&[(10, " + ")]);
+        let key = snap.selected.clone().unwrap();
+        let pending = comment("p", &key, Side::Additions, 11, Span::Line);
+        let mut unconfirmed = pending.clone();
+        unconfirmed.id = "u".into();
+        unconfirmed.state = CommentState::Unconfirmed {
+            stamp: stamp(),
+            before: Vec::new(),
+        };
+        let mut sent = pending.clone();
+        sent.state = CommentState::Sent(stamp());
+        let mut branch = pending.clone();
+        branch.anchor.comparison = AnchorComparison::Branch {
+            merge_base: "0".repeat(40),
+            label: "main".into(),
+        };
+        snap.comments = std::sync::Arc::new(vec![pending, unconfirmed, sent, branch]);
+        for diff in [DiffState::Idle, DiffState::Loading] {
+            snap.diff = diff;
+            assert!(orphans(&snap.comments, &snap).is_empty());
+        }
+        snap.diff = DiffState::Failed("permission denied".into());
+        assert_eq!(
+            orphans(&snap.comments, &snap)
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["p", "u"]
+        );
+        snap.selected = None;
+        assert!(orphans(&snap.comments, &snap).is_empty());
     }
 
     #[test]

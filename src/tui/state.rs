@@ -46,6 +46,7 @@ type BuiltFrom = (
     u64,
     u16,
     Option<EditorPlace>,
+    Option<String>,
 );
 
 pub struct ViewState {
@@ -567,6 +568,10 @@ impl ViewState {
             DiffState::Ready(d) => Some(d),
             _ => None,
         };
+        let failure = match &snapshot.diff {
+            DiffState::Failed(reason) => Some(reason),
+            _ => None,
+        };
         if self
             .visual
             .as_ref()
@@ -577,6 +582,9 @@ impl ViewState {
         let body_width = self.body_width();
         let mut files = std::collections::hash_map::DefaultHasher::new();
         (snapshot.scope == crate::engine::Scope::Branch).hash(&mut files);
+        if failure.is_some() {
+            snapshot.selected.hash(&mut files);
+        }
         snapshot.files.len().hash(&mut files);
         for file in &snapshot.files {
             crate::engine::FileKey::of(file).hash(&mut files);
@@ -590,7 +598,9 @@ impl ViewState {
                 }
             }
         }
-        if let Some((built, mode, comments, built_files, width, built_editor)) = &self.built_from {
+        if let Some((built, mode, comments, built_files, width, built_editor, built_failure)) =
+            &self.built_from
+        {
             let same_diff = match (built, diff) {
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
                 (None, None) => true,
@@ -602,6 +612,7 @@ impl ViewState {
                 && *built_files == files
                 && *width == body_width
                 && *built_editor == editor
+                && built_failure.as_ref() == failure
             {
                 return;
             }
@@ -628,6 +639,7 @@ impl ViewState {
             files,
             body_width,
             editor.clone(),
+            failure.cloned(),
         ));
         let orphans = rows::orphans(&snapshot.comments, snapshot);
         let card_width = cards::card_width(usize::from(body_width), self.mode);
@@ -636,7 +648,12 @@ impl ViewState {
                 self.orphan = None;
             }
             self.rows = if !orphans.is_empty() || editor.is_some() {
-                Some(rows::orphans_only(&orphans, card_width, editor.as_ref()))
+                Some(rows::orphans_only(
+                    &orphans,
+                    card_width,
+                    editor.as_ref(),
+                    failure.map(|reason| crate::tui::sanitize::sanitize(reason)),
+                ))
             } else {
                 None
             };
@@ -1373,6 +1390,78 @@ pub(crate) mod tests {
     use crate::tui::input::tests::{anchor_on, comment_at, key, review_setup};
     use crate::tui::review::Editor;
     use crate::tui::rows::Row;
+
+    #[test]
+    fn a_failed_diff_rebuilds_comments_and_keeps_its_reason_above_them() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        let ready = snap.diff.clone();
+        snap.comments = Arc::new(vec![comment_at(&anchor_on(&snap, 11), "check this", 1)]);
+        let comments = snap.comments.clone();
+        st.files_panel = FilesPanel::Hidden;
+        st.resize(120, 10);
+        snap.diff = DiffState::Loading;
+        st.observe(&snap);
+        st.reconcile(&snap);
+        assert!(st.rows.is_none());
+
+        for reason in ["permission denied", "cannot read \u{1b}[31mfile"] {
+            snap.diff = DiffState::Failed(reason.into());
+            st.observe(&snap);
+            st.reconcile(&snap);
+            assert!(Arc::ptr_eq(&comments, &snap.comments));
+            let rows = st
+                .rows
+                .as_ref()
+                .expect("failed diff's comments are reachable");
+            let note = crate::tui::sanitize::sanitize(reason);
+            assert!(matches!(&rows.rows[0], Row::Note(text) if text == &note));
+            assert!(matches!(rows.rows[1], Row::Orphans { count: 1 }));
+            assert!(rows.rows[2..].iter().all(|r| matches!(r, Row::Card { .. })));
+            assert_eq!(rows.orphan_tops, [(2, "c1".into())]);
+            assert!(rows.row_of_target.is_empty());
+            assert!(st.cursor.is_none());
+            let plain = crate::tui::view::render(&snap, &st, 120, 12).plain();
+            assert_eq!(plain[1].trim_end(), note);
+            assert!(plain[2].contains("on changes no longer shown (1)"));
+            assert!(plain[3].contains("a.rs:11 · Bug · pending"));
+            assert!(plain[4].contains("check this"));
+        }
+        let selected = snap.selected.take();
+        st.reconcile(&snap);
+        assert!(st.rows.is_none());
+        snap.selected = selected;
+        st.reconcile(&snap);
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert_eq!(st.orphan, Some(0));
+        handle_key(&mut st, &snap, key("u"), 120);
+        assert_eq!(
+            st.editor.as_ref().map(|e| e.text.as_str()),
+            Some("check this")
+        );
+        handle_key(&mut st, &snap, key("Esc"), 120);
+        assert!(matches!(
+            handle_key(&mut st, &snap, key("x"), 120),
+            crate::tui::input::Outcome::Engine(Command::DeleteComment { seen }) if seen.id == "c1"
+        ));
+
+        snap.diff = ready;
+        st.observe(&snap);
+        st.reconcile(&snap);
+        let rows = st.rows.as_ref().unwrap();
+        assert!(rows.orphan_tops.is_empty());
+        assert!(rows.rows.iter().any(|r| matches!(r, Row::Card { .. })));
+        assert!(!rows.rows.iter().any(|r| matches!(r, Row::Note(_))));
+
+        snap.comments = Arc::new(Vec::new());
+        snap.diff = DiffState::Failed("permission denied".into());
+        st.observe(&snap);
+        st.reconcile(&snap);
+        assert!(st.rows.is_none());
+        let plain = crate::tui::view::render(&snap, &st, 120, 12).plain();
+        assert!(plain[1].trim().is_empty());
+        assert_eq!(plain[6].trim(), "permission denied");
+        assert_eq!(plain[6].find("permission denied"), Some(51));
+    }
 
     #[test]
     fn reconcile_rebuilds_on_a_new_comments_arc_and_on_width_and_not_otherwise() {

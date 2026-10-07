@@ -202,15 +202,17 @@ never moves: a comment is drawn at whatever row now carries its number under
 its comparison, and it is counted and sent either way. Vimeflow does the same,
 and the agent's reply is matched by item number, not by position. A pending or
 unconfirmed comment whose row is no longer in the list -- the file was
-committed, the hunk discarded -- is not lost from the screen: it is drawn at
-the end of the body, after the last diff row, under the line `✎ on changes no
-longer shown (2)`, as a card whose title also names its path and place
-(`src/cart.py:16 · Bug · pending`). These cards are the one kind that is a
-cursor target: `j` reaches them past the last diff line, `u` edits and `x`
-deletes them, so a reviewer can always shorten or drop what an oversized or
-outdated review carries, and every other comment key is inert on them. A
-comment is drawn only while the viewer shows its comparison kind and, in
-worktree scope, its half; the panel count counts it regardless.
+committed, the hunk discarded -- or whose file is selected while its diff
+fails to load is not lost from the screen: it is drawn at the end of the body,
+after the last diff row, under the line `✎ on changes no longer shown (2)`, as
+a card whose title also names its path and place (`src/cart.py:16 · Bug ·
+pending`). When the diff failed, its reason is the line above that section.
+These cards are the one kind that is a cursor target: `j` reaches them past
+the last diff line, `u` edits and `x` deletes them, so a reviewer can always
+shorten or drop what an oversized or outdated review carries, and every other
+comment key is inert on them. A comment is drawn only while the viewer shows
+its comparison kind and, in worktree scope, its half; the panel count counts
+it regardless.
 
 **Cards.** A pending comment is a card under its line: a one-line rounded
 frame, the title `Bug · pending` on its top edge, the text wrapped inside at
@@ -767,6 +769,7 @@ comment is a record beside the diff, never in it.
 | OSC 52 is dropped by the terminal or the host | `clipboard.md` has the text and the notice names it; a clipboard send with no file written is `Unconfirmed` |
 | the base moves (a merge into `main`, a fetch) under branch-scope comments | the anchors keep the merge-base they were made against and are drawn at their numbers; the prompt names that merge-base, so the agent sees what the reviewer saw |
 | a comment's row leaves the list (the file was committed, the hunk discarded) | the card moves to the orphan section at the end of the body, where `u` and `x` still reach it; the comment is counted and sent; `✎` leaves the panel with the row |
+| the selected file's diff fails to load while the file carries comments | its pending and unconfirmed comments join the orphan section under the failure's reason until the diff loads, where `u` and `x` reach them |
 | another viewer holds the send lock | the box reads `another viewer is sending` and the send waits for it; the lock is released by the host's answer plus half a second, or by the death of the viewer holding it |
 | a retry of an `Unconfirmed` comment fails definitely | the record returns to `Unconfirmed` with its earlier stamp, never to `Pending`: the earlier send may have arrived |
 | the fresh check finds a condition the box did not show (a restart behind a `working` refusal) | refused and shown; `send anyway` accepts only what the box named |
