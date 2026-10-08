@@ -25,6 +25,11 @@ pub struct FakeHerdr {
     panes: Arc<Mutex<serde_json::Value>>,
     fail_focus: Arc<AtomicBool>,
     popup_error: Arc<Mutex<Option<String>>>,
+    prompt_failure: Arc<Mutex<Option<serde_json::Value>>>,
+    reply_delay: Arc<Mutex<Option<Duration>>>,
+    /// Hold the request unanswered beyond the client's deadline.
+    silent: Arc<AtomicBool>,
+    reply_raw: Arc<Mutex<Option<serde_json::Value>>>,
     listener_thread: Option<std::thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
 }
@@ -41,6 +46,10 @@ impl FakeHerdr {
         let fail_focus = Arc::new(AtomicBool::new(false));
         let popup_error = Arc::new(Mutex::new(None::<String>));
         let popup_failure = popup_error.clone();
+        let prompt_failure = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let reply_delay = Arc::new(Mutex::new(None::<Duration>));
+        let silent = Arc::new(AtomicBool::new(false));
+        let reply_raw = Arc::new(Mutex::new(None::<serde_json::Value>));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (requests, pane_response, focus_failure, stop) = (
             recorded.clone(),
@@ -48,6 +57,10 @@ impl FakeHerdr {
             fail_focus.clone(),
             shutdown.clone(),
         );
+        let prompt_fail = prompt_failure.clone();
+        let delay = reply_delay.clone();
+        let silent_flag = silent.clone();
+        let raw_reply = reply_raw.clone();
         let listener_thread = std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -114,12 +127,36 @@ impl FakeHerdr {
                                         "plugin_pane": { "plugin_id": "test.hunks", "entrypoint": "viewer", "pane": pane },
                                     }))
                                     .ok_or_else(|| serde_json::json!({ "code": "pane_not_found", "message": "no such pane" })),
+                                "pane.list" => Ok(serde_json::json!({
+                                    "type": "pane_list",
+                                    "panes": pane_response.lock().unwrap()["panes"].clone(),
+                                })),
+                                "agent.prompt" => match prompt_fail.lock().unwrap().clone() {
+                                    Some(error) => Err(error),
+                                    None => pane_response.lock().unwrap()["panes"]
+                                        .as_array().unwrap().iter()
+                                        .find(|pane| pane["pane_id"] == request["params"]["target"])
+                                        .map(|pane| serde_json::json!({ "type": "agent_prompted", "agent": pane }))
+                                        .ok_or_else(|| serde_json::json!({ "code": "agent_not_found", "message": "no agent in that pane" })),
+                                },
                                 _ => Err(serde_json::json!({ "code": "unknown_method", "message": "unknown method" })),
                             };
                             match result {
                                 Ok(result) => serde_json::json!({ "id": id, "result": result }),
                                 Err(error) => serde_json::json!({ "id": id, "error": error }),
                             }
+                        };
+                        if silent_flag.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_secs(6));
+                            continue;
+                        }
+                        let response = if let Some(raw) = raw_reply.lock().unwrap().clone() {
+                            raw
+                        } else {
+                            if let Some(delay) = *delay.lock().unwrap() {
+                                std::thread::sleep(delay);
+                            }
+                            response
                         };
                         sent.lock().unwrap().push(response.clone());
                         let mut writer = stream;
@@ -141,6 +178,10 @@ impl FakeHerdr {
             panes,
             fail_focus,
             popup_error,
+            prompt_failure,
+            reply_delay,
+            silent,
+            reply_raw,
             listener_thread: Some(listener_thread),
             shutdown,
         }
@@ -163,6 +204,32 @@ impl FakeHerdr {
 
     pub fn popup_error(&self, message: &str) {
         *self.popup_error.lock().unwrap() = Some(message.into());
+    }
+
+    pub fn fail_prompt(&self, code: &str, message: &str) {
+        *self.prompt_failure.lock().unwrap() =
+            Some(serde_json::json!({ "code": code, "message": message }));
+    }
+
+    pub fn clear_prompt_failure(&self) {
+        *self.prompt_failure.lock().unwrap() = None;
+    }
+
+    pub fn delay_replies(&self, delay: Option<Duration>) {
+        *self.reply_delay.lock().unwrap() = delay;
+    }
+
+    pub fn go_silent(&self, silent: bool) {
+        self.silent.store(silent, Ordering::Relaxed);
+    }
+
+    pub fn reply_raw(&self, value: Option<serde_json::Value>) {
+        *self.reply_raw.lock().unwrap() = value;
+    }
+
+    #[allow(dead_code)]
+    pub fn all_calls(&self) -> Vec<serde_json::Value> {
+        self.recorded.lock().unwrap().clone()
     }
 
     pub fn calls_named(&self, method: &str) -> Vec<serde_json::Value> {

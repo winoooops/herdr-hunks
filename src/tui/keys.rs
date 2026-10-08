@@ -22,6 +22,16 @@ pub enum KeyAction {
     ToggleScope,
     PickBase,
     MarkReviewed,
+    PickPane,
+    Finish,
+    RequestReview,
+    Comment,
+    CommentFile,
+    Visual,
+    EditComment,
+    EditFileComment,
+    DeleteComment,
+    DeleteFileComment,
     StageHunk,
     DiscardHunk,
     DiscardFile,
@@ -41,7 +51,7 @@ pub struct Binding {
     pub vimeflow: Option<&'static str>,
 }
 
-pub const RESERVED: &[&str] = &["i", "I", "u", "U", "x", "X", "v", "y", "Y", "@", "c", "/"];
+pub const RESERVED: &[&str] = &["/"];
 
 pub const KEYS: &[Binding] = &[
     Binding {
@@ -165,6 +175,66 @@ pub const KEYS: &[Binding] = &[
         vimeflow: None,
     },
     Binding {
+        key: "A",
+        label: "send to (pane)",
+        action: KeyAction::PickPane,
+        vimeflow: None,
+    },
+    Binding {
+        key: "i",
+        label: "comment on line / selection",
+        action: KeyAction::Comment,
+        vimeflow: Some("diff-comment"),
+    },
+    Binding {
+        key: "I",
+        label: "comment on file",
+        action: KeyAction::CommentFile,
+        vimeflow: Some("diff-comment-file"),
+    },
+    Binding {
+        key: "v",
+        label: "select lines",
+        action: KeyAction::Visual,
+        vimeflow: Some("diff-visual"),
+    },
+    Binding {
+        key: "u",
+        label: "edit comment",
+        action: KeyAction::EditComment,
+        vimeflow: Some("diff-comment-edit"),
+    },
+    Binding {
+        key: "U",
+        label: "edit file comment",
+        action: KeyAction::EditFileComment,
+        vimeflow: None,
+    },
+    Binding {
+        key: "x",
+        label: "delete comment",
+        action: KeyAction::DeleteComment,
+        vimeflow: Some("diff-comment-delete"),
+    },
+    Binding {
+        key: "X",
+        label: "delete file comment",
+        action: KeyAction::DeleteFileComment,
+        vimeflow: None,
+    },
+    Binding {
+        key: "Y",
+        label: "finish: send the review",
+        action: KeyAction::Finish,
+        vimeflow: Some("diff-review-finish"),
+    },
+    Binding {
+        key: "@",
+        label: "request a review",
+        action: KeyAction::RequestReview,
+        vimeflow: Some("diff-review-request"),
+    },
+    Binding {
         key: "g",
         label: "first row",
         action: KeyAction::First,
@@ -256,6 +326,11 @@ pub fn help_panel(popup: bool) -> Panel {
         cursor: None,
         offset: 0,
     };
+    panel.rows.extend([
+        Row::Note("in the Finish and Request boxes: Y confirm · A pick another pane · c copy · n cancel · f / a scope".into()),
+        Row::Note("in the editor: Enter save · ctrl+j newline · ctrl+h/l category · Esc cancel".into()),
+        Row::Note("y copies a selection made with v".into()),
+    ]);
     if popup {
         panel.rows.push(Row::Entry {
             label: "esc".into(),
@@ -295,8 +370,8 @@ mod tests {
                 assert_eq!(lookup(&KeyEvent::new(code, modifiers)), None);
             }
         }
-        assert_eq!(KEYS.len(), 27);
-        assert_eq!(help_panel(false).rows.len(), 27);
+        assert_eq!(KEYS.len(), 37);
+        assert_eq!(help_panel(false).rows.len(), 40);
     }
 
     #[test]

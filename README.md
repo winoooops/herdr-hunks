@@ -4,7 +4,7 @@
 
 A git hunk viewer for [Herdr](https://herdr.dev), with changed files,
 unified/split diffs, a clickable navigation toolbar, live refresh, and hunk
-staging behind a y/n box. It does not add comments or dispatch to agents.
+staging behind a y/n box, review comments, and dispatch to your chosen agent pane.
 
 ## Install
 
@@ -38,7 +38,7 @@ herdr plugin action invoke update --plugin winoooops.hunks
 
 Standalone: `herdr-hunks [PATH]` or `herdr-hunks tui [PATH]`; PATH defaults to the
 current directory. Both stdin and stdout must be terminals. `--version` prints
-`herdr-hunks 0.0.4`. Action diagnostics are available through
+`herdr-hunks 0.0.5`. Action diagnostics are available through
 `herdr plugin log list --plugin winoooops.hunks --limit 1`.
 
 ## Keybinding
@@ -74,16 +74,25 @@ To bind the split action instead, change `command` to
 | `b` | Switch scope: worktree <-> branch |
 | `B` | Compare against: pick the base |
 | `M` | Mark the current commit as reviewed |
+| `A` | Choose the agent pane or clipboard target |
+| `i` | Comment on the cursor line |
+| `I` | Comment on the file |
+| `v` | Select a range with j/k, then i to comment or y to copy |
+| `u` | Edit the pending comment on the cursor line |
+| `U` | Edit the pending file comment |
+| `x` | Delete the pending comment on the cursor line |
+| `X` | Delete the pending file comment |
+| `Y` | Open Finish to send pending comments |
+| `@` | Request a review of this file or all changes |
 | `g` / `G`, Home / End | First / last row |
 | `H` / `L` | Scroll left / right by eight display cells |
 | `m` | Toggle mouse capture |
 | `?` | Open the key sheet; `j` / `k` or Down / Up scroll it |
 | `q` | Quit; closes the key sheet first if open |
-| Esc | Close the key sheet or base picker; otherwise close a popup viewer |
+| Esc | Close the key sheet, base picker, editor, pane picker or boxes; otherwise close a popup viewer |
 | Ctrl+C | Quit immediately, including from the key sheet or base picker |
 
-Arrow, page, Home, and End aliases require no modifiers. Phase 2 leaves
-`i I u U x X v y Y @ c /` unbound.
+Arrow, page, Home, and End aliases require no modifiers. Phase 3 leaves `/` unbound.
 
 ## Mouse
 
@@ -219,6 +228,38 @@ discard`.
 The viewer runs eleven git subcommands: the ten reads of branch scope and
 `apply`, which runs only from a confirmed key.
 
+## Review loop
+
+Press `A` to choose the agent pane a review goes to: the picker lists this
+worktree's agent panes first, every other agent pane after, and a clipboard
+row for a review you would rather paste yourself. The chip after the stats
+shows the pane and what the host says about it (`→ codex w4:p2 · working`),
+checked at every refresh; a pane that closed reads `gone`, an agent that was
+restarted since you picked it `restarted`. The choice is remembered per
+worktree. Without a host the chip reads `→ no host` and the clipboard still
+works.
+
+`i` writes a comment on the line under the cursor, `I` on the file, `v` then
+`j`/`k` and `i` on a range; `ctrl+h`/`ctrl+l` pick the category (Question,
+Change, Bug, Suggestion), `ctrl+j` adds a line, Enter saves, Esc discards.
+A comment is a card under its line; `u`/`x` edit or delete the card on the
+cursor line, `U`/`X` the file's. Comments are shared through `comments.json`
+in the state directory, so two viewers on one worktree see the same cards,
+and a comment whose line is gone moves to a section at the end of the body
+where it can still be edited or dropped. At most 50 unsent comments per
+worktree, 4,000 characters and 100 lines each.
+
+`Y` sends every pending comment to the chosen pane as one message, Vimeflow's
+inline-review prompt with a `[#n]` per item and a nonce the agent echoes; the
+box refuses while the agent is at an approval, asks before sending to one
+that is working, unknown or restarted, and `c` copies the text to the
+clipboard and to `clipboard.md` instead. `@` asks the agent to delegate a
+review of this file or of all changes. Replies are not read yet: that is the
+next release.
+
+The viewer talks to the host through three methods only, `pane.get`,
+`pane.list` and `agent.prompt`, and runs no new git subcommand.
+
 ## Requirements
 
 - macOS or Linux, with terminal stdin and stdout.
@@ -228,7 +269,7 @@ The viewer runs eleven git subcommands: the ten reads of branch scope and
 
 ## Known limitations
 
-K1–K7 of PORT-SURFACE.md are closed in 0.0.4. Comments are not implemented.
+K1–K7 of PORT-SURFACE.md are closed in 0.0.4. Agent replies are not read yet.
 Paths that are not valid UTF-8 are shown with `\u{fffd}` in
 place of the offending bytes; git is given the replaced name, so their diff is empty
 (or that of a file literally so named); paths that differ only in those bytes share
@@ -241,7 +282,7 @@ when reading a partial clone. No syntax highlighting or context expansion yet.
 ## Roadmap
 
 P1: read-only viewing. P2: stage/unstage/discard actions and defect fixes (0.0.4).
-P3: comments and agent dispatch. P4: replies and threads. P5: delegated review.
+P3: comments and agent dispatch (0.0.5). P4: replies and threads. P5: delegated review.
 See the [design spec](docs/superpowers/specs/2026-09-18-hunks-roadmap-p1-viewer-design.md).
 
 ## Local development

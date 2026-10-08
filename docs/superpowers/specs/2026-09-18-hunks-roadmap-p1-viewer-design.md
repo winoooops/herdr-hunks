@@ -27,6 +27,8 @@ The spec for phase N+1 starts after phase N ships.
 | P4 | Replies and threads: `VIMEFLOW_REPLY` capture, nonce-scoped recovery, thread cards, resolve / reply | yes | yes |
 | P5 | Delegated review: request review (file / all changes), `VIMEFLOW_REVIEW` findings placement, review-level notes | yes | yes |
 
+Order amended 2026-09-30: Phase 2 (section 9, 0.0.4) shipped before Phase 3 (section 10, 0.0.5); the loop's second half is section 11.
+
 ### 1.3 Phase 1 goals
 
 - **G1 Open from herdr.** One action opens the viewer from any pane, scoped to

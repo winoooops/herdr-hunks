@@ -9,6 +9,8 @@ mkdir -p "$work/scripts" "$work/port" "$work/src"
 cp "$root/scripts/port-check.sh" "$work/scripts/"
 cp -R "$root/port/patches" "$work/port/"
 cp -R "$root/src/git" "$work/src/"
+mkdir -p "$work/src/engine/prompts"
+cp "$root/src/engine/prompts/delegated-review.md" "$work/src/engine/prompts/"
 cp "$root/PORT-SURFACE.md" "$work/"
 cd "$work"
 
@@ -37,6 +39,11 @@ mv "$work/mod.rs" src/git/mod.rs
 : > src/git/extra.rs
 check 'extra file' fail
 rm src/git/extra.rs
+
+printf '\n> one more line\n' >> src/engine/prompts/delegated-review.md
+check 'edited review prompt' fail
+cp "$root/src/engine/prompts/delegated-review.md" src/engine/prompts/delegated-review.md
+check 'restored review prompt' pass
 
 cp src/git/mod.rs "$work/mod.rs"
 printf '\n// hand edit\n' >> src/git/mod.rs

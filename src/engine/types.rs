@@ -2,7 +2,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::engine::comments::{Anchor, Category, Comment};
+use crate::engine::dispatch::{CopyOut, CopyRequest, Refusal, SendOutcome, SendRequest};
 use crate::engine::nav::{targets_for_diff, unified_order, Target};
+use crate::engine::target::{PaneRow, TargetState};
 use crate::git::{ChangedFile, ChangedFileStatus, FileDiff, GetGitDiffResponse};
 
 pub const MAX_DIFF_LINES: usize = 200_000;
@@ -12,7 +15,7 @@ pub const NO_BASE_NOTICE: &str = "no base branch: set [base] ref or press B";
 
 /// vimeflow's file identity: a partially staged path is two rows. In branch
 /// scope a path deleted on the branch and recreated untracked is two rows too.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FileKey {
     pub path: String,
     pub staged: bool,
@@ -309,6 +312,35 @@ pub struct Snapshot {
     pub action_error: Option<String>,
     /// Whether any `apply` form ran for the answered `Act`.
     pub action_applied: bool,
+    /// The pane or clipboard a review goes to; `None` until one is chosen (spec 10.2).
+    pub target: Option<crate::engine::target::Target>,
+    /// The last check's answer; `NoHost` with no target and no host, `Unverified` with no target and a host.
+    pub target_state: TargetState,
+    /// Bumped once per answered target write; `target_error` is that answer.
+    pub target_seq: u64,
+    pub target_error: Option<String>,
+    /// The pick token this write answers; `None` for a comment or check's write.
+    pub target_token: Option<u64>,
+    /// The pane picker's rows under the opening's token, as `refs` are for the base picker.
+    pub panes: Option<Arc<Vec<PaneRow>>>,
+    pub panes_seq: u64,
+    pub panes_error: Option<String>,
+    /// This worktree's comments in every state (spec 10.3).
+    pub comments: Arc<Vec<Comment>>,
+    /// Advanced once per comment answer or refresh notice.
+    pub comment_seq: u64,
+    pub comment_error: Option<String>,
+    /// False for accepted operations, including journaled ones.
+    pub comment_refused: bool,
+    /// The add or edit token; absent for deletions and refresh notices.
+    pub comment_token: Option<u64>,
+    pub send_seq: u64,
+    pub send_error: Option<String>,
+    pub send_refusal: Option<Refusal>,
+    pub send_outcome: Option<SendOutcome>,
+    pub send_waiting: bool,
+    pub copy_seq: u64,
+    pub copy: Option<Arc<CopyOut>>,
 }
 
 impl Snapshot {
@@ -344,12 +376,34 @@ impl Snapshot {
             action_seq: 0,
             action_error: None,
             action_applied: false,
+            target: None,
+            target_state: TargetState::Unverified,
+            target_seq: 0,
+            target_error: None,
+            target_token: None,
+            panes: None,
+            panes_seq: 0,
+            panes_error: None,
+            comments: Arc::new(Vec::new()),
+            comment_seq: 0,
+            comment_error: None,
+            comment_refused: false,
+            comment_token: None,
+            send_seq: 0,
+            send_error: None,
+            send_refusal: None,
+            send_outcome: None,
+            send_waiting: false,
+            copy_seq: 0,
+            copy: None,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    Send(SendRequest),
+    Copy(CopyRequest),
     Select(FileKey),
     SelectNext,
     SelectPrev,
@@ -364,6 +418,30 @@ pub enum Command {
     LoadRefs(u64),
     /// Run the apply forms of spec 9.2 for this confirmed action; answered on `action_seq`.
     Act(Action),
+    /// Answer with the agent panes and this opening's token on the snapshot (spec 10.2).
+    LoadPanes(u64),
+    /// Remember the target and echo this pick's token; the next refresh verifies it.
+    SetTarget {
+        token: u64,
+        target: crate::engine::target::Target,
+    },
+    /// Add a comment and echo the editor's save token.
+    AddComment {
+        token: u64,
+        anchor: Anchor,
+        category: Category,
+        text: String,
+    },
+    /// Change only the record the editor saw.
+    EditComment {
+        token: u64,
+        seen: Comment,
+        category: Category,
+        text: String,
+    },
+    DeleteComment {
+        seen: Comment,
+    },
     Shutdown,
 }
 

@@ -63,6 +63,7 @@ fn install_panic_hook() {
         let _ = crossterm::execute!(
             io::stdout(),
             crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
             crossterm::terminal::LeaveAlternateScreen,
             crossterm::cursor::Show,
         );
@@ -122,10 +123,13 @@ fn run_terminal(
     path: &std::path::Path,
 ) -> io::Result<()> {
     let mut guard = TerminalGuard::enter()?;
+    // Bracketed paste is disabled by run and the panic hook on every exit.
+    crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
     let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(TerminalOutput(io::stdout())))?;
     let mut width = terminal.size()?.width;
     let mut state = initial_state(config, width);
     state.popup = std::env::var("HERDR_HUNKS_PLACEMENT").as_deref() == Ok("popup");
+    state.socket_path = std::env::var("HERDR_SOCKET_PATH").ok();
     if let Some(notice) = notice {
         state.notify(notice);
     }
@@ -146,12 +150,19 @@ fn run_terminal(
         }
         while let Ok(next) = handle.snapshots.try_recv() {
             state.observe(&next);
+            if let Some(command) = state.pending_command.take() {
+                let _ = handle.commands.send(command);
+            }
+            if let Some(osc) = state.pending_copy.take() {
+                write_copy(&mut io::stdout(), &osc)?;
+            }
             snapshot = next;
             dirty = true;
         }
         if dirty {
             let mut drew_body = false;
             let mut box_fits = false;
+            let mut review_fits = false;
             terminal.draw(|frame| {
                 let area = frame.area();
                 width = area.width;
@@ -163,6 +174,10 @@ fn run_terminal(
                     .confirm
                     .as_ref()
                     .is_some_and(|c| c.fits(width, area.height));
+                review_fits = state
+                    .review_box
+                    .as_ref()
+                    .is_some_and(|b| b.fits(&snapshot, width, area.height));
                 let lines: Vec<_> = rendered
                     .lines
                     .iter()
@@ -186,6 +201,9 @@ fn run_terminal(
             if let Some(confirm) = state.confirm.as_mut() {
                 confirm.drawn = box_fits;
             }
+            if let Some(b) = state.review_box.as_mut() {
+                b.drawn = review_fits;
+            }
             dirty = false;
         }
         match guard::poll_terminal(Duration::ZERO).and_then(|pending| {
@@ -201,6 +219,7 @@ fn run_terminal(
         }
         let outcome = match crossterm::event::read() {
             Ok(Event::Key(key)) => input::handle_key(&mut state, &snapshot, key, width),
+            Ok(Event::Paste(text)) => input::handle_paste(&mut state, &snapshot, &text),
             Ok(Event::Mouse(mouse)) => input::handle_mouse(&mut state, &snapshot, &rendered, mouse),
             Ok(Event::Resize(_, _)) => Outcome::Redraw,
             Ok(_) => Outcome::Inert,
@@ -217,6 +236,12 @@ fn run_terminal(
         }
     }
     Ok(())
+}
+
+/// The OSC 52 write of spec 10.4: raw bytes between frames; the terminal does not answer.
+fn write_copy(out: &mut impl Write, osc: &str) -> io::Result<()> {
+    out.write_all(osc.as_bytes())?;
+    out.flush()
 }
 
 /// The caller must initialize the process environment before starting any threads.
@@ -250,9 +275,18 @@ pub fn run(path: PathBuf) -> i32 {
     session.scope = config.scope;
     session.base_ref = config.base.clone();
     session.state_dir = config::state_dir(lookup);
+    session.host = engine::host::from_env();
+    session.socket_path = std::env::var("HERDR_SOCKET_PATH").ok();
+    session.opener_pane = std::env::var("HERDR_HUNKS_OPENER_PANE")
+        .ok()
+        .filter(|p| engine::target::is_pane_id(p));
+    session.own_pane = std::env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|p| engine::target::is_pane_id(p));
     let handle = engine::spawn(runtime.handle(), session);
     install_panic_hook();
     let result = run_terminal(&handle, &config, notice, &path);
+    let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
     let _ = handle.commands.send(Command::Shutdown);
     // A blocking git call must not keep a closed viewer alive for its full timeout.
     runtime.shutdown_timeout(Duration::from_secs(1));
@@ -470,5 +504,32 @@ mod tests {
             disable < leave && leave < show && show < message,
             "{output}"
         );
+    }
+
+    #[test]
+    fn write_copy_emits_exactly_the_osc_sequence_and_flushes() {
+        #[derive(Default)]
+        struct Output {
+            bytes: Vec<u8>,
+            flushed: bool,
+        }
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushed = true;
+                Ok(())
+            }
+        }
+        let osc = "\x1b]52;c;dGVzdA==\x07";
+        let mut output = Output::default();
+        write_copy(&mut output, osc).unwrap();
+        assert_eq!(output.bytes, osc.as_bytes());
+        assert!(output.flushed);
+        let mut bytes = Vec::new();
+        write_copy(&mut bytes, osc).unwrap();
+        assert_eq!(bytes, osc.as_bytes());
     }
 }

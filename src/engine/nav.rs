@@ -1,7 +1,8 @@
 //! Pure navigation model, ported from vimeflow's useReviewTargetNavigation.
 use crate::git::{DiffLineType, FileDiff};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Side {
     /// New-file line numbers.
     Additions,

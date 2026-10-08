@@ -1,8 +1,13 @@
 //! Everything the TUI owns that is not in the snapshot, and the 4.8 reconciliation rules.
+use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
 use crate::engine::nav::{self, Side, ViewMode};
-use crate::engine::{DiffState, LoadedDiff, Snapshot};
+use crate::engine::{Command, DiffState, LoadedDiff, Snapshot, Target, TargetState};
 use crate::tui::layout::{clamp_scroll, ensure_visible, reanchor, LineSpan};
-use crate::tui::rows::{self, Rows};
+use crate::tui::rows::{self, EditorAnchor, EditorPlace, Row, Rows};
+use crate::tui::{cards, review};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilesPanel {
@@ -34,6 +39,16 @@ pub struct Notice {
     pub urgent: bool,
 }
 
+type BuiltFrom = (
+    Option<Arc<LoadedDiff>>,
+    ViewMode,
+    Arc<Vec<crate::engine::comments::Comment>>,
+    u64,
+    u16,
+    Option<EditorPlace>,
+    Option<String>,
+);
+
 pub struct ViewState {
     pub drawn_head: Option<String>,
     pub requested_mode: ViewMode,
@@ -52,6 +67,20 @@ pub struct ViewState {
     pub confirm: Option<crate::tui::confirm::Confirm>,
     /// The action `y` sent, until its answer and, when a form ran, its Arc have both passed.
     pub pending_action: Option<PendingAction>,
+    pub panes: Option<crate::tui::panes::PanePicker>,
+    pub panes_token: u64,
+    pub editor: Option<crate::tui::review::Editor>,
+    pub visual: Option<crate::tui::review::Visual>,
+    pub orphan: Option<usize>,
+    pub comment_token: u64,
+    pub review_box: Option<review::ReviewBox>,
+    /// The OSC 52 sequence the shell takes once before the next frame.
+    pub pending_copy: Option<String>,
+    /// A command from observe, drained by the shell once.
+    pub pending_command: Option<Command>,
+
+    pub pick_token: u64,
+    pub socket_path: Option<String>,
     pub refs_token: u64,
     /// Last submitted pick's reply sequence, retained when the picker closes.
     pub submitted_pick_seq: u64,
@@ -64,13 +93,19 @@ pub struct ViewState {
     pending_base_error: Option<String>,
     /// What the notice on screen is, so displacing one can put it back.
     notice_kind: NoticeKind,
+    seen_target_seq: u64,
+    seen_comment_seq: u64,
+    seen_send_seq: u64,
+    seen_copy_seq: u64,
+    deferred: VecDeque<String>,
     seen_mark_seq: u64,
     seen_action_seq: u64,
     seen_rewrite: Option<(String, String, crate::engine::MarkState)>,
     width: u16,
     /// The diff the rows were built from. Holding the Arc makes `Arc::ptr_eq` a safe,
     /// allocation-free "did anything change" test; the engine swaps the Arc only on change.
-    built_from: Option<(std::sync::Arc<LoadedDiff>, ViewMode)>,
+    built_from: Option<BuiltFrom>,
+    last_diff: Option<Arc<LoadedDiff>>,
 }
 
 impl ViewState {
@@ -91,6 +126,17 @@ impl ViewState {
             picker: None,
             confirm: None,
             pending_action: None,
+            panes: None,
+            panes_token: 0,
+            editor: None,
+            visual: None,
+            orphan: None,
+            comment_token: 0,
+            review_box: None,
+            pending_copy: None,
+            pending_command: None,
+            pick_token: 0,
+            socket_path: None,
             refs_token: 0,
             submitted_pick_seq: 0,
             notice: None,
@@ -100,11 +146,17 @@ impl ViewState {
             seen_base_error: None,
             pending_base_error: None,
             notice_kind: NoticeKind::Other,
+            seen_target_seq: 0,
+            seen_comment_seq: 0,
+            seen_send_seq: 0,
+            seen_copy_seq: 0,
+            deferred: VecDeque::new(),
             seen_mark_seq: 0,
             seen_action_seq: 0,
             seen_rewrite: None,
             width: 0,
             built_from: None,
+            last_diff: None,
         }
     }
 
@@ -191,19 +243,65 @@ impl ViewState {
         }
     }
 
-    fn keep_cursor_visible(&mut self) {
-        if let (Some(rows), Some(cursor)) = (&self.rows, self.cursor) {
-            if let Some(&row) = rows.row_of_target.get(cursor) {
-                self.offset = ensure_visible(
-                    self.offset,
+    pub fn body_width(&self) -> u16 {
+        self.width
+            .saturating_sub(if self.files_panel == FilesPanel::Hidden {
+                0
+            } else {
+                crate::tui::view::FILES_WIDTH + 1
+            })
+    }
+
+    pub fn editor_place(&self) -> Option<EditorPlace> {
+        let editor = self.editor.as_ref()?;
+        Some(EditorPlace {
+            after: EditorAnchor::Anchor(editor.anchor.clone()),
+            editing: editor.editing.as_ref().map(|c| c.id.clone()),
+            lines: editor
+                .lines(cards::card_width(usize::from(self.body_width()), self.mode))
+                .len(),
+        })
+    }
+
+    pub fn keep_cursor_visible(&mut self) {
+        let Some(rows) = &self.rows else { return };
+        let span = if self.editor.is_some() {
+            let first = rows
+                .rows
+                .iter()
+                .position(|r| matches!(r, Row::Editor { .. }));
+            let last = rows
+                .rows
+                .iter()
+                .rposition(|r| matches!(r, Row::Editor { .. }));
+            first.zip(last).map(|(first, last)| {
+                if last - first + 1 > usize::from(self.body_height) {
                     LineSpan {
-                        start: row,
+                        start: last.saturating_sub(1),
                         height: 1,
-                    },
-                    self.body_height,
-                    rows.rows.len(),
-                );
-            }
+                    }
+                } else {
+                    LineSpan {
+                        start: first,
+                        height: last - first + 1,
+                    }
+                }
+            })
+        } else if let Some(index) = self.orphan {
+            rows.orphan_tops.get(index).map(|(row, _)| LineSpan {
+                start: *row,
+                height: 1,
+            })
+        } else {
+            self.cursor
+                .and_then(|c| rows.row_of_target.get(c))
+                .map(|row| LineSpan {
+                    start: *row,
+                    height: 1,
+                })
+        };
+        if let Some(span) = span {
+            self.offset = ensure_visible(self.offset, span, self.body_height, rows.rows.len());
         }
     }
 
@@ -218,23 +316,141 @@ impl ViewState {
                 self.picker = None;
             }
         }
+        if let Some(picker) = &mut self.panes {
+            picker.observe(snapshot);
+            if picker.done {
+                if snapshot.target.is_some() {
+                    match &picker.return_to {
+                        crate::tui::panes::ReturnTo::Editor(anchor) => {
+                            self.editor = Some(review::Editor::new(anchor.clone()))
+                        }
+                        crate::tui::panes::ReturnTo::Finish => {
+                            self.review_box = Some(review::ReviewBox::finish())
+                        }
+                        crate::tui::panes::ReturnTo::Request(scope) => {
+                            let mut b = review::ReviewBox::request(snapshot);
+                            b.scope = scope.clone();
+                            self.review_box = Some(b);
+                        }
+                        crate::tui::panes::ReturnTo::Nothing => {}
+                    }
+                }
+                self.panes = None;
+            }
+        }
+        let answered_target = snapshot.target_seq != self.seen_target_seq;
+        if answered_target {
+            self.seen_target_seq = snapshot.target_seq;
+            if let Some(error) = &snapshot.target_error {
+                self.displace_notice();
+                self.warn(crate::tui::sanitize::sanitize(error));
+            }
+        }
+        let answered_comment = snapshot.comment_seq != self.seen_comment_seq;
+        if answered_comment {
+            self.seen_comment_seq = snapshot.comment_seq;
+            if let Some(error) = &snapshot.comment_error {
+                self.displace_notice();
+                self.warn(crate::tui::sanitize::sanitize(error));
+            }
+            if self
+                .editor
+                .as_ref()
+                .is_some_and(|e| e.pending.is_some() && e.pending == snapshot.comment_token)
+            {
+                if snapshot.comment_refused {
+                    if let Some(editor) = self.editor.as_mut() {
+                        editor.pending = None;
+                    }
+                } else {
+                    self.editor = None;
+                }
+            }
+        }
+        let send_answered = snapshot.send_seq != self.seen_send_seq;
+        if send_answered {
+            self.seen_send_seq = snapshot.send_seq;
+            let answered_box = self
+                .review_box
+                .as_ref()
+                .is_some_and(|b| b.pending.is_some_and(|p| snapshot.send_seq > p));
+            match (&snapshot.send_error, &snapshot.send_outcome) {
+                (Some(error), _) if answered_box => {
+                    if let Some(b) = self.review_box.as_mut() {
+                        b.refuse(
+                            error.clone(),
+                            snapshot
+                                .send_refusal
+                                .clone()
+                                .unwrap_or(crate::engine::dispatch::Refusal::Other),
+                        );
+                    }
+                }
+                (Some(error), _) => {
+                    self.displace_notice();
+                    self.notify(crate::tui::sanitize::sanitize(error));
+                }
+                (None, Some(outcome)) => {
+                    self.review_box = None;
+                    let (text, urgent) = crate::tui::review::outcome_notice(outcome, snapshot);
+                    self.displace_notice();
+                    if urgent {
+                        self.warn(text)
+                    } else {
+                        self.notify(text)
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+        let copy_answered = snapshot.copy_seq != self.seen_copy_seq;
+        if copy_answered {
+            self.seen_copy_seq = snapshot.copy_seq;
+            if let Some(copy) = &snapshot.copy {
+                self.pending_copy = copy.osc.clone();
+                if !send_answered {
+                    self.displace_notice();
+                    if copy.urgent {
+                        self.warn(copy.notice.clone())
+                    } else {
+                        self.notify(copy.notice.clone())
+                    }
+                }
+            }
+        }
+        if let (
+            Some(b),
+            Some(Target::Pane { agent, pane, .. }),
+            TargetState::Left | TargetState::Gone,
+        ) = (&self.review_box, &snapshot.target, &snapshot.target_state)
+        {
+            if b.pending.is_none() && !b.offers(snapshot).nothing {
+                let return_to = match b.kind {
+                    crate::tui::review::BoxKind::Finish => crate::tui::panes::ReturnTo::Finish,
+                    crate::tui::review::BoxKind::Request => {
+                        crate::tui::panes::ReturnTo::Request(b.scope.clone())
+                    }
+                };
+                self.review_box = None;
+                self.displace_notice();
+                self.notify(format!(
+                    "{} · {} is gone · pick a pane",
+                    crate::tui::sanitize::sanitize(agent),
+                    crate::tui::sanitize::sanitize(pane)
+                ));
+                self.panes_token += 1;
+                self.panes = Some(crate::tui::panes::PanePicker::open(
+                    self.panes_token,
+                    return_to,
+                ));
+                self.pending_command = Some(Command::LoadPanes(self.panes_token));
+            }
+        }
         let mut answered_mark = false;
         if snapshot.mark_seq != self.seen_mark_seq {
             self.seen_mark_seq = snapshot.mark_seq;
             answered_mark = true;
-            // The answer to the key the user just pressed is shown at once, even over an
-            // unread warning -- but displacing one puts it back, so it speaks again once this
-            // answer is read. A classification warning regenerates itself from the snapshot;
-            // a base error is text nothing else holds, so it returns to its slot. If the
-            // answer resolved what the warning was about, the branch below finds nothing to
-            // say and nothing comes back.
-            if let Some(displaced) = self.notice.as_ref().filter(|n| n.urgent) {
-                match self.notice_kind {
-                    NoticeKind::Rewrite => self.seen_rewrite = None,
-                    NoticeKind::BaseError => self.pending_base_error = Some(displaced.text.clone()),
-                    NoticeKind::Other => {}
-                }
-            }
+            self.displace_notice();
             match (&snapshot.mark_error, &snapshot.mark) {
                 (Some(error), _) => self.warn(crate::tui::sanitize::sanitize(error)),
                 (None, Some(mark)) => {
@@ -249,16 +465,7 @@ impl ViewState {
             self.seen_action_seq = snapshot.action_seq;
             answered_action = true;
             if let Some(pending) = self.pending_action.take() {
-                // The answer to the key the user just pressed is shown at once (8.5's rule for M).
-                if let Some(displaced) = self.notice.as_ref().filter(|n| n.urgent) {
-                    match self.notice_kind {
-                        NoticeKind::Rewrite => self.seen_rewrite = None,
-                        NoticeKind::BaseError => {
-                            self.pending_base_error = Some(displaced.text.clone())
-                        }
-                        NoticeKind::Other => {}
-                    }
-                }
+                self.displace_notice();
                 match &snapshot.action_error {
                     Some(error) => {
                         let mut text = format!(
@@ -287,15 +494,16 @@ impl ViewState {
         {
             self.pending_action = None;
         }
+        let answered_now =
+            answered_target || answered_mark || answered_action || send_answered || copy_answered;
         // Warn only for the pair the engine conclusively classified.
         let rewritten = snapshot.mark.as_ref().and_then(|mark| {
             let at = mark.classified_at.clone()?;
             (Some(&at) == snapshot.head_seen.as_ref() && mark.state != MarkState::Current)
                 .then(|| (mark.commit.clone(), at, mark.state.clone()))
         });
-        // Leave the warning pending until an urgent answer has been acknowledged.
-        let urgent_stands = self.notice.as_ref().is_some_and(|n| n.urgent);
-        if rewritten != self.seen_rewrite && !answered_mark && !answered_action && !urgent_stands {
+        // Leave the warning pending until the current notice has been acknowledged.
+        if rewritten != self.seen_rewrite && !answered_now && self.notice.is_none() {
             self.seen_rewrite = rewritten.clone();
             match rewritten.map(|(_, _, state)| state) {
                 Some(MarkState::Rewritten) => {
@@ -319,50 +527,167 @@ impl ViewState {
         if snapshot.base_error != self.seen_base_error {
             self.seen_base_error = snapshot.base_error.clone();
             if let (Some(error), None) = (&snapshot.base_error, &self.picker) {
-                self.pending_base_error = Some(crate::tui::sanitize::sanitize(error));
+                if let Some(older) = self
+                    .pending_base_error
+                    .replace(crate::tui::sanitize::sanitize(error))
+                {
+                    self.deferred.push_back(older);
+                }
             }
         }
         // It then waits behind a mark answer from this same snapshot and behind any unread
         // warning -- including the one the branch above just set, whose pair is already
         // recorded and would never speak again.
         if let Some(error) = self.pending_base_error.clone() {
-            if !answered_mark && !answered_action && !self.notice.as_ref().is_some_and(|n| n.urgent)
-            {
+            if !answered_now && self.notice.is_none() {
                 self.pending_base_error = None;
                 self.warn(error);
                 self.notice_kind = NoticeKind::BaseError;
             }
         }
+        if !answered_now && self.notice.is_none() {
+            if let Some(text) = self.deferred.pop_front() {
+                self.warn(text);
+            }
+        }
+    }
+
+    /// Displaced notices retain their way back after the answer is read.
+    fn displace_notice(&mut self) {
+        if let Some(displaced) = self.notice.as_ref() {
+            match self.notice_kind {
+                NoticeKind::Rewrite => self.seen_rewrite = None,
+                NoticeKind::BaseError => self.pending_base_error = Some(displaced.text.clone()),
+                NoticeKind::Other => self.deferred.push_back(displaced.text.clone()),
+            }
+        }
     }
 
     pub fn reconcile(&mut self, snapshot: &Snapshot) {
-        let DiffState::Ready(diff) = &snapshot.diff else {
-            // Keep the identity and previous diff for the next Ready.
-            self.rows = None;
-            self.cursor = None;
-            self.offset = 0;
-            self.hscroll = 0;
-            return;
+        let diff = match &snapshot.diff {
+            DiffState::Ready(d) => Some(d),
+            _ => None,
         };
-        // Runs before every frame, so the unchanged case must cost nothing: no clone, no compare of text.
-        if let Some((built, mode)) = &self.built_from {
-            if std::sync::Arc::ptr_eq(built, diff) && *mode == self.mode && self.rows.is_some() {
+        let failure = match &snapshot.diff {
+            DiffState::Failed(reason) => Some(reason),
+            _ => None,
+        };
+        if self
+            .visual
+            .as_ref()
+            .is_some_and(|v| diff.is_none_or(|d| !Arc::ptr_eq(d, &v.diff)))
+        {
+            self.visual = None;
+        }
+        let body_width = self.body_width();
+        let mut files = std::collections::hash_map::DefaultHasher::new();
+        (snapshot.scope == crate::engine::Scope::Branch).hash(&mut files);
+        if failure.is_some() {
+            snapshot.selected.hash(&mut files);
+        }
+        snapshot.files.len().hash(&mut files);
+        for file in &snapshot.files {
+            crate::engine::FileKey::of(file).hash(&mut files);
+        }
+        let files = files.finish();
+        let mut editor = self.editor_place();
+        if diff.is_none() {
+            if let Some(editor) = &mut editor {
+                if matches!(editor.after, EditorAnchor::Anchor(_)) {
+                    editor.after = EditorAnchor::End;
+                }
+            }
+        }
+        if let Some((built, mode, comments, built_files, width, built_editor, built_failure)) =
+            &self.built_from
+        {
+            let same_diff = match (built, diff) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            if same_diff
+                && *mode == self.mode
+                && Arc::ptr_eq(comments, &snapshot.comments)
+                && *built_files == files
+                && *width == body_width
+                && *built_editor == editor
+                && built_failure.as_ref() == failure
+            {
                 return;
             }
         }
-        let same_file = self
-            .built_from
-            .as_ref()
-            .map(|(built, _)| {
-                built.key == diff.key
-                    || (built.comparison != diff.comparison && built.key.path == diff.key.path)
+        let keep_scrolled = editor.is_none()
+            && self.orphan.is_none()
+            && self.built_from.as_ref().is_some_and(|(built, mode, ..)| {
+                *mode == self.mode
+                    && built
+                        .as_ref()
+                        .zip(diff)
+                        .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
             })
-            .unwrap_or(false);
+            && self
+                .cursor
+                .and_then(|c| self.rows.as_ref()?.row_of_target.get(c))
+                .is_some_and(|row| {
+                    *row < self.offset || *row >= self.offset + usize::from(self.body_height)
+                });
+        self.built_from = Some((
+            diff.cloned(),
+            self.mode,
+            snapshot.comments.clone(),
+            files,
+            body_width,
+            editor.clone(),
+            failure.cloned(),
+        ));
+        let orphans = rows::orphans(&snapshot.comments, snapshot);
+        let card_width = cards::card_width(usize::from(body_width), self.mode);
+        let Some(diff) = diff else {
+            if self.orphan.is_some_and(|i| i >= orphans.len()) {
+                self.orphan = None;
+            }
+            self.rows = if !orphans.is_empty() || editor.is_some() {
+                Some(rows::orphans_only(
+                    &orphans,
+                    card_width,
+                    editor.as_ref(),
+                    failure.map(|reason| crate::tui::sanitize::sanitize(reason)),
+                ))
+            } else {
+                None
+            };
+            self.cursor = None;
+            self.offset = self.rows.as_ref().map_or(0, |rows| {
+                clamp_scroll(self.offset, rows.rows.len(), self.body_height)
+            });
+            self.hscroll = 0;
+            self.keep_cursor_visible();
+            return;
+        };
+        let same_file = self.last_diff.as_ref().is_some_and(|built| {
+            built.key == diff.key
+                || (built.comparison != diff.comparison && built.key.path == diff.key.path)
+        });
         let old_row = match (&self.rows, self.cursor) {
             (Some(rows), Some(c)) => rows.row_of_target.get(c).copied(),
             _ => None,
         };
-        let rows = rows::build(diff, self.mode);
+        let rows = rows::build(
+            diff,
+            self.mode,
+            &rows::in_place(
+                &snapshot.comments,
+                diff,
+                snapshot.scope == crate::engine::Scope::Branch,
+            ),
+            &orphans,
+            card_width,
+            editor.as_ref(),
+        );
+        if self.orphan.is_some_and(|i| i >= rows.orphan_tops.len()) {
+            self.orphan = None;
+        }
 
         if !same_file {
             self.offset = 0;
@@ -390,7 +715,7 @@ impl ViewState {
             self.offset = 0;
             self.hscroll = 0;
         } else if let (true, Some(old), Some(new)) = (
-            same_file,
+            same_file && !keep_scrolled,
             old_row,
             self.cursor.and_then(|c| rows.row_of_target.get(c).copied()),
         ) {
@@ -398,8 +723,16 @@ impl ViewState {
         }
         self.rows = Some(rows);
         self.hscroll = self.hscroll.min(self.max_hscroll());
-        self.keep_cursor_visible();
-        self.built_from = Some((diff.clone(), self.mode));
+        if keep_scrolled {
+            self.offset = clamp_scroll(
+                self.offset,
+                self.rows.as_ref().unwrap().rows.len(),
+                self.body_height,
+            );
+        } else {
+            self.keep_cursor_visible();
+        }
+        self.last_diff = Some(diff.clone());
     }
 }
 
@@ -596,7 +929,10 @@ pub(crate) mod tests {
         let DiffState::Ready(diff) = &snap.diff else {
             panic!()
         };
-        assert!(Arc::ptr_eq(&st.built_from.as_ref().unwrap().0, diff));
+        assert!(Arc::ptr_eq(
+            st.built_from.as_ref().unwrap().0.as_ref().unwrap(),
+            diff
+        ));
     }
 
     #[test]
@@ -843,6 +1179,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_new_base_error_preserves_one_parked_behind_a_mark_answer() {
+        let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
+        let mut st = ViewState::new(ViewMode::Unified, FilesPanel::Hidden, true);
+        snap.base_error = Some("base error A".into());
+        st.observe(&snap);
+        assert_eq!(st.notice.as_ref().unwrap().text, "base error A");
+
+        snap.mark_seq = 1;
+        snap.mark_error = Some("mark not remembered: no state directory".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().unwrap().text,
+            "mark not remembered: no state directory"
+        );
+
+        snap.base_error = Some("base error B".into());
+        st.observe(&snap);
+        assert_eq!(
+            st.notice.as_ref().unwrap().text,
+            "mark not remembered: no state directory"
+        );
+        for expected in ["base error B", "base error A"] {
+            st.notice = None;
+            st.observe(&snap);
+            assert_eq!(st.notice.as_ref().map(|n| n.text.as_str()), Some(expected));
+        }
+        st.notice = None;
+        st.observe(&snap);
+        assert!(st.notice.is_none());
+    }
+
+    #[test]
     fn a_deferred_base_error_survives_a_refresh_that_no_longer_carries_it() {
         use crate::engine::{Mark, MarkState};
         let mut snap = snapshot("a.rs", "r1", &[(1, "+")]);
@@ -1016,5 +1384,203 @@ pub(crate) mod tests {
             .unwrap()
             .text
             .contains("no longer on this branch"));
+    }
+
+    use crate::tui::input::handle_key;
+    use crate::tui::input::tests::{anchor_on, comment_at, key, review_setup};
+    use crate::tui::review::Editor;
+    use crate::tui::rows::Row;
+
+    #[test]
+    fn a_failed_diff_rebuilds_comments_and_keeps_its_reason_above_them() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        let ready = snap.diff.clone();
+        snap.comments = Arc::new(vec![comment_at(&anchor_on(&snap, 11), "check this", 1)]);
+        let comments = snap.comments.clone();
+        st.files_panel = FilesPanel::Hidden;
+        st.resize(120, 10);
+        snap.diff = DiffState::Loading;
+        st.observe(&snap);
+        st.reconcile(&snap);
+        assert!(st.rows.is_none());
+
+        for reason in ["permission denied", "cannot read \u{1b}[31mfile"] {
+            snap.diff = DiffState::Failed(reason.into());
+            st.observe(&snap);
+            st.reconcile(&snap);
+            assert!(Arc::ptr_eq(&comments, &snap.comments));
+            let rows = st
+                .rows
+                .as_ref()
+                .expect("failed diff's comments are reachable");
+            let note = crate::tui::sanitize::sanitize(reason);
+            assert!(matches!(&rows.rows[0], Row::Note(text) if text == &note));
+            assert!(matches!(rows.rows[1], Row::Orphans { count: 1 }));
+            assert!(rows.rows[2..].iter().all(|r| matches!(r, Row::Card { .. })));
+            assert_eq!(rows.orphan_tops, [(2, "c1".into())]);
+            assert!(rows.row_of_target.is_empty());
+            assert!(st.cursor.is_none());
+            let plain = crate::tui::view::render(&snap, &st, 120, 12).plain();
+            assert_eq!(plain[1].trim_end(), note);
+            assert!(plain[2].contains("on changes no longer shown (1)"));
+            assert!(plain[3].contains("a.rs:11 · Bug · pending"));
+            assert!(plain[4].contains("check this"));
+        }
+        let selected = snap.selected.take();
+        st.reconcile(&snap);
+        assert!(st.rows.is_none());
+        snap.selected = selected;
+        st.reconcile(&snap);
+        handle_key(&mut st, &snap, key("j"), 120);
+        assert_eq!(st.orphan, Some(0));
+        handle_key(&mut st, &snap, key("u"), 120);
+        assert_eq!(
+            st.editor.as_ref().map(|e| e.text.as_str()),
+            Some("check this")
+        );
+        handle_key(&mut st, &snap, key("Esc"), 120);
+        assert!(matches!(
+            handle_key(&mut st, &snap, key("x"), 120),
+            crate::tui::input::Outcome::Engine(Command::DeleteComment { seen }) if seen.id == "c1"
+        ));
+
+        snap.diff = ready;
+        st.observe(&snap);
+        st.reconcile(&snap);
+        let rows = st.rows.as_ref().unwrap();
+        assert!(rows.orphan_tops.is_empty());
+        assert!(rows.rows.iter().any(|r| matches!(r, Row::Card { .. })));
+        assert!(!rows.rows.iter().any(|r| matches!(r, Row::Note(_))));
+
+        snap.comments = Arc::new(Vec::new());
+        snap.diff = DiffState::Failed("permission denied".into());
+        st.observe(&snap);
+        st.reconcile(&snap);
+        assert!(st.rows.is_none());
+        let plain = crate::tui::view::render(&snap, &st, 120, 12).plain();
+        assert!(plain[1].trim().is_empty());
+        assert_eq!(plain[6].trim(), "permission denied");
+        assert_eq!(plain[6].find("permission denied"), Some(51));
+    }
+
+    #[test]
+    fn reconcile_rebuilds_on_a_new_comments_arc_and_on_width_and_not_otherwise() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        let before = st.rows.as_ref().unwrap().rows.as_ptr();
+        st.reconcile(&snap);
+        assert_eq!(st.rows.as_ref().unwrap().rows.as_ptr(), before);
+        snap.comments = Arc::new(vec![comment_at(
+            &anchor_on(&snap, 11),
+            &"字".repeat(200),
+            1,
+        )]);
+        st.reconcile(&snap);
+        assert!(st
+            .rows
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .any(|r| matches!(r, Row::Card { .. })));
+        let rows = st.rows.as_ref().unwrap().rows.as_ptr();
+        st.reconcile(&snap);
+        assert_eq!(st.rows.as_ref().unwrap().rows.as_ptr(), rows);
+        let len = st.rows.as_ref().unwrap().rows.len();
+        st.resize(100, 22);
+        st.reconcile(&snap);
+        assert!(st.rows.as_ref().unwrap().rows.len() > len);
+        st.editor = Some(Editor::new(anchor_on(&snap, 11)));
+        st.reconcile(&snap);
+        let rows = st.rows.as_ref().unwrap().rows.as_ptr();
+        st.editor.as_mut().unwrap().insert('a');
+        st.reconcile(&snap);
+        assert_eq!(
+            st.rows.as_ref().unwrap().rows.as_ptr(),
+            rows,
+            "typing within one row reuses rows"
+        );
+        st.editor = None;
+        snap.files.clear();
+        st.reconcile(&snap);
+        assert_eq!(
+            st.rows.as_ref().unwrap().orphan_tops.len(),
+            1,
+            "file membership also rebuilds"
+        );
+    }
+
+    #[test]
+    fn an_editor_opened_on_the_bottom_row_scrolls_into_view() {
+        let (snap, mut st) = review_setup(&[(1, &"+".repeat(40))]);
+        st.resize(120, 10);
+        handle_key(&mut st, &snap, key("G"), 120);
+        handle_key(&mut st, &snap, key("i"), 120);
+        st.reconcile(&snap);
+        let rows = &st.rows.as_ref().unwrap().rows;
+        let first = rows
+            .iter()
+            .position(|r| matches!(r, Row::Editor { .. }))
+            .expect("editor rows");
+        let last = rows
+            .iter()
+            .rposition(|r| matches!(r, Row::Editor { .. }))
+            .unwrap();
+        assert!(first >= st.offset && last < st.offset + 10);
+    }
+
+    #[test]
+    fn an_editor_taller_than_the_body_keeps_its_caret_visible() {
+        let (snap, mut st) = review_setup(&[(1, "+")]);
+        st.resize(120, 8);
+        handle_key(&mut st, &snap, key("i"), 120);
+        for _ in 0..120 {
+            handle_key(&mut st, &snap, key("ctrl+j"), 120);
+            st.reconcile(&snap);
+        }
+        let editor = st.editor.as_ref().expect("editor");
+        assert_eq!(editor.text.split('\n').count(), 100);
+        let plain = crate::tui::view::render(&snap, &st, 120, 10).plain();
+        assert!(
+            plain[8].contains('_'),
+            "the caret is on the body's bottom row: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn a_partially_visible_editor_whose_anchor_scrolled_away_still_draws() {
+        let (snap, mut st) = review_setup(&[(1, &"+".repeat(40))]);
+        st.resize(120, 8);
+        handle_key(&mut st, &snap, key("i"), 120);
+        for _ in 0..5 {
+            handle_key(&mut st, &snap, key("ctrl+j"), 120);
+        }
+        handle_key(&mut st, &snap, key("z"), 120);
+        st.reconcile(&snap);
+        handle_key(&mut st, &snap, key("ctrl+d"), 120);
+        st.reconcile(&snap);
+        assert!(
+            matches!(st.rows.as_ref().unwrap().rows[st.offset], Row::Editor { line } if line > 0)
+        );
+        let plain = crate::tui::view::render(&snap, &st, 120, 10).plain();
+        assert!(plain[1].trim_start().starts_with('│'), "{plain:?}");
+        assert!(plain.iter().any(|l| l.contains("z_")));
+    }
+
+    #[test]
+    fn an_accepted_comment_save_does_not_hide_a_base_error() {
+        let (mut snap, mut st) = review_setup(&[(10, " + ")]);
+        let mut editor = Editor::new(anchor_on(&snap, 11));
+        editor.text = "saved".into();
+        editor.submit(1);
+        st.editor = Some(editor);
+        snap.comment_seq = 1;
+        snap.comment_token = Some(1);
+        snap.base_error = Some("base failed".into());
+        st.observe(&snap);
+        assert!(st.editor.is_none());
+        assert_eq!(
+            st.notice.as_ref().map(|n| n.text.as_str()),
+            Some("base failed")
+        );
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -32,15 +33,22 @@ pub fn save(state_dir: &Path, records: &BTreeMap<String, Record>) -> std::io::Re
 }
 
 pub fn with_lock<T>(state_dir: &Path, f: impl FnOnce() -> T) -> std::io::Result<T> {
-    use std::os::unix::io::AsRawFd;
-    use std::time::{Duration, Instant};
     std::fs::create_dir_all(state_dir)?;
+    with_lock_at(
+        &state_dir.join("split-panes.lock"),
+        Duration::from_secs(2),
+        f,
+    )
+}
+
+/// An exclusive `flock` on `lock`, waited for up to `wait`; released when the file drops, panics included.
+pub fn with_lock_at<T>(lock: &Path, wait: Duration, f: impl FnOnce() -> T) -> std::io::Result<T> {
+    use std::os::unix::io::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(state_dir.join("split-panes.lock"))?;
-    // flock is released when `file` drops, including on panic.
+        .open(lock)?;
     let start = Instant::now();
     while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let error = std::io::Error::last_os_error();
@@ -50,10 +58,13 @@ pub fn with_lock<T>(state_dir: &Path, f: impl FnOnce() -> T) -> std::io::Result<
         ) {
             return Err(error);
         }
-        if start.elapsed() >= Duration::from_secs(2) {
+        if start.elapsed() >= wait {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
-                "split reuse lock is busy",
+                format!(
+                    "{} is busy",
+                    lock.file_name().unwrap_or_default().to_string_lossy()
+                ),
             ));
         }
         std::thread::sleep(Duration::from_millis(25));
